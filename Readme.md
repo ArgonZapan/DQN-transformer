@@ -1,51 +1,50 @@
 # Trading DQN — Distributed Reinforcement Learning dla Rynków Kryptowalut
 
-System oparty na architekturze Ape-X (Actor-Learner) z modelem Conv1D + Transformer do tradingu algorytmicznego na parach BTC/ETH/SOL.
+Architektura Actor-Learner Ape-X z modelem Conv1D + Transformer do tradingu algorytmicznego na parach kryptowalut (BTC/ETH/SOL).
 
----
+### Stack
 
-## Spis treści
+| Moduł | Technologia |
+|---|---|
+| Learner | Python + PyTorch + FastAPI |
+| Actor (N instancji) | Node.js |
+| Monitoring Service | Node.js |
+| Dashboard | Vite + React (dev mode) |
+| Konfiguracja | TOML (jeden plik, zero hardcoded zmiennych) |
+| Uruchomienie | Jeden plik .bat (Windows) |
 
-1. [Przegląd architektury](#przegląd-architektury)
-2. [Dlaczego taki podział Python / Node.js](#dlaczego-taki-podział)
-3. [Model sieci neuronowej](#model-sieci-neuronowej)
-4. [Algorytm DQN i Rainbow](#algorytm-dqn-i-rainbow)
-5. [Replay Buffer](#replay-buffer)
-6. [Nagradzanie](#nagradzanie)
-7. [Wejście do sieci — multi-scale temporal](#wejście-do-sieci)
-8. [Środowisko i Actorzy](#środowisko-i-actorzy)
-9. [Komunikacja Python ↔ Node.js](#komunikacja)
-10. [Plan treningu fazowego](#plan-treningu-fazowego)
-11. [Metryki i ewaluacja](#metryki-i-ewaluacja)
-12. [Struktura plików](#struktura-plików)
-13. [Uruchomienie](#uruchomienie)
-14. [Wymagania sprzętowe](#wymagania-sprzętowe)
+### Stack jakości
+
+- TDD — 100% coverage per moduł
+- Folder `debug/` ze smoke-testami do szybkiej weryfikacji integracji
+- Żadnych hardcoded zmiennych w kodzie — wszystko przez konfig TOML
 
 ---
 
 ## Przegląd architektury
 
-System jest podzielony na dwa niezależne procesy inspirowane architekturą **Ape-X (DeepMind, 2018)**:
-
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                        Node.js                          │
 │                                                         │
-│  Actor BTC ──┐                                          │
-│  Actor ETH ──┼──► actorManager ──► POST /step ──┐      │
-│  Actor SOL ──┘         ▲                         │      │
-│                        │                         ▼      │
-│              ◄── nextAction ◄────── POST /predict       │
-└─────────────────────────────────────────────────────────┘
-                                          │
-                                          ▼
-┌─────────────────────────────────────────────────────────┐
-│                        Python                           │
+│  Actor 1 ──┐                                            │
+│  Actor 2 ──┼──► actorManager ──► POST /step ──┐        │
+│  Actor N ──┘         ▲                         │        │
+│                        │                         ▼        │
+│              ◄── nextAction ◄────── POST /predict        │
 │                                                         │
-│  FastAPI ──► Replay Buffer ──► Trainer ──► Model        │
-│                                    │                    │
-│                              Target Network             │
+│  Każdy moduł ──► POST metrics ──► Monitoring Svc         │
 └─────────────────────────────────────────────────────────┘
+     │                                    │
+     ▼                                    ▼
+┌─────────────┐              ┌─────────────────────────┐
+│   Python    │              │   Node.js Monitoring     │
+│             │              │   (agregacja metryk)      │
+│  FastAPI ──►│              ├─────────────────────────┤
+│  Replay Buf │              │   Dashboard (Vite+React) │
+│  Trainer ──►│              │   pull co 1 min, GET     │
+│  Model      │              │   tylko wyswietla        │
+└─────────────┘              └─────────────────────────┘
 ```
 
 **Node.js (Actor)** odpowiada wyłącznie za symulację środowiska rynkowego — pobieranie danych, budowanie stanów, obliczanie nagród, zarządzanie epizodami.
@@ -253,14 +252,15 @@ Mała dodatkowa kara niezależna od prowizji zniechęca do nadmiernego handlu:
 nagroda -= 0.001  # przy każdym otwarciu pozycji
 ```
 
-### Skala nagród
+### Skala nagród i clipping
 
 ```
 nagrody pośrednie (bicie pionka, etc.): max ±0.1
 nagroda końcowa (wygrana/przegrana):    ±1.0
+clip nagrody:                           [-1, 1]
 ```
 
-Nagrody pośrednie muszą być znacznie mniejsze niż końcowa — inaczej sieć optymalizuje pod nagrody pośrednie kosztem wyniku końcowego.
+Nagrody pośrednie muszą być znacznie mniejsze niż końcowa — inaczej sieć optymalizuje pod nagrody pośrednie kosztem wyniku końcowego. Ostateczna nagroda jest always clipped do zakresu [-1, 1] dla stabilności gradientów.
 
 ### Typowe problemy
 
@@ -309,14 +309,49 @@ Nigdy surowe ceny — zawsze zmiany procentowe lub znormalizowane wartości. Sie
 
 ## Środowisko i Actorzy
 
-### Jeden Actor = jedna para
+### Konfiguracja aktorów
 
-Każdy Actor to osobna instancja Node.js symulująca środowisko dla jednej pary (BTCUSDT, ETHUSDT, SOLUSDT). Wszystkie wysyłają doświadczenia do jednego Python Learnera.
+Actorzy są zdefiniowani jako lista obiektów w pliku TOML. Każdy wpis zawiera symbol, exchange i indywidualne parametry. Dzięki temu dodanie nowej pary to jeden wpis w konfigu, zero zmian w kodzie.
+
+```toml
+[[actors]]
+symbol = "BTCUSDT"
+exchange = "binance"
+leverage = 1
+
+[[actors]]
+symbol = "ETHUSDT"
+exchange = "binance"
+leverage = 1
+
+[[actors]]
+symbol = "SOLUSDT"
+exchange = "binance"
+leverage = 1
+```
+
+### Globalne timeframe'y
+
+Timeframe'y są zdefiniowane globalnie — jeden zestaw dla wszystkich aktorów, jeden model. Wszystkie Actory używają tej samej struktury stanu i tego samego schematu nagród.
+
+```toml
+[timeframes]
+candles_1m  = 15
+candles_15m = 15
+candles_1h  = 20
+candles_1d  = 30
+candles_1w  = 54
+```
+
+### Dlaczego wielu aktorów
+
+Każdy Actor symuluje środowisko dla jednej pary. Wszystkie wysyłają doświadczenia do jednego Python Learnera.
 
 Korzyści:
 - Sieć uczy się ogólnych wzorców niezależnych od pary
 - Replay buffer zawiera mix z różnych reżimów rynkowych
 - Naturalne rozwiązanie problemu korelacji doświadczeń
+- Skalowalne — dodaj kolejnego aktora przez wpis w TOML
 
 ### Batching requestów
 
@@ -362,6 +397,34 @@ GET /status
 Stany są wysyłane jako zagnieżdżone tablice floatów w JSON. Przy batch 3 Actorów payload jednego `/step` to kilkadziesiąt KB — akceptowalne przy localhost.
 
 Dla większej liczby Actorów warto rozważyć MessagePack zamiast JSON — kilkukrotnie mniejszy payload.
+
+---
+
+## Monitoring
+
+### Monitoring Service (Node.js)
+
+Każdy moduł systemu (Actorzy, Python Learner) pushuje swoje metryki przez HTTP POST do dedykowanego Monitoring Service. Moduł jest pasywny — tylko agreguje i udostępnia dane.
+
+```
+Actor         ──POST──► Monitoring Svc
+Python/Learner ──POST──► Monitoring Svc ◄──GET (co 1 min)── Dashboard
+```
+
+Metryki pushowane na bieżąco:
+- **Actor:** epsilon, liczba transakcji, P&L epizodu, status pozycji, loss krokowy
+- **Learner:** bufferSize, trainSteps, aktualny loss, Sharpe in-sample, Sharpe out-of-sample
+
+### Dashboard (Vite + React)
+
+Dashboard odpytuje Monitoring Service co 1 minutę wyłącznie w trybie GET. Nie modyfikuje danych, tylko je wyświetla. Odpalany w dev mode z poziomu pliku uruchamiającego.
+
+Typowe widoki:
+- Loss curve w czasie
+- Epsilon decay
+- Equity curve actorów
+- Metryki replay buffer (size, sampling rate)
+- Sharpe ratio in-sample vs out-of-sample
 
 ---
 
@@ -419,9 +482,12 @@ Jeśli in-sample Sharpe jest wysoki a out-of-sample niski — model się overfit
 ```
 trading-dqn/
 │
+├── config.toml                    ← jedna konfiguracja dla całego systemu
+├── run.bat                        ← jedno uruchomienie (Windows)
+│
 ├── python/
 │   ├── main.py
-│   ├── config.py
+│   ├── config.py                  ← loader config.toml (sekcja [learner])
 │   ├── model/
 │   │   ├── network.py
 │   │   ├── regime_detector.py
@@ -436,11 +502,13 @@ trading-dqn/
 │   ├── utils/
 │   │   ├── normalizer.py
 │   │   └── metrics.py
+│   ├── monitoring/
+│   │   └── monitor_client.py    ← HTTP POST metryk do Monitoring Svc
 │   └── checkpoints/
 │
 ├── node/
 │   ├── index.js
-│   ├── config.js
+│   ├── config.js                  ← loader config.toml (sekcje [actors], [timeframes])
 │   ├── env/
 │   │   ├── tradingEnv.js
 │   │   ├── reward.js
@@ -454,8 +522,21 @@ trading-dqn/
 │   ├── actors/
 │   │   ├── actor.js
 │   │   └── actorManager.js
-│   └── client/
-│       └── pythonClient.js
+│   ├── client/
+│   │   └── pythonClient.js
+│   └── monitoring/
+│       └── monitor_client.js      ← HTTP POST metryk do Monitoring Svc
+│
+├── monitoring/
+│   ├── server.js                  ← Monitoring Service (Node.js)
+│   └── config.js                  ← loader config.toml (sekcja [monitoring])
+│
+├── dashboard/
+│   ├── package.json
+│   ├── vite.config.js
+│   └── src/
+│       ├── App.jsx
+│       └── components/
 │
 ├── shared/
 │   └── stateSchema.js
@@ -469,59 +550,102 @@ trading-dqn/
 │   ├── python/
 │   └── node/
 │
+├── debug/                         ← smoke-testy integracyjne
+│   └── ...
+│
 ├── docker/
 │   ├── Dockerfile.python
 │   ├── Dockerfile.node
 │   └── docker-compose.yml
 │
-├── .env
-├── .env.example
-└── README.md
+└── Readme.md
 ```
 
 ---
 
 ## Uruchomienie
 
-### Wymagania
+### Konfiguracja
 
-```bash
-# Python
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install fastapi uvicorn numpy
+Wszystkie parametry w jednym pliku `config.toml`. Zero hardcoded zmiennych w kodzie. Każdy moduł ładuje swoją sekcję.
 
-# Node.js
-cd node && npm install
-```
+```toml
+[learner]
+host = "localhost"
+port = 8000
+device = "cuda"
 
-### Pobieranie danych historycznych
+[[actors]]
+symbol = "BTCUSDT"
+exchange = "binance"
+leverage = 1
 
-```bash
-node scripts/download_data.js --pairs BTCUSDT,ETHUSDT,SOLUSDT --timeframes 1m,15m,1h,1d,1w
+[[actors]]
+symbol = "ETHUSDT"
+exchange = "binance"
+leverage = 1
+
+[[actors]]
+symbol = "SOLUSDT"
+exchange = "binance"
+leverage = 1
+
+[timeframes]
+candles_1m  = 15
+candles_15m = 15
+candles_1h  = 20
+candles_1d  = 30
+candles_1w  = 54
+
+[monitoring]
+host = "localhost"
+port = 3001
+metrics_push_interval_sec = 5
+dashboard_poll_interval_sec = 60
+
+[training]
+gamma = 0.999
+lr = 0.0001
+batch_size = 256
+buffer_capacity = 500000
+target_update_interval = 1000
+epsilon_start = 1.0
+epsilon_end = 0.05
+epsilon_decay_fraction = 0.3
+
+[api]
+binance_key = "..."
+simulation_mode = true
 ```
 
 ### Uruchomienie
 
 ```bash
+# Jednym poleceniem — plik .bat startuje wszystkie procesy:
+run.bat
+```
+
+Plik uruchamia równolegle:
+1. **Python Learner** — FastAPI, trening, predykcje
+2. **Monitoring Service** — Node.js, agregacja metryk
+3. **Actorzy** — Node.js (N instancji wg config.toml)
+4. **Dashboard** — Vite + React w dev mode
+
+```bash
+# Ręczne uruchamianie (opcjonalnie):
+
 # Terminal 1 — Python Learner
 cd python && python main.py
 
-# Terminal 2 — Node.js Actorzy
+# Terminal 2 — Monitoring Service
+cd monitoring && node server.js
+
+# Terminal 3 — Actorzy (zarządza N instancjami przez actorManager)
 cd node && node index.js
 
-# Terminal 3 — monitoring (opcjonalnie)
-cd python && python scripts/visualize.py
+# Terminal 4 — Dashboard
+cd dashboard && npm run dev
 ```
-
-### Zmienne środowiskowe
-
-```env
-BINANCE_API_KEY=
-BINANCE_API_SECRET=
-PYTHON_HOST=localhost
-PYTHON_PORT=8000
-PAIRS=BTCUSDT,ETHUSDT,SOLUSDT
-SIMULATION_MODE=true
 ```
 
 ---
