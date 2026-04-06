@@ -10,6 +10,7 @@ Architektura Actor-Learner Ape-X z modelem Conv1D + Transformer do tradingu algo
 | Actor (N instancji) | Node.js |
 | Monitoring Service | Node.js |
 | Dashboard | Vite + React (dev mode) |
+| Komunikacja | ZeroMQ + MessagePack |
 | Konfiguracja | TOML (jeden plik, zero hardcoded zmiennych) |
 | Uruchomienie | Jeden plik .bat (Windows) |
 
@@ -28,19 +29,19 @@ Architektura Actor-Learner Ape-X z modelem Conv1D + Transformer do tradingu algo
 │                        Node.js                          │
 │                                                         │
 │  Actor 1 ──┐                                            │
-│  Actor 2 ──┼──► actorManager ──► POST /step ──┐        │
-│  Actor N ──┘         ▲                         │        │
-│                        │                         ▼        │
-│              ◄── nextAction ◄────── POST /predict        │
+│  Actor 2 ──┼──► actorManager ──► ZMQ REQ/REP ──┐        │
+│  Actor N ──┘         ▲                           │        │
+│                        │                           ▼        │
+│              ◄── nextAction ◄──── ZMQ REQ/REP             │
 │                                                         │
-│  Każdy moduł ──► POST metrics ──► Monitoring Svc         │
+│  Każdy moduł ──► PUSH metrics ──► Monitoring Svc         │
 └─────────────────────────────────────────────────────────┘
      │                                    │
      ▼                                    ▼
 ┌─────────────┐              ┌─────────────────────────┐
 │   Python    │              │   Node.js Monitoring     │
 │             │              │   (agregacja metryk)      │
-│  FastAPI ──►│              ├─────────────────────────┤
+│  ZeroMQ ───►│              ├─────────────────────────┤
 │  Replay Buf │              │   Dashboard (Vite+React) │
 │  Trainer ──►│              │   pull co 1 min, GET     │
 │  Model      │              │   tylko wyswietla        │
@@ -57,7 +58,7 @@ Architektura Actor-Learner Ape-X z modelem Conv1D + Transformer do tradingu algo
 
 Node.js ma dojrzałe biblioteki do obsługi Binance API i jest naturalnym środowiskiem dla logiki tradingowej. Python z PyTorch ma natywną obsługę CUDA i jest standardem dla RL — większość papierów badawczych i bibliotek (Stable Baselines, RLlib, CleanRL) jest w PyTorch.
 
-Połączenie obu przez HTTP daje czystą separację odpowiedzialności. Każdą część można testować niezależnie. Model można wymienić bez dotykania logiki tradingowej i odwrotnie.
+Połączenie obu przez **ZeroMQ** daje czystą separację odpowiedzialności, niskie opóźnienia i automatyczny reconnect. Każdą część można testować niezależnie. Model można wymienić bez dotykania logiki tradingowej i odwrotnie.
 
 Jest to implementacja wzorca **Actor-Learner** gdzie Node.js to Actor działający w środowisku, a Python to Learner uczący się z doświadczeń i dostarczający politykę.
 
@@ -124,16 +125,20 @@ Ten podział przyspiesza uczenie bo sieć może nauczyć się wartości stanu be
 
 ### Parametry modelu
 
-| Parametr | Wartość |
-|---|---|
-| Cechy na świecę | 8 |
-| Liczba akcji | 3 (kup / sprzedaj / czekaj) |
-| Bloki Transformer | 3 |
-| Głowice attention | 8 |
-| Key dimension | 64 |
-| Feed-Forward dim | 512 |
-| Dropout | 0.1 |
-| Łączne parametry | ~5-8M |
+Wszystkie parametry modelu są konfigurowalne przez `config.toml`:
+
+| Parametr | Wartość | Config field |
+|---|---|---|
+| Cechy na świecę | 8 | `[features].num_features` |
+| Liczba akcji | 3 (kup / sprzedaj / czekaj) | `[model].num_actions` |
+| Bloki Transformer | 3 | `[model].n_transformer_blocks` |
+| Głowice attention | 8 | `[model].n_attention_heads` |
+| Key dimension | 64 | `[model].key_dim` |
+| Feed-Forward dim | 512 | `[model].ff_dim` |
+| Dropout | 0.1 | `[training].dropout` |
+| Conv1D kernel size | 3 | `[model].conv_kernel_size` |
+| Conv1D filters | 128 | `[model].conv1d_filters` |
+| Łączne parametry | ~5-8M | — |
 
 ---
 
@@ -187,7 +192,7 @@ Gamma określa jak bardzo sieć ceni przyszłe nagrody względem natychmiastowyc
 G_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + ... + γⁿ·r_{t+n}
 ```
 
-Przy `γ=0.999` nagroda za 100 kroków jest warta `0.999^100 ≈ 0.905` — sieć jest cierpliwa i gra długoterminowo. Przy niskiej gammie sieć jest krótkowzroczna i preferuje szybkie małe zyski.
+Przy `γ=0.999` nagroda za 100 kroków jest warta `0.999^100 ≈ 0.905` — sieć jest cierpliwa i gra długoterminowo. Przy niskiej gammie sieć jest krótkowzroczna i preferuje szybkie małe zyski. **Gamma jest w pełni konfigurowalna** — można ją dostosować do różnych strategii tradingowych (swing vs. pozycyjny).
 
 ### Monte Carlo Returns
 
@@ -200,7 +205,7 @@ for t in reversed(range(len(episode))):
     episode[t].return_G = G
 ```
 
-Dopiero po obliczeniu G dla wszystkich kroków epizodu wrzucasz je do głównego replay bufora.
+Dopiero po obliczeniu G dla wszystkich kroków epizodu wrzucasz je do głównego replay bufora. Monte Carlo Returns daje dokładniejsze oszacowanie wartości długoterminowych — sieć widzi rzeczywisty wynik całej sekwencji decyzji, a nie tylko natychmiastową nagrodę. To szczególnie ważne w tradingu gdzie konsekwencje decyzji mogą ujawnić się dopiero po wielu krokach.
 
 ---
 
@@ -224,7 +229,7 @@ states = self.states_1m[idx].to('cuda', non_blocking=True)
 
 ### Faza wstępna bez inference
 
-Przez pierwsze 200-500k kroków gdy epsilon jest wysoki (sieć i tak losuje akcje), Node.js generuje losowe akcje bez pytania Pythona. Bufor zapełnia się znacznie szybciej bez narzutu HTTP i inference.
+Przez pierwsze 200-500k kroków gdy epsilon jest wysoki (sieć i tak losuje akcje), Node.js generuje losowe akcje bez pytania Pythona. Bufor zapełnia się znacznie szybciej bez narzutu komunikacji i inference.
 
 ---
 
@@ -369,34 +374,54 @@ Przy wysokim epsilon Actor wybiera losową akcję bez pytania modelu — znaczą
 
 ---
 
-## Komunikacja
+## Komunikacja ZeroMQ
 
-### Endpointy FastAPI
+Moduły komunikują się przez **ZeroMQ** (REQ/REP + PUSH/PULL pattern), co zapewnia niskie opóźnienia i lepszą skalowalność niż REST/HTTP.
 
 ```
-POST /step
-  body: {
-    state: { s1m, s15m, s1h, s1d, s1w },  # stany per timeframe
-    action: int,                            # akcja którą Actor wykonał
-    reward: float,                          # nagroda
-    nextState: { s1m, s15m, s1h, s1d, s1w },
-    done: bool                              # czy koniec epizodu
-  }
-  response: { nextAction: int }
-
-POST /predict
-  body: { state: { s1m, s15m, s1h, s1d, s1w } }
-  response: { action: int, qValues: [float, float, float] }
-
-GET /status
-  response: { bufferSize, trainSteps, epsilon, lastLoss }
+Actor ←→ REQ/REP (step + action) ←→ Learner
+Actor ──► PUSH (experience) ──► Learner (PULL)
+Learner ──► PUSH (metrics) ──► Monitoring Service (PULL)
+Monitoring Service ←→ REP (latest metrics) ←→ Dashboard (REQ)
 ```
 
-### Format danych
+### Typy wiadomości
 
-Stany są wysyłane jako zagnieżdżone tablice floatów w JSON. Przy batch 3 Actorów payload jednego `/step` to kilkadziesiąt KB — akceptowalne przy localhost.
+**Step (REQ/REP):**
+```
+Request:  { state, action, reward, nextState, done }
+Response: { nextAction }
+```
 
-Dla większej liczby Actorów warto rozważyć MessagePack zamiast JSON — kilkukrotnie mniejszy payload.
+**Predict (REQ/REP):**
+```
+Request:  { state }
+Response: { action, qValues }
+```
+
+**Experience (PUSH):**
+```
+{ state, action, reward, nextState, done, td_error? }
+```
+
+**Status (REQ/REP):**
+```
+Response: { bufferSize, trainSteps, epsilon, lastLoss }
+```
+
+### Serializacja: MessagePack
+
+Stany i akcje są serializowane przez **MessagePack** — binarny format kilkukrotnie zmniejszający payload względem JSON. Przy batchu 3 aktorów jeden request to zaledwie kilka KB. ZeroMQ eliminuje też opóźnienia związane z handshake HTTP i obsługuje automatyczne reconnect przy padzie któregokolwiek modułu.
+
+### Dlaczego ZeroMQ
+
+| Cecha | HTTP/REST | ZeroMQ |
+|---|---|---|
+| Opóźnienie | ~1-5ms | ~0.1ms |
+| Reconnect | manualny | automatyczny |
+| Pattern | Req/Res tylko | Req/Res, Push/Pull, Pub/Sub |
+| Throughput | ograniczony | liniowa skalowalność |
+| Overhead | duży (headers) | minimalny (binary) |
 
 ---
 
@@ -404,11 +429,11 @@ Dla większej liczby Actorów warto rozważyć MessagePack zamiast JSON — kilk
 
 ### Monitoring Service (Node.js)
 
-Każdy moduł systemu (Actorzy, Python Learner) pushuje swoje metryki przez HTTP POST do dedykowanego Monitoring Service. Moduł jest pasywny — tylko agreguje i udostępnia dane.
+Każdy moduł systemu (Actorzy, Python Learner) pushuje swoje metryki przez ZeroMQ do dedykowanego Monitoring Service. Moduł jest pasywny — tylko agreguje i udostępnia dane.
 
 ```
-Actor         ──POST──► Monitoring Svc
-Python/Learner ──POST──► Monitoring Svc ◄──GET (co 1 min)── Dashboard
+Actor         ──PUSH──► Monitoring Svc
+Python/Learner ──PUSH──► Monitoring Svc ◄──REQ (co 1 min)── Dashboard
 ```
 
 Metryki pushowane na bieżąco:
@@ -448,14 +473,14 @@ Zastąpienie flat Dense przez bloki Transformer Encoder po konkatenacji. Monitor
 
 Multi-step returns (n=5), Prioritized Replay, pełne hyperparameter tuning. Population Based Training opcjonalnie.
 
-### Parametry per faza
+### Parametry per faza (konfigurowalne)
 
 | | Faza 1 | Faza 2 | Faza 3 | Faza 4 |
 |---|---|---|---|---|
 | lr | 0.0003 | 0.0001 | 0.0001 | 0.00005 |
 | batch | 64 | 128 | 256 | 512 |
 | buffer | 50k | 200k | 500k | 2M |
-| gamma | 0.99 | 0.99 | 0.999 | 0.999 |
+| gamma | 0.99 | 0.99 | 0.99 | 0.999 |
 | n-step | 1 | 1 | 3 | 5 |
 | target update | 500 | 500 | 1000 | 1000 |
 
@@ -497,13 +522,13 @@ trading-dqn/
 │   │   ├── trainer.py
 │   │   └── prioritized_buffer.py
 │   ├── server/
-│   │   ├── app.py
+│   │   ├── zmq_server.py
 │   │   └── schemas.py
 │   ├── utils/
 │   │   ├── normalizer.py
 │   │   └── metrics.py
 │   ├── monitoring/
-│   │   └── monitor_client.py    ← HTTP POST metryk do Monitoring Svc
+│   │   └── monitor_client.py    ← ZeroMQ PUSH metryk do Monitoring Svc
 │   └── checkpoints/
 │
 ├── node/
@@ -523,9 +548,9 @@ trading-dqn/
 │   │   ├── actor.js
 │   │   └── actorManager.js
 │   ├── client/
-│   │   └── pythonClient.js
+│   │   └── pythonClient.js       ← ZeroMQ REQ/REP
 │   └── monitoring/
-│       └── monitor_client.js      ← HTTP POST metryk do Monitoring Svc
+│       └── monitor_client.js      ← ZeroMQ PUSH metryk do Monitoring Svc
 │
 ├── monitoring/
 │   ├── server.js                  ← Monitoring Service (Node.js)
@@ -571,8 +596,8 @@ Wszystkie parametry w jednym pliku `config.toml`. Zero hardcoded zmiennych w kod
 
 ```toml
 [learner]
-host = "localhost"
-port = 8000
+host = "tcp://127.0.0.1"
+port = 5555
 device = "cuda"
 
 [[actors]]
@@ -598,7 +623,7 @@ candles_1d  = 30
 candles_1w  = 54
 
 [monitoring]
-host = "localhost"
+host = "tcp://127.0.0.1"
 port = 3001
 metrics_push_interval_sec = 5
 dashboard_poll_interval_sec = 60
@@ -612,6 +637,19 @@ target_update_interval = 1000
 epsilon_start = 1.0
 epsilon_end = 0.05
 epsilon_decay_fraction = 0.3
+dropout = 0.1
+
+[model]
+num_actions = 3
+n_transformer_blocks = 3
+n_attention_heads = 8
+key_dim = 64
+ff_dim = 512
+conv_kernel_size = 3
+conv1d_filters = 128
+
+[features]
+num_features = 8
 
 [api]
 binance_key = "..."
@@ -626,7 +664,7 @@ run.bat
 ```
 
 Plik uruchamia równolegle:
-1. **Python Learner** — FastAPI, trening, predykcje
+1. **Python Learner** — FastAPI + ZeroMQ, trening, predykcje
 2. **Monitoring Service** — Node.js, agregacja metryk
 3. **Actorzy** — Node.js (N instancji wg config.toml)
 4. **Dashboard** — Vite + React w dev mode
@@ -646,20 +684,22 @@ cd node && node index.js
 # Terminal 4 — Dashboard
 cd dashboard && npm run dev
 ```
-```
 
 ---
 
 ## Wymagania sprzętowe
 
-| Komponent | Minimalne | Zalecane |
-|---|---|---|
-| GPU | RTX 3080 (10GB) | RTX 3090 (24GB) |
-| RAM | 32GB | 64GB |
-| CPU | 8 rdzeni | 16+ rdzeni |
-| Dysk | 50GB SSD | 200GB NVMe |
+Wymagania sprzętowe są w pełni konfigurowalne — można dostosować rozmiar batcha, pojemność bufora i wielkość modelu do posiadanego sprzętu. Przykładowe profile:
 
-Projekt był projektowany pod RTX 3090 + Ryzen 7950X + 64GB RAM. Przy 2M replay buffer i batch 512 zużycie VRAM wynosi około 8-12GB, RAM około 4-6GB.
+| Komponent | Profil Budget | Profil Mid | Profil High |
+|---|---|---|---|
+| GPU | RTX 3060 (12GB) | RTX 3080 (10GB) | RTX 3090 (24GB) |
+| RAM | 16GB | 32GB | 64GB |
+| Buffer capacity | 50k | 500k | 2M |
+| Batch size | 64 | 256 | 512 |
+| VRAM usage | ~4GB | ~8GB | ~12GB |
+
+Domyślna konfiguracja w `config.toml` zakłada profil Mid — wystarczy zmienić wartości w sekcjach `[training]` i `[model]` aby dostosować do swojego sprzętu.
 
 ---
 
@@ -671,3 +711,4 @@ Projekt był projektowany pod RTX 3090 + Ryzen 7950X + 64GB RAM. Przy 2M replay 
 - **Attention Is All You Need** (Vaswani et al., Google 2017) — Transformer
 - **Dueling Network Architectures** (Wang et al., DeepMind 2016)
 - **Prioritized Experience Replay** (Schaul et al., DeepMind 2015)
+- **ZeroMQ: A High-Performance Asynchronous Messaging Library** (Pieter Hintjens)
