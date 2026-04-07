@@ -1,5 +1,18 @@
 import os
 import toml
+import torch
+
+
+def get_optimal_device():
+    """Automatycznie wybiera najlepsze dostępne urządzenie (GPU lub CPU)."""
+    if torch.cuda.is_available():
+        device = "cuda"
+        print(f"[Config] GPU detected: {torch.cuda.get_device_name(0)}")
+        print(f"[Config] CUDA version: {torch.version.cuda}")
+    else:
+        device = "cpu"
+        print("[Config] No GPU available, using CPU")
+    return device
 
 
 def load_config(config_path=None):
@@ -14,6 +27,14 @@ def load_config(config_path=None):
     config = toml.load(config_path)
 
     _validate_config(config)
+
+    # Obsługa automatycznego wyboru urządzenia
+    device = config['learner'].get('device', 'auto')
+    if device == 'auto':
+        config['learner']['device'] = get_optimal_device()
+    elif device == 'cuda' and not torch.cuda.is_available():
+        print(f"[Config] WARNING: device='cuda' requested but GPU not available. Falling back to CPU.")
+        config['learner']['device'] = 'cpu'
 
     return config
 

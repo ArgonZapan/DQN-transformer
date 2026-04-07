@@ -2,7 +2,7 @@
 host = "tcp://127.0.0.1"
 port = 5555
 metrics_port = 5556
-device = "cpu"
+device = "auto"  # "auto" = automatycznie wykryj GPU, "cuda" = wymuś GPU, "cpu" = wymuś CPU
 
 [[actors]]
 symbol = "BTCUSDT"
