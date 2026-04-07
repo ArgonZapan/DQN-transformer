@@ -80,6 +80,7 @@ class PrioritizedReplayBuffer:
         self.per_epsilon = per_cfg['epsilon']
 
         self.beta = self.beta_start
+        self.use_pin = torch.cuda.is_available()
 
         tf_cfg = config['timeframes']
         self.timeframe_keys = sorted(tf_cfg.keys())
@@ -89,19 +90,19 @@ class PrioritizedReplayBuffer:
         self.next_states = {}
         for key in self.timeframe_keys:
             seq_len = self.timeframe_sizes[key]
-            self.states[key] = torch.zeros(
-                self.capacity, seq_len, self.num_features, dtype=torch.float32
-            ).pin_memory()
-            self.next_states[key] = torch.zeros(
-                self.capacity, seq_len, self.num_features, dtype=torch.float32
-            ).pin_memory()
+            s = torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32)
+            ns = torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32)
+            self.states[key] = s.pin_memory() if self.use_pin else s
+            self.next_states[key] = ns.pin_memory() if self.use_pin else ns
 
-        self.actions = torch.zeros(self.capacity, dtype=torch.long).pin_memory()
-        self.rewards = torch.zeros(self.capacity, dtype=torch.float32).pin_memory()
-        self.dones = torch.zeros(self.capacity, dtype=torch.float32).pin_memory()
-        self.action_masks = torch.zeros(
-            self.capacity, self.num_actions, dtype=torch.float32
-        ).pin_memory()
+        a = torch.zeros(self.capacity, dtype=torch.long)
+        r = torch.zeros(self.capacity, dtype=torch.float32)
+        d = torch.zeros(self.capacity, dtype=torch.float32)
+        m = torch.zeros(self.capacity, self.num_actions, dtype=torch.float32)
+        self.actions = a.pin_memory() if self.use_pin else a
+        self.rewards = r.pin_memory() if self.use_pin else r
+        self.dones = d.pin_memory() if self.use_pin else d
+        self.action_masks = m.pin_memory() if self.use_pin else m
 
         self.tree = SumTree(self.capacity)
         self.max_priority = 1.0

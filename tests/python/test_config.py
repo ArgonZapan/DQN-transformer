@@ -78,7 +78,7 @@ class TestConfigSections:
         assert learner['host'] == 'tcp://127.0.0.1'
         assert learner['port'] == 5555
         assert learner['metrics_port'] == 5556
-        assert learner['device'] == 'cuda'
+        assert learner['device'] == 'cpu'
 
     def test_training_config(self, config):
         training = get_training_config(config)

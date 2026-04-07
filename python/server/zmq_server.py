@@ -3,7 +3,7 @@ import msgpack
 import zmq
 import torch
 
-from .schemas import (
+from server.schemas import (
     validate_step_request, validate_batch_request,
     build_step_response, build_predict_response, build_batch_response
 )

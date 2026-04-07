@@ -44,7 +44,7 @@ test('learner config has correct values', () => {
     assert.strictEqual(learner.host, 'tcp://127.0.0.1');
     assert.strictEqual(learner.port, 5555);
     assert.strictEqual(learner.metrics_port, 5556);
-    assert.strictEqual(learner.device, 'cuda');
+    assert.strictEqual(learner.device, 'cpu');
 });
 
 // Actors config

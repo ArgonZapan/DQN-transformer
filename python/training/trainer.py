@@ -6,9 +6,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from ..model.network import TradingDQN
-from .replay_buffer import ReplayBuffer
-from .prioritized_buffer import PrioritizedReplayBuffer
+from model.network import TradingDQN
+from training.replay_buffer import ReplayBuffer
+from training.prioritized_buffer import PrioritizedReplayBuffer
 
 logger = logging.getLogger(__name__)
 
