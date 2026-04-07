@@ -1,0 +1,36 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Node.js
+node_modules/
+
+# Checkpoints
+python/checkpoints/*.pt
+
+# Historical data
+node/data/historical/*.csv
+node/data/cache/*.csv
+
+# Datasets
+datasets/
+
+# Results
+results/*.json
+
+# Logs
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
