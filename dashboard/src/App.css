@@ -1,0 +1,156 @@
+s* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #0f1117;
+  color: #e1e4e8;
+  min-height: 100vh;
+}
+
+.dashboard {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.dashboard-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #2d333b;
+}
+
+.dashboard-header h1 {
+  font-size: 1.5rem;
+  color: #58a6ff;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.card {
+  background: #161b22;
+  border: 1px solid #2d333b;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.card.wide {
+  grid-column: 1 / -1;
+}
+
+.card h2 {
+  font-size: 0.95rem;
+  color: #8b949e;
+  margin-bottom: 16px;
+  font-weight: 500;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 0.85rem;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot.connected { background: #3fb950; }
+.status-dot.disconnected { background: #f85149; }
+
+.refresh-btn {
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #363b42;
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.refresh-btn:hover {
+  background: #30363d;
+}
+
+.error-msg {
+  color: #f85149;
+  font-size: 0.85rem;
+}
+
+.metric-value {
+  font-size: 2rem;
+  font-weight: bold;
+  color: #58a6ff;
+}
+
+.metric-label {
+  font-size: 0.8rem;
+  color: #8b949e;
+  margin-top: 4px;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.metric-card {
+  background: #0d1117;
+  border-radius: 6px;
+  padding: 12px;
+  text-align: center;
+}
+
+.metric-card .value {
+  font-size: 1.4rem;
+  font-weight: bold;
+  color: #58a6ff;
+}
+
+.metric-card .label {
+  font-size: 0.75rem;
+  color: #8b949e;
+  margin-top: 4px;
+}
+
+.no-data {
+  color: #484f58;
+  font-style: italic;
+  text-align: center;
+  padding: 40px 0;
+}
+
+.buffer-bar {
+  background: #21262d;
+  border-radius: 4px;
+  height: 24px;
+  margin: 12px 0;
+  overflow: hidden;
+}
+
+.buffer-fill {
+  background: linear-gradient(90deg, #238636, #3fb950);
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: bold;
+}

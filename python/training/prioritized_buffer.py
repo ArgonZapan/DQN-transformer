@@ -83,7 +83,7 @@ class PrioritizedReplayBuffer:
         self.use_pin = torch.cuda.is_available()
 
         tf_cfg = config['timeframes']
-        self.timeframe_keys = sorted(tf_cfg.keys())
+        self.timeframe_keys = [k for k in sorted(tf_cfg.keys()) if tf_cfg[k] > 0]
         self.timeframe_sizes = {k: tf_cfg[k] for k in self.timeframe_keys}
 
         self.states = {}
@@ -114,31 +114,97 @@ class PrioritizedReplayBuffer:
 
         for key in self.timeframe_keys:
             tf_name = key.replace('candles_', '')
-            if tf_name in state:
-                self.states[key][idx] = torch.tensor(state[tf_name], dtype=torch.float32)
-            if next_state is not None and tf_name in next_state:
-                self.next_states[key][idx] = torch.tensor(next_state[tf_name], dtype=torch.float32)
+            seq_len = self.timeframe_sizes[key]
+            
+            # Pobierz state dla tego timeframe'a
+            state_data = None
+            if key in state:
+                state_data = state[key]
+            elif tf_name in state:
+                state_data = state[tf_name]
+            
+            # Waliduj i konwertuj state
+            if state_data is None or len(state_data) == 0:
+                self.states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+            else:
+                state_tensor = torch.tensor(state_data, dtype=torch.float32)
+                if state_tensor.shape != torch.Size([seq_len, self.num_features]):
+                    if state_tensor.ndim == 2 and state_tensor.shape[1] == self.num_features:
+                        actual_len = min(state_tensor.shape[0], seq_len)
+                        zeros = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+                        zeros[:actual_len] = state_tensor[:actual_len]
+                        self.states[key][idx] = zeros
+                    else:
+                        self.states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+                else:
+                    self.states[key][idx] = state_tensor
+            
+            # Pobierz next_state dla tego timeframe'a
+            if next_state is not None:
+                next_state_data = None
+                if key in next_state:
+                    next_state_data = next_state[key]
+                elif tf_name in next_state:
+                    next_state_data = next_state[tf_name]
+                
+                if next_state_data is None or len(next_state_data) == 0:
+                    self.next_states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+                else:
+                    next_tensor = torch.tensor(next_state_data, dtype=torch.float32)
+                    if next_tensor.shape != torch.Size([seq_len, self.num_features]):
+                        if next_tensor.ndim == 2 and next_tensor.shape[1] == self.num_features:
+                            actual_len = min(next_tensor.shape[0], seq_len)
+                            zeros = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+                            zeros[:actual_len] = next_tensor[:actual_len]
+                            self.next_states[key][idx] = zeros
+                        else:
+                            self.next_states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+                    else:
+                        self.next_states[key][idx] = next_tensor
+            else:
+                self.next_states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
 
         self.actions[idx] = action
         self.rewards[idx] = reward
         self.dones[idx] = float(done)
 
         if action_mask is not None:
-            self.action_masks[idx] = torch.tensor(action_mask, dtype=torch.float32)
+            mask_tensor = torch.tensor(action_mask, dtype=torch.float32)
+            if mask_tensor.shape[0] == self.num_actions:
+                self.action_masks[idx] = mask_tensor
+            else:
+                self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
+        else:
+            self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
 
         if td_error is not None:
-            priority = (abs(td_error) + self.per_epsilon) ** self.alpha
+            td_val = abs(td_error) if np.isfinite(td_error) else self.max_priority
+            priority = min((td_val + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
         else:
-            priority = self.max_priority ** self.alpha
+            priority = min(self.max_priority ** self.alpha, self._MAX_PRIORITY)
 
         self.tree.add(priority)
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
+    def _sanitize_tree(self):
+        """Reset tree to uniform priorities if it contains invalid values."""
+        total = self.tree.total()
+        if not np.isfinite(total) or total <= 0:
+            uniform_priority = min(self.max_priority ** self.alpha, self._MAX_PRIORITY)
+            if not np.isfinite(uniform_priority) or uniform_priority <= 0:
+                uniform_priority = 1.0
+            self.tree.tree[:] = 0.0
+            self.max_priority = uniform_priority
+            for i in range(self.size):
+                self.tree.update(i, uniform_priority)
+
     def sample(self, batch_size):
+        self._sanitize_tree()
         indices = []
         priorities = []
-        segment = self.tree.total() / batch_size
+        total = self.tree.total()
+        segment = total / batch_size
 
         for i in range(batch_size):
             a = segment * i
@@ -151,7 +217,7 @@ class PrioritizedReplayBuffer:
         indices = np.array(indices)
         priorities = np.array(priorities, dtype=np.float64)
 
-        sampling_probs = priorities / self.tree.total()
+        sampling_probs = priorities / total
         sampling_probs = np.clip(sampling_probs, 1e-10, None)
 
         is_weights = (self.size * sampling_probs) ** (-self.beta)
@@ -171,17 +237,59 @@ class PrioritizedReplayBuffer:
 
         return states_batch, actions, rewards, next_states_batch, dones, action_masks, indices, is_weights
 
+    _MAX_PRIORITY = 1e6  # hard cap — prevents Inf propagating into the tree
+
     def update_priorities(self, indices, td_errors):
         for idx, td_err in zip(indices, td_errors):
-            priority = (abs(td_err) + self.per_epsilon) ** self.alpha
+            td_val = abs(td_err)
+            if not np.isfinite(td_val):
+                td_val = self.max_priority
+            priority = min((td_val + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
             self.tree.update(idx, priority)
             self.max_priority = max(self.max_priority, priority)
 
     def update_beta(self, fraction):
-        self.beta = self.beta_start + (self.beta_end - self.beta_start) * fraction
+        self.beta = min(self.beta_end, self.beta_start + (self.beta_end - self.beta_start) * fraction)
 
     def __len__(self):
         return self.size
 
     def is_ready(self, min_size):
         return self.size >= min_size
+
+    def get_state(self):
+        """Zwraca serializowalny stan bufora (tylko wypełniona część)."""
+        n = self.size
+        return {
+            'size': self.size,
+            'position': self.position,
+            'max_priority': self.max_priority,
+            'beta': self.beta,
+            'tree': self.tree.tree.copy(),
+            'states': {k: self.states[k][:n].cpu().clone() for k in self.timeframe_keys},
+            'next_states': {k: self.next_states[k][:n].cpu().clone() for k in self.timeframe_keys},
+            'actions': self.actions[:n].cpu().clone(),
+            'rewards': self.rewards[:n].cpu().clone(),
+            'dones': self.dones[:n].cpu().clone(),
+            'action_masks': self.action_masks[:n].cpu().clone(),
+        }
+
+    def load_state(self, state):
+        """Przywraca bufor z zapisanego stanu."""
+        n = min(state['size'], self.capacity)
+        self.size = n
+        self.position = state['position'] % self.capacity
+        self.max_priority = state.get('max_priority', 1.0)
+        self.beta = state.get('beta', self.beta_start)
+        if 'tree' in state and len(state['tree']) == len(self.tree.tree):
+            self.tree.tree[:] = state['tree']
+            self.tree.data_pointer = self.position
+        self._sanitize_tree()  # fix Inf/NaN from previous runs
+        for k in self.timeframe_keys:
+            if k in state.get('states', {}):
+                self.states[k][:n] = state['states'][k][:n]
+                self.next_states[k][:n] = state['next_states'][k][:n]
+        self.actions[:n] = state['actions'][:n]
+        self.rewards[:n] = state['rewards'][:n]
+        self.dones[:n] = state['dones'][:n]
+        self.action_masks[:n] = state['action_masks'][:n]

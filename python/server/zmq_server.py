@@ -42,6 +42,15 @@ class ZMQServer:
                 response = self._handle_request(data)
                 packed = msgpack.packb(response)
                 self.socket.send(packed)
+                
+                # Log co 500 wiadomości (mniej spamu)
+                if hasattr(self, '_msg_count'):
+                    self._msg_count += 1
+                else:
+                    self._msg_count = 1
+                    
+                if self._msg_count % 500 == 0:
+                    logger.info(f"[ZMQ] Processed {self._msg_count} messages, buffer={len(self.trainer.buffer)}")
             except zmq.Again:
                 continue
             except Exception as e:
@@ -55,14 +64,18 @@ class ZMQServer:
     def _handle_request(self, data):
         if isinstance(data, list):
             return self._handle_batch(data)
-        elif 'action' in data:
+        elif 'action' in data and data['action'] is not None:
             return self._handle_step(data)
         else:
             return self._handle_predict(data)
 
     def _handle_step(self, data):
-        validate_step_request(data)
-
+        # Waliduj czy wszystkie wymagane pola są obecne
+        required = ['state', 'action', 'reward', 'nextState', 'done']
+        for field in required:
+            if field not in data:
+                raise ValueError(f"Missing field in step request: {field}")
+        
         state = data['state']
         action = data['action']
         reward = data['reward']
@@ -70,7 +83,8 @@ class ZMQServer:
         done = data['done']
         action_mask = data.get('actionMask')
 
-        self.trainer.add_experience(state, action, reward, next_state, done, action_mask)
+        if action is not None:
+            self.trainer.add_experience(state, action, reward, next_state, done, action_mask, actor_id='single')
 
         if next_state is not None and not done:
             next_action = self.trainer.predict_action(next_state, action_mask)
@@ -80,12 +94,14 @@ class ZMQServer:
         return build_step_response(next_action)
 
     def _handle_predict(self, data):
-        validate_step_request(data) if 'action' in data else None
+        # Predict request może nie mieć action - waliduj tylko state
+        if 'state' not in data:
+            raise ValueError("Missing field: state")
         state = data['state']
         action_mask = data.get('actionMask')
 
         action, q_values = self.trainer.predict(state, action_mask)
-        return build_predict_response(action, q_values)
+        return build_predict_response(action, q_values, epsilon=self.trainer.epsilon)
 
     def _handle_batch(self, batch):
         validate_batch_request(batch)
@@ -93,15 +109,21 @@ class ZMQServer:
         results = []
         for item in batch:
             actor_id = item['actorId']
+            symbol = item.get('symbol', actor_id)  # Symbol do metryk
             state = item['state']
             action = item.get('action')
             reward = item.get('reward', 0)
             next_state = item.get('nextState')
             done = item.get('done', False)
             action_mask = item.get('actionMask')
+            metrics = item.get('metrics', {})  # Metryki od aktora
 
             if action is not None:
-                self.trainer.add_experience(state, action, reward, next_state, done, action_mask)
+                self.trainer.add_experience(state, action, reward, next_state, done, action_mask, actor_id=actor_id)
+
+            # Przekaż metryki aktora do TensorBoard accumulation
+            if metrics:
+                self.trainer.add_actor_metrics(symbol, metrics)
 
             pred_action, q_values = self.trainer.predict(state, action_mask)
             results.append({
@@ -110,11 +132,12 @@ class ZMQServer:
                 'qValues': q_values
             })
 
-        return build_batch_response(results)
+        return build_batch_response(results, epsilon=self.trainer.epsilon)
 
     def close(self):
         self.running = False
         logger.info("Closing ZMQ Server...")
+        self.socket.setsockopt(zmq.LINGER, 500)  # czekaj max 500ms na wysyłkę zakolejkowanych
         self.socket.close()
         self.context.term()
         logger.info("ZMQ Server closed.")

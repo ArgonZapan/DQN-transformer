@@ -65,7 +65,7 @@ function buildFeatures(candles, normWindow) {
  */
 function getAlignedCandles(allCandles, currentTime, timeframe, numCandles) {
     const filtered = allCandles.filter(c => c.close_time <= currentTime);
-    return filtered.slice(-numCandles);
+    return numCandles > 0 ? filtered.slice(-numCandles) : [];
 }
 
 function buildState(allCandlesPerTf, currentTime, config) {
@@ -76,6 +76,8 @@ function buildState(allCandlesPerTf, currentTime, config) {
     for (const tf of TIMEFRAME_KEYS) {
         const configKey = TIMEFRAME_CONFIG_KEYS[tf];
         const numCandles = timeframesConfig[configKey];
+        if (!numCandles || numCandles <= 0) continue;  // skip disabled timeframes
+
         const candles = allCandlesPerTf[tf] || [];
 
         const aligned = getAlignedCandles(candles, currentTime, tf, numCandles);

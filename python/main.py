@@ -5,16 +5,9 @@ import logging
 import logging.handlers
 import threading
 import time
+import traceback
 
 from config import load_config
-
-# Reset logów przy starcie
-def reset_logs(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, 'learner.log')
-    if os.path.exists(log_file):
-        os.remove(log_file)
-        print(f"[Setup] Removed old log file: {log_file}")
 from training.trainer import Trainer
 from server.zmq_server import ZMQServer
 from monitoring.monitor_client import MonitorClient
@@ -24,37 +17,40 @@ logger = logging.getLogger('learner')
 
 def setup_logging(config):
     log_cfg = config['logging']
-    os.makedirs(log_cfg['log_dir'], exist_ok=True)
+    log_dir = log_cfg['log_dir']
+    os.makedirs(log_dir, exist_ok=True)
+
+    log_file = os.path.join(log_dir, 'learner.log')
+    if os.path.exists(log_file):
+        os.remove(log_file)
 
     handler = logging.handlers.RotatingFileHandler(
-        os.path.join(log_cfg['log_dir'], 'learner.log'),
+        log_file,
         maxBytes=log_cfg['max_file_size_mb'] * 1024 * 1024,
-        backupCount=log_cfg['max_files']
+        backupCount=log_cfg['max_files'],
+        encoding='utf-8',
     )
     console = logging.StreamHandler()
+    console.stream = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 
     formatter = logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s')
     handler.setFormatter(formatter)
     console.setFormatter(formatter)
 
     root = logging.getLogger()
-    root.setLevel(getattr(logging, log_cfg['level']))
+    root.setLevel(getattr(logging, log_cfg['level'].upper(), logging.INFO))
     root.addHandler(handler)
     root.addHandler(console)
 
 
 def main():
-    import logging.handlers
-
     config = load_config()
-    # Reset logów przy starcie
-    reset_logs(config['logging']['log_dir'])
     setup_logging(config)
 
     logger.info("Starting Python Learner...")
     device = config['learner']['device']
     logger.info(f"Device: {device}")
-    
+
     if device == 'cuda':
         import torch
         gpu_name = torch.cuda.get_device_name(0)
@@ -62,7 +58,7 @@ def main():
         logger.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
 
     trainer = Trainer(config)
-    logger.info(f"Model initialized on {config['learner']['device']}")
+    logger.info(f"Model initialized on {device}")
 
     monitor = MonitorClient(config)
     try:
@@ -74,11 +70,11 @@ def main():
 
     def graceful_shutdown(signum, frame):
         metrics = trainer.get_metrics()
-        logger.info(f"[Learner] 🛑 SHUTDOWN - Total steps: {metrics['step']}, final loss: {metrics['loss']:.6f}, epsilon: {metrics['epsilon']:.4f}")
-        logger.info("Saving checkpoint...")
+        logger.info(f"[Learner] SHUTDOWN - Total steps: {metrics['step']}, "
+                    f"final loss: {metrics['loss']:.6f}, epsilon: {metrics['epsilon']:.4f}")
         trainer.finish_current_step()
-        os.makedirs(os.path.join('checkpoints'), exist_ok=True)
-        trainer.save_checkpoint(os.path.join('checkpoints', 'shutdown_checkpoint.pt'))
+        shutdown_path = os.path.join('python', 'checkpoints', 'shutdown_checkpoint.pt')
+        trainer.save_checkpoint(path=shutdown_path, include_buffer=True)
         logger.info("Checkpoint saved. Shutting down.")
         zmq_server.close()
         monitor.close()
@@ -88,59 +84,54 @@ def main():
     signal.signal(signal.SIGINT, graceful_shutdown)
 
     def training_loop():
-        print("[Training] Thread started!")  # Debug - czy wątek w ogóle startuje
-        import sys
-        sys.stdout.flush()
-        
         push_interval = config['monitoring']['metrics_push_interval_sec']
-        import time
-        last_push = 0
-        last_buffer_log = 0
+        last_push = 0.0
+        last_buffer_log = 0.0
         training_started = False
-        iteration = 0
 
         while zmq_server.running:
-            iteration += 1
-            if iteration <= 3 or iteration % 50 == 0:
-                print(f"[Training] iteration={iteration}, buffer={len(trainer.buffer)}, running={zmq_server.running}")
-                sys.stdout.flush()
-            buffer_before = len(trainer.buffer)
             try:
                 loss = trainer.train_step()
             except Exception as e:
                 logger.error(f"[Training] Exception in train_step: {e}")
+                logger.error(traceback.format_exc())
                 time.sleep(1)
                 continue
-            
+
+            now = time.time()
+
             if loss is not None:
-                # First time training starts
                 if not training_started:
-                    logger.info(f"[Training] ✅ TRAINING STARTED: buffer={buffer_before}, step_count={trainer.step_count}")
-                    for h in logging.root.handlers:
-                        h.flush()
+                    logger.info(f"[Training] STARTED: buffer={len(trainer.buffer)}, step={trainer.step_count}")
                     training_started = True
-                # Regular metrics push
-                if time.time() - last_push >= push_interval:
+                if now - last_push >= push_interval:
                     metrics = trainer.get_metrics()
                     logger.info(f"[Training] step={metrics['step']}, loss={loss:.6f}, epsilon={metrics['epsilon']:.4f}")
                     monitor.send_metrics('learner', metrics)
-                    last_push = time.time()
+                    last_push = now
             else:
-                buffer_size = len(trainer.buffer)
-                if time.time() - last_buffer_log >= 1.0:  # co 1 sekundę zamiast 2
-                    logger.info(f"[Training] Buffer: {buffer_size}/{trainer.min_buffer_size} ({100*buffer_size/trainer.min_buffer_size:.1f}%)")
-                    for h in logging.root.handlers:
-                        h.flush()
-                    last_buffer_log = time.time()
+                if now - last_buffer_log >= 5.0:
+                    buf = len(trainer.buffer)
+                    pct = 100 * buf / trainer.min_buffer_size
+                    logger.info(f"[Training] Filling buffer: {buf}/{trainer.min_buffer_size} ({pct:.1f}%)")
+                    last_buffer_log = now
                 time.sleep(0.1)
 
     zmq_server.bind()
 
-    train_thread = threading.Thread(target=training_loop, daemon=True)
-    train_thread.start()
+    zmq_thread = threading.Thread(target=zmq_server.start, daemon=True, name="ZMQThread")
+    zmq_thread.start()
+    logger.info(f"ZMQ thread started")
 
-    logger.info("Learner ready. Waiting for actor connections...")
-    zmq_server.start()
+    train_thread = threading.Thread(target=training_loop, daemon=True, name="TrainingThread")
+    train_thread.start()
+    logger.info("Training thread started. Waiting for actor connections...")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
 
 
 if __name__ == '__main__':

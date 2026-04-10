@@ -7,7 +7,8 @@
 class Episode {
     constructor(config) {
         this.trainDataFraction = config.training.train_data_fraction;
-        this.minEpisodeLength = config.training.min_episode_length;
+        this.maxEpisodeLength  = config.training.episode_length;
+        this.stepInterval      = config.training.step_interval || 1;
         this.gamma = config.training.gamma;
 
         this.steps = [];
@@ -18,7 +19,7 @@ class Episode {
 
     getRandomStartIndex(dataLength) {
         const trainEnd = Math.floor(dataLength * this.trainDataFraction);
-        const maxStart = trainEnd - this.minEpisodeLength;
+        const maxStart = trainEnd - this.maxEpisodeLength * this.stepInterval;
         if (maxStart <= 0) return 0;
         return Math.floor(Math.random() * maxStart);
     }
@@ -33,13 +34,14 @@ class Episode {
 
     addStep(state, action, reward, nextState, done, actionMask) {
         this.steps.push({ state, action, reward, nextState, done, actionMask });
-        this.currentIndex++;
+        this.currentIndex += this.stepInterval;
         if (done) this.done = true;
     }
 
     isAtTrainEnd(dataLength) {
         const trainEnd = Math.floor(dataLength * this.trainDataFraction);
-        return this.currentIndex >= trainEnd - 1;
+        const epEnd    = this.startIndex + this.maxEpisodeLength * this.stepInterval;
+        return this.currentIndex >= Math.min(trainEnd, epEnd) - 1;
     }
 
     getStepCount() {

@@ -23,6 +23,7 @@ async function startZmqPull() {
 
             if (!metrics[source]) {
                 metrics[source] = [];
+                console.log(`[Monitoring] New source connected: ${source}`);
             }
 
             metrics[source].push({
@@ -32,6 +33,11 @@ async function startZmqPull() {
 
             if (metrics[source].length > 1000) {
                 metrics[source] = metrics[source].slice(-1000);
+            }
+            
+            // Log every 100th message from each source
+            if (metrics[source].length % 100 === 0) {
+                console.log(`[Monitoring] ${source}: ${metrics[source].length} metrics received`);
             }
         } catch (err) {
             console.error(`[Monitoring] Parse error: ${err.message}`);
@@ -81,6 +87,10 @@ async function gracefulShutdown() {
 process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
 
-console.log('[Monitoring] Starting Monitoring Service...');
+console.log('[Monitoring] 🚀 STARTING Monitoring Service...');
 startZmqPull().catch(err => console.error('[Monitoring] ZMQ error:', err));
 startHttpServer();
+
+process.on('exit', () => {
+    console.log('[Monitoring] 🛑 SHUTDOWN complete');
+});

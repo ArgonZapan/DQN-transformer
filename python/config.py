@@ -62,7 +62,7 @@ def _validate_config(config):
         'target_update_interval', 'epsilon_start', 'epsilon_end',
         'epsilon_decay_fraction', 'dropout', 'n_step', 'seed',
         'checkpoint_interval', 'evaluation_interval',
-        'train_data_fraction', 'min_episode_length'
+        'train_data_fraction', 'episode_length', 'step_interval', 'max_trades_per_episode'
     ]
     for key in required_training:
         if key not in config['training']:
@@ -77,49 +77,3 @@ def _validate_config(config):
             raise ValueError(f"Missing required model config: {key}")
 
 
-def get_learner_config(config):
-    return config['learner']
-
-
-def get_training_config(config):
-    return config['training']
-
-
-def get_model_config(config):
-    return config['model']
-
-
-def get_features_config(config):
-    return config['features']
-
-
-def get_reward_config(config):
-    return config['reward']
-
-
-def get_per_config(config):
-    return config['per']
-
-
-def get_timeframes_config(config):
-    return config['timeframes']
-
-
-def get_monitoring_config(config):
-    return config['monitoring']
-
-
-def get_data_config(config):
-    return config['data']
-
-
-def get_logging_config(config):
-    return config['logging']
-
-
-def get_backtesting_config(config):
-    return config['backtesting']
-
-
-def get_actors_config(config):
-    return config['actors']

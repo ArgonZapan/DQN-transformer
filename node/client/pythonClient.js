@@ -22,6 +22,13 @@ class PythonClient {
         const [reply] = await this.socket.receive();
         return msgpack.decode(reply);
     }
+    
+    getStats() {
+        return {
+            connected: this._connected,
+            address: `${this.host}:${this.port}`
+        };
+    }
 
     async sendBatch(batch) {
         const encoded = msgpack.encode(batch);

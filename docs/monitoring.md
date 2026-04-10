@@ -438,3 +438,75 @@ function TradingMetrics({ data }) {
     );
 }
 ```
+
+## TensorBoard Integration
+
+Treningowe metryki z TensorBoard są konfigurowalne przez `config.toml`:
+
+```toml
+[tensorboard]
+log_dir              = "runs"              # Katalog na logi TensorBoard
+log_interval_sec     = 10                  # Interwał logowania scalar metrics (w sekundach)
+histogram_interval_sec = 60                # Interwał logowania histogramów (w sekundach)
+enable_actor_metrics = true                # Czy logować metryki od actorów
+```
+
+### Logowane metryki
+
+#### Metryki Treningowe (Learner)
+| Kategoria | Metryki | Interwał |
+|-----------|---------|----------|
+| **Loss** | train (średnia z batchy) | 10s |
+| **Epsilon** | exploration rate | 10s |
+| **Learning** | lr | 10s |
+| **TD Error** | mean, max_abs, std | 10s |
+| **Q-values** | mean, max, min, ema | 10s |
+| **Gradients** | total_norm | 10s |
+| **Buffer** | size, fill_ratio | 10s |
+| **PER** | beta, priority_mean, priority_max | 10s |
+| **Actions** | count_0, count_1, ..., ratio_0, ratio_1, ... | 10s |
+| **Weights** | histogram per layer | 60s |
+
+#### Metryki od Actorów (Trading)
+| Symbol | Metryki |
+|--------|---------|
+| BTCUSDT, ETHUSDT, SOLUSDT | win_rate, episode_pnl_avg, max_consecutive_losses, transactions |
+
+### Architektura logowania
+
+```
+Actor (Node.js)
+    │
+    ├── metryki (epsilon, transactions, episode_pnl)
+    │
+    ▼ ZMQ batch request z polem "metrics"
+Learner (Python)
+    │
+    ├── add_actor_metrics() → _actor_metrics accumulator
+    │
+    ├── train_step() → _metrics_accumulator (loss, TD_error, Q-values)
+    │
+    ▼ co 10s
+TensorBoard (SummaryWriter)
+    │
+    ├── Scalars: Loss, Epsilon, Q-values, etc.
+    ├── Scalars per Actor: win_rate, episode_pnl_avg
+    └── Histograms: weights per layer (co 60s)
+```
+
+### Włączanie metryk aktorów
+
+Actor musi wysyłać metryki w batch request:
+```javascript
+// W Node.js actorze
+socket.send(msgpack.encode([{
+    actorId: 'BTCUSDT',
+    symbol: 'BTCUSDT',  // lub 'BTCUSDT'
+    state: state,
+    metrics: {
+        transactions: 5,
+        episode_pnl: 0.023,
+        win: true  // opcjonalnie
+    }
+}]));
+```

@@ -21,7 +21,7 @@ function calculateRSI(closes, period = 14) {
     avgLoss /= period;
 
     if (avgLoss === 0) {
-        rsi[period] = 100;
+        rsi[period] = avgGain === 0 ? 50 : 100;
     } else {
         const rs = avgGain / avgLoss;
         rsi[period] = 100 - (100 / (1 + rs));
@@ -36,7 +36,7 @@ function calculateRSI(closes, period = 14) {
         avgLoss = (avgLoss * (period - 1) + loss) / period;
 
         if (avgLoss === 0) {
-            rsi[i] = 100;
+            rsi[i] = avgGain === 0 ? 50 : 100;
         } else {
             const rs = avgGain / avgLoss;
             rsi[i] = 100 - (100 / (1 + rs));

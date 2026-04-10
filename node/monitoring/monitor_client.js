@@ -7,6 +7,8 @@ class MonitorClient {
         this.interval = config.monitoring.metrics_push_interval_sec * 1000;
         this.socket = new zmq.Push();
         this._connected = false;
+        this._sending = false;
+        this._queue = [];
     }
 
     async connect() {
@@ -19,12 +21,27 @@ class MonitorClient {
     async sendMetrics(source, metrics) {
         if (!this._connected) return;
 
-        try {
-            const message = JSON.stringify({ source, metrics, timestamp: Date.now() });
-            await this.socket.send(message);
-        } catch (err) {
-            console.warn(`[MonitorClient] Push failed: ${err.message}`);
+        const message = JSON.stringify({ source, metrics, timestamp: Date.now() });
+        this._queue.push(message);
+        this._flushQueue();
+    }
+
+    async _flushQueue() {
+        if (this._sending || this._queue.length === 0) return;
+        
+        this._sending = true;
+        while (this._queue.length > 0) {
+            const message = this._queue.shift();
+            try {
+                await this.socket.send(message);
+            } catch (err) {
+                console.warn(`[MonitorClient] Push failed: ${err.message}`);
+                // Put message back in queue
+                this._queue.unshift(message);
+                break;
+            }
         }
+        this._sending = false;
     }
 
     close() {

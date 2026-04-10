@@ -16,14 +16,18 @@ function calculatePnL(position) {
     return 0;
 }
 
+function calculateOpenPenalty(rewardConfig) {
+    // Natychmiastowy koszt wejścia w pozycję — model czuje go zaraz po otwarciu
+    return -(rewardConfig.commission_open + rewardConfig.trade_penalty);
+}
+
 function calculateReward(position, rewardConfig) {
+    // Nagroda przy zamknięciu: tylko PnL i prowizja za zamknięcie
+    // (prowizja za otwarcie i trade_penalty zostały już odliczone przy otwarciu)
     if (!position || !position.closed) return 0;
 
     const pnl = calculatePnL(position);
-    const commission = rewardConfig.commission_open + rewardConfig.commission_close;
-    const tradePenalty = rewardConfig.trade_penalty;
-
-    let reward = pnl - commission - tradePenalty;
+    let reward = pnl - rewardConfig.commission_close;
     reward = Math.max(rewardConfig.clip_min, Math.min(rewardConfig.clip_max, reward));
 
     return reward;
@@ -59,6 +63,7 @@ function calculateRewardTimeDecay(position, holdingTimeHours, rewardConfig) {
 
 module.exports = {
     calculatePnL,
+    calculateOpenPenalty,
     calculateReward,
     calculateRewardRiskAdjusted,
     calculateRewardTimeDecay

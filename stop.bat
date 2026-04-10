@@ -1,8 +1,11 @@
 @echo off
 echo Zatrzymywanie systemu Trading DQN...
 
-:: 1. Zatrzymaj Aktorzy (Node.js)
+:: 1. Zatrzymaj Aktorzy (Node.js) - każdy w osobnym oknie
 echo [1/4] Zatrzymywanie Aktorow...
+taskkill /F /FI "WINDOWTITLE eq actor_BTCUSDT*" /T >nul 2>&1
+taskkill /F /FI "WINDOWTITLE eq actor_ETHUSDT*" /T >nul 2>&1
+taskkill /F /FI "WINDOWTITLE eq actor_SOLUSDT*" /T >nul 2>&1
 taskkill /F /FI "WINDOWTITLE eq actors*" /T >nul 2>&1
 timeout /t 3 /nobreak >nul
 

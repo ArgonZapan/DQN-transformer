@@ -5,7 +5,8 @@ Definiuje format danych wymienianych między Actor (Node.js) a Learner (Python).
 
 
 def validate_step_request(data):
-    required_fields = ['state', 'action', 'reward', 'nextState', 'done']
+    # Dla predict request action=null, nextState=None - to jest OK
+    required_fields = ['state']
     for field in required_fields:
         if field not in data:
             raise ValueError(f"Missing field in step request: {field}")
@@ -13,6 +14,11 @@ def validate_step_request(data):
     state = data['state']
     if not isinstance(state, dict):
         raise ValueError("State must be a dict with timeframe keys")
+
+    # Waliduj tylko gdy to jest pełny step (nie predict)
+    action = data.get('action')
+    if action is not None and action not in [0, 1, 2, 3]:
+        raise ValueError(f"Invalid action value: {action}")
 
     return True
 
@@ -45,19 +51,27 @@ def build_step_response(action):
     return {'nextAction': int(action)}
 
 
-def build_predict_response(action, q_values):
-    return {
+def build_predict_response(action, q_values, epsilon=None):
+    resp = {
         'action': int(action),
         'qValues': q_values.tolist() if hasattr(q_values, 'tolist') else list(q_values)
     }
+    if epsilon is not None:
+        resp['epsilon'] = float(epsilon)
+    return resp
 
 
-def build_batch_response(results):
-    return [
-        {
-            'actorId': r['actorId'],
-            'action': int(r['action']),
-            'qValues': r['qValues'].tolist() if hasattr(r['qValues'], 'tolist') else list(r['qValues'])
-        }
-        for r in results
-    ]
+def build_batch_response(results, epsilon=None):
+    resp = {
+        'predictions': [
+            {
+                'actorId': r['actorId'],
+                'action': int(r['action']),
+                'qValues': r['qValues'].tolist() if hasattr(r['qValues'], 'tolist') else list(r['qValues'])
+            }
+            for r in results
+        ]
+    }
+    if epsilon is not None:
+        resp['epsilon'] = float(epsilon)
+    return resp

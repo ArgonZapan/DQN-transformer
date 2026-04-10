@@ -24,18 +24,21 @@ function parseArgs(argv) {
     };
 
     for (let i = 2; i < argv.length; i++) {
+        // Check bounds before accessing next element
+        if (i + 1 >= argv.length) break;
+        
         switch (argv[i]) {
             case '--symbol':
-                args.symbol = argv[++i];
+                args.symbol = argv[++i]?.trim();
                 break;
             case '--interval':
-                args.interval = argv[++i];
+                args.interval = argv[++i]?.trim();
                 break;
             case '--days':
-                args.days = parseInt(argv[++i], 10);
+                args.days = parseInt(argv[++i], 10) || 30;
                 break;
             case '--output':
-                args.output = argv[++i];
+                args.output = argv[++i]?.trim();
                 break;
         }
     }

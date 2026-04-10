@@ -5,17 +5,22 @@ import torch.nn.functional as F
 
 class Conv1DBlock(nn.Module):
     """Blok konwolucyjny dla pojedynczego timeframe'a.
-    Wykrywa lokalne wzorce cenowe, skoki wolumenu, momentum."""
+    Wykrywa lokalne wzorce cenowe, skoki wolumenu, momentum.
+    Używa kauzalnego paddingu (tylko w lewo) — brak look-ahead bias."""
 
     def __init__(self, num_features, conv_filters, kernel_size, dropout):
         super().__init__()
-        self.conv = nn.Conv1d(num_features, conv_filters, kernel_size, padding=kernel_size // 2)
+        # padding=0 — pad ręcznie tylko po lewej stronie (przeszłość)
+        self.conv = nn.Conv1d(num_features, conv_filters, kernel_size, padding=0)
+        self.causal_pad = kernel_size - 1  # ile zer dodać po lewej
         self.bn = nn.BatchNorm1d(conv_filters)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # x: [batch, seq_len, features] -> transpose to [batch, features, seq_len]
+        # x: [batch, seq_len, features] -> [batch, features, seq_len]
         x = x.transpose(1, 2)
+        # Kauzalny padding: tylko w lewo (przeszłość), nie w prawo (przyszłość)
+        x = F.pad(x, (self.causal_pad, 0))
         x = self.conv(x)
         x = self.bn(x)
         x = F.relu(x)
@@ -78,7 +83,7 @@ class TradingDQN(nn.Module):
         self.ff_dim = model_cfg['ff_dim']
         self.dropout = training_cfg['dropout']
 
-        self.timeframe_keys = sorted(timeframes_cfg.keys())
+        self.timeframe_keys = [k for k in sorted(timeframes_cfg.keys()) if timeframes_cfg[k] > 0]
         self.num_timeframes = len(self.timeframe_keys)
 
         self.conv_blocks = nn.ModuleList([
@@ -144,6 +149,9 @@ class TradingDQN(nn.Module):
         advantage = self.advantage_stream(x)
         # Q = V + (A - mean(A)) — odejmowanie mean(A) identyfikuje model jednoznacznie
         q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        # Przechowaj dla debuggera (bez narzutu gdy debugger nieaktywny)
+        self._debug_value = value
+        self._debug_advantage = advantage
 
         if action_mask is not None:
             # Zablokuj niedozwolone akcje ustawiając Q na -inf

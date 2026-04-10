@@ -60,6 +60,9 @@ function fetchKlinesRaw(symbol, interval, limit, startTime, endTime) {
             });
         });
 
+        req.setTimeout(10000, () => {
+            req.destroy(new Error(`Binance request timeout for ${symbol} ${interval}`));
+        });
         req.on('error', reject);
         req.end();
     });
@@ -147,8 +150,9 @@ class BinanceClient {
 
     async getData(symbol, interval, limit) {
         if (this.dataSource === 'file') {
-            const allCandles = this.loadFromFile(symbol, interval);
-            return allCandles.slice(-limit);
+            // Zwróć wszystkie dostępne świece — trening chce maksimum danych historycznych.
+            // Limit jest ignorowany w trybie file (ma znaczenie tylko dla API real-time).
+            return this.loadFromFile(symbol, interval);
         }
         return await this.fetchWithRetry(symbol, interval, limit);
     }
