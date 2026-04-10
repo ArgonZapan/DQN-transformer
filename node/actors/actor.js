@@ -272,6 +272,7 @@ class Actor {
 
     stop() {
         this.running = false;
+        this.binanceClient.destroy();
         console.log(`[Actor:${this.symbol}] STOPPED - Total: ${this.totalEpisodes} episodes, ${this.totalSteps} steps, ${this.env.getTrades().length} trades`);
     }
 }

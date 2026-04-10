@@ -4,7 +4,7 @@ import zmq
 import torch
 
 from server.schemas import (
-    validate_step_request, validate_batch_request,
+    validate_step_request, validate_predict_request, validate_batch_request,
     build_step_response, build_predict_response, build_batch_response
 )
 
@@ -94,9 +94,7 @@ class ZMQServer:
         return build_step_response(next_action)
 
     def _handle_predict(self, data):
-        # Predict request może nie mieć action - waliduj tylko state
-        if 'state' not in data:
-            raise ValueError("Missing field: state")
+        validate_predict_request(data)
         state = data['state']
         action_mask = data.get('actionMask')
 

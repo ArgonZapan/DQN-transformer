@@ -91,16 +91,24 @@ function rollingMean(values, window) {
 
 function rollingStd(values, window) {
     const std = new Array(values.length).fill(0);
+    // Algorytm Welforda O(n) — bieżąca suma i suma kwadratów w oknie przesuwnym
+    let sumX = 0, sumX2 = 0;
 
     for (let i = 0; i < values.length; i++) {
-        const start = Math.max(0, i - window + 1);
-        const slice = values.slice(start, i + 1);
-        const n = slice.length;
+        sumX  += values[i];
+        sumX2 += values[i] * values[i];
+
+        if (i >= window) {
+            sumX  -= values[i - window];
+            sumX2 -= values[i - window] * values[i - window];
+        }
+
+        const n = Math.min(i + 1, window);
         if (n < 2) { std[i] = 0; continue; }
 
-        const mean = slice.reduce((a, b) => a + b, 0) / n;
-        const variance = slice.reduce((sum, v) => sum + (v - mean) ** 2, 0) / n;
-        std[i] = Math.sqrt(variance);
+        const mean = sumX / n;
+        const variance = sumX2 / n - mean * mean;
+        std[i] = variance > 0 ? Math.sqrt(variance) : 0;
     }
 
     return std;

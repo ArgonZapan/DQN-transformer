@@ -468,7 +468,7 @@ class Trainer:
         if debug_now:
             self.debugger.log_gradient_flow(self.main_network, self.step_count)
 
-        torch.nn.utils.clip_grad_norm_(self.main_network.parameters(), 10.0)
+        torch.nn.utils.clip_grad_norm_(self.main_network.parameters(), 1.0)
         self.optimizer.step()
 
         if debug_now:

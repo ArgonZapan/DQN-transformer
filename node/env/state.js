@@ -65,7 +65,7 @@ function buildFeatures(candles, normWindow) {
  * aby uniknąć look-ahead bias.
  * Binary search O(log N) zamiast filter O(N).
  */
-function getAlignedCandles(allCandles, currentTime, timeframe, numCandles) {
+function getAlignedCandles(allCandles, currentTime, numCandles) {
     let lo = 0, hi = allCandles.length;
     while (lo < hi) {
         const mid = (lo + hi) >>> 1;
@@ -87,7 +87,7 @@ function buildState(allCandlesPerTf, currentTime, config) {
         if (!numCandles || numCandles <= 0) continue;
 
         const candles = allCandlesPerTf[tf] || [];
-        const aligned = getAlignedCandles(candles, currentTime, tf, numCandles);
+        const aligned = getAlignedCandles(candles, currentTime, numCandles);
 
         if (aligned.length < numCandles) {
             const features = buildFeatures(aligned, normWindow);

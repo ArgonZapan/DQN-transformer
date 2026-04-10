@@ -60,7 +60,7 @@ def _validate_config(config):
     required_training = [
         'gamma', 'lr', 'batch_size', 'buffer_capacity', 'min_buffer_size',
         'target_update_interval', 'epsilon_start', 'epsilon_end',
-        'epsilon_decay_fraction', 'dropout', 'n_step', 'seed',
+        'epsilon_decay_fraction', 'dropout', 'seed',
         'checkpoint_interval', 'evaluation_interval',
         'train_data_fraction', 'episode_length', 'step_interval', 'max_trades_per_episode'
     ]
@@ -70,7 +70,7 @@ def _validate_config(config):
 
     required_model = [
         'num_actions', 'n_transformer_blocks', 'n_attention_heads',
-        'key_dim', 'ff_dim', 'conv_kernel_size', 'conv1d_filters'
+        'ff_dim', 'conv_kernel_size', 'conv1d_filters'
     ]
     for key in required_model:
         if key not in config['model']:
