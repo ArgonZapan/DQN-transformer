@@ -38,9 +38,9 @@ metrics_push_interval_sec   = 5                  # Interwał wysyłania metryk (
 dashboard_poll_interval_sec = 60                 # Interwał odświeżania dashboardu (w sekundach)
 
 [training]
-gamma                   = 0.985             # Współczynnik dyskontowania nagród (gamma) - im bliższy 1, tym dalej widzi w przyszłość
+gamma                   = 0.99              # Współczynnik dyskontowania nagród (gamma) - im bliższy 1, tym dalej widzi w przyszłość
 lr                      = 0.00001           # Learning rate - szybkość uczenia (zbyt wysoki = niestabilność, zbyt niski = wolne uczenie)
-batch_size              = 64                # Rozmiar batcha - ile próbek na jedną aktualizację sieci
+batch_size              = 2048              # Rozmiar batcha - ile próbek na jedną aktualizację sieci
 buffer_capacity         = 1000000           # Pojemność replay buffer - max liczba doświadczeń do przechowania
 min_buffer_size         = 50000             # Minymalny rozmiar bufferu przed rozpoczęciem treningu
 target_update_interval  = 1000              # Co ile kroków aktualizować sieć docelową (target network)
@@ -56,8 +56,8 @@ checkpoint_interval     = 5000              # Co ile kroków zapisywać checkpoi
 evaluation_interval     = 10000             # Co ile kroków uruchamiać ewaluację
 train_data_fraction     = 0.9               # Frakcja danych użyta do treningu (reszta = walidacja)
 episode_length          = 1000              # Długość epizodu w decyzjach (nie świecach); start losowany z całej dostępnej historii
-step_interval           = 12                # Co ile świec 1m podejmować decyzję (1 = co minutę, 10 = co 10 minut, 60 = co godzinę)
-max_trades_per_episode  = 5                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
+step_interval           = 30                # Co ile świec 1m podejmować decyzję (1 = co minutę, 10 = co 10 minut, 60 = co godzinę)
+max_trades_per_episode  = 3                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
 
 [per]
 alpha      = 0.6           # Priorytet α - jak bardzo priorytetyzować ważne próbki (0 = brak priorytetów, 1 = tylko priorytety)
@@ -84,7 +84,7 @@ use_sma20    = true       # SMA20 - Simple Moving Average 20 okresów
 [reward]
 commission_open         = 0.00075          # Prowizja za otwarcie pozycji (0.1%)
 commission_close       = 0.00075           # Prowizja za zamknięcie pozycji (0.1%)
-trade_penalty          = 0.002             # Kara za każdą transakcję (zachęca do rzadszego handlu)
+trade_penalty          = 0.005             # Kara za każdą transakcję (zachęca do rzadszego handlu)
 clip_min               = -2.0              # Minimalna nagroda/kara (clamping)
 clip_max               = 2.0               # Maksymalna nagroda/kara (clamping)
 intermediate_reward_max = 0.1              # Max nagroda pośrednia (za małe zyski)

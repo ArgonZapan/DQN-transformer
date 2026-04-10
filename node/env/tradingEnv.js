@@ -1,4 +1,4 @@
-const { buildState, getActionMask } = require('./state');
+const { buildState, getActionMask, precomputeIndicators, buildStateFromPrecomputed, TIMEFRAME_KEYS, TIMEFRAME_CONFIG_KEYS } = require('./state');
 const { calculateOpenPenalty, calculateReward } = require('./reward');
 const { Episode } = require('./episode');
 
@@ -47,12 +47,52 @@ class TradingEnv {
         this.position = null;
         this.episode = new Episode(config);
         this.allCandles = {};
+        this.precomputed = null;
+        this.tfAlignments = null;
         this.currentStepIndex = 0;
         this.trades = [];
     }
 
     setData(candlesPerTimeframe) {
         this.allCandles = candlesPerTimeframe;
+        this._precompute();
+    }
+
+    _precompute() {
+        const candles1m = this.allCandles['1m'];
+        if (!candles1m || candles1m.length === 0) return;
+
+        const t0 = Date.now();
+        const normWindow = this.config.data.normalization_window;
+        this.precomputed  = {};
+        this.tfAlignments = {};
+
+        for (const tf of TIMEFRAME_KEYS) {
+            const configKey  = TIMEFRAME_CONFIG_KEYS[tf];
+            const numCandles = this.config.timeframes[configKey];
+            if (!numCandles || numCandles <= 0) continue;
+
+            const candles = this.allCandles[tf] || [];
+            if (candles.length === 0) continue;
+
+            this.precomputed[tf] = precomputeIndicators(candles, normWindow);
+
+            // Dla 1m endIdx = stepIndex+1, nie potrzeba mapy
+            if (tf === '1m') continue;
+
+            // Jednorazowy liniowy sweep O(N1m + NTF): dla każdej świecy 1m
+            // znajdź ile świec TF jest <= close_time tej świecy
+            const endIndices = new Int32Array(candles1m.length);
+            let j = 0;
+            for (let i = 0; i < candles1m.length; i++) {
+                const t = candles1m[i].close_time;
+                while (j < candles.length && candles[j].close_time <= t) j++;
+                endIndices[i] = j;
+            }
+            this.tfAlignments[tf] = endIndices;
+        }
+
+        console.log(`[TradingEnv:${this.symbol}] Pre-computed indicators in ${Date.now() - t0}ms`);
     }
 
     getDataLength() {
@@ -70,9 +110,16 @@ class TradingEnv {
 
     _getState() {
         const candle1m = this.allCandles['1m'];
-        if (!candle1m || this.currentStepIndex >= candle1m.length) {
-            return null;
+        if (!candle1m || this.currentStepIndex >= candle1m.length) return null;
+
+        if (this.precomputed) {
+            return buildStateFromPrecomputed(
+                this.precomputed, this.tfAlignments,
+                this.currentStepIndex, this.config
+            );
         }
+
+        // fallback (brak pre-kompilacji)
         const currentTime = candle1m[this.currentStepIndex].close_time || Date.now();
         return buildState(this.allCandles, currentTime, this.config);
     }
