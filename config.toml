@@ -38,25 +38,24 @@ metrics_push_interval_sec   = 5                  # Interwał wysyłania metryk (
 dashboard_poll_interval_sec = 60                 # Interwał odświeżania dashboardu (w sekundach)
 
 [training]
-gamma                   = 0.99              # Współczynnik dyskontowania nagród (gamma) - im bliższy 1, tym dalej widzi w przyszłość
-lr                      = 0.00001           # Learning rate - szybkość uczenia (zbyt wysoki = niestabilność, zbyt niski = wolne uczenie)
-batch_size              = 2048              # Rozmiar batcha - ile próbek na jedną aktualizację sieci
+gamma                   = 0.97              # Współczynnik dyskontowania nagród (gamma) - im bliższy 1, tym dalej widzi w przyszłość
+lr                      = 0.0003            # Learning rate - szybkość uczenia (zbyt wysoki = niestabilność, zbyt niski = wolne uczenie)
+batch_size              = 256               # Rozmiar batcha - ile próbek na jedną aktualizację sieci
 buffer_capacity         = 1000000           # Pojemność replay buffer - max liczba doświadczeń do przechowania
 min_buffer_size         = 50000             # Minymalny rozmiar bufferu przed rozpoczęciem treningu
 target_update_interval  = 1000              # Co ile kroków aktualizować sieć docelową (target network)
 epsilon_start           = 0.96              # Początkowy epsilon (Exploration Rate) - start z pełną eksploracją
 epsilon_end             = 0.02              # Końcowy epsilon - minimalna eksploracja po długim treningu
-epsilon_decay_fraction  = 0.1               # Frakcja treningu przeznaczona na decay epsilon (0.1 = 10% treningu)
-dropout                 = 0.15              # Dropout rate - regularization (0.1 = 10% neuronów losowo wyłączanych)
-n_step                  = 5                 # Liczba kroków dla N-step returns (1 = standardowy Q-learning)
+epsilon_decay_fraction  = 0.5               # Frakcja treningu przeznaczona na decay epsilon (0.5 = 50% treningu)
+dropout                 = 0.10              # Dropout rate - regularization (0.1 = 10% neuronów losowo wyłączanych)
 seed                    = 42                # Seed losowy dla powtarzalności eksperymentów
 resume_from_checkpoint  = ""                # Ścieżka do checkpointu do wznowienia treningu (puste = od zera)
 keep_last_n_checkpoints = 24                # Ile ostatnich checkpointów trzymać na dysku
 checkpoint_interval     = 5000              # Co ile kroków zapisywać checkpoint
 evaluation_interval     = 10000             # Co ile kroków uruchamiać ewaluację
-train_data_fraction     = 0.9               # Frakcja danych użyta do treningu (reszta = walidacja)
+validation_days         = 60                # Ile ostatnich dni zarezerwowanych do walidacji (reszta = trening)
 episode_length          = 1000              # Długość epizodu w decyzjach (nie świecach); start losowany z całej dostępnej historii
-step_interval           = 30                # Co ile świec 1m podejmować decyzję (1 = co minutę, 10 = co 10 minut, 60 = co godzinę)
+step_interval           = 5                 # Co ile świec 1m podejmować decyzję (1 = co minutę, 10 = co 10 minut, 60 = co godzinę)
 max_trades_per_episode  = 3                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
 
 [per]
@@ -69,7 +68,7 @@ epsilon    = 0.0001        # Mała wartość dodawana do priorytetów (zapewnia 
 num_actions          = 4            # Liczba akcji: 4 (HOLD, LONG, SHORT, CLOSE)
 n_transformer_blocks = 3            # Liczba bloków Transformer
 n_attention_heads    = 8            # Liczba głów attention
-key_dim              = 64           # Wymiar klucza i query w attention
+key_dim              = 16           # Wymiar klucza i query w attention (= conv1d_filters / n_attention_heads; nieużywany, PyTorch oblicza automatycznie)
 ff_dim               = 512          # Wymiar warstwy Feed-Forward
 conv_kernel_size     = 3            # Rozmiar jądra konwolucji 1D
 conv1d_filters       = 128          # Liczba filtrów w konwolucji 1D
@@ -82,15 +81,16 @@ use_macd     = true       # MACD - Moving Average Convergence Divergence
 use_sma20    = true       # SMA20 - Simple Moving Average 20 okresów
 
 [reward]
-commission_open         = 0.00075          # Prowizja za otwarcie pozycji (0.1%)
-commission_close       = 0.00075           # Prowizja za zamknięcie pozycji (0.1%)
-trade_penalty          = 0.005             # Kara za każdą transakcję (zachęca do rzadszego handlu)
-clip_min               = -2.0              # Minimalna nagroda/kara (clamping)
-clip_max               = 2.0               # Maksymalna nagroda/kara (clamping)
+commission_open         = 0.00075          # Prowizja za otwarcie pozycji 
+commission_close       = 0.00075           # Prowizja za zamknięcie pozycji 
+trade_penalty          = 0.00050           # Kara za otwarcie pozycji (zachęca do rzadszego wchodzenia)
+close_penalty          = 0.00050           # Kara za zamknięcie pozycji (zachęca do dłuższego trzymania)
+post_close_cooldown_steps = 5              # Po zamknięciu: ile kroków trade_penalty jest x2 (0 = wyłączone)
+clip_min               = -1.0              # Minimalna nagroda/kara (clamping)
+clip_max               = 1.0               # Maksymalna nagroda/kara (clamping)
 intermediate_reward_max = 0.1              # Max nagroda pośrednia (za małe zyski)
-drawdown_penalty      = 0.5                # Kara za duże obsunięcia kapitału
+drawdown_penalty      = 0.2                # Kara za duże obsunięcia kapitału
 time_decay_hours      = 1.0                # Czas bez akcji po którym zaczyna się kara za bezczynność
-confidence_scale      = 1.0                # Skalowanie pewności modelu (wyższy = większe nagrody za pewność)
 
 [data]
 source               = "file"                           # Źródło danych: "file" = pliki CSV, "binance" = API Binance
@@ -108,11 +108,23 @@ max_files        = 5                                # Max liczba plików logów 
 log_dir          = "logs"                           # Katalog na pliki logów
 
 [backtesting]
-enabled    = false                                  # Włączony/wyłączony backtesting
-model_path = "python/checkpoints/best_model.pt"     # Ścieżka do modelu do backtestingu
-start_date = "2023-01-01"                           # Data startu backtestu
-end_date   = "2023-12-31"                           # Data końca backtestu
-results_dir = "results"                             # Katalog na wyniki backtestu
+enabled       = false                                  # Włączony/wyłączony backtesting
+model_path    = "python/checkpoints/best_model.pt"     # Ścieżka do modelu do backtestingu
+start_date    = "2023-01-01"                           # Data startu backtestu
+end_date      = "2023-12-31"                           # Data końca backtestu
+results_dir   = "results"                              # Katalog na wyniki backtestu
+step_interval = 5                                      # Co ile świec 1m podejmować decyzję podczas backtestu (powinno być = training.step_interval)
+max_oos_days  = 30                                      # Ile ostatnich dni OOS używać do backtestu (60 = 2 miesiące = 86 400 świec 1m)
+fee           = 0.00075                                # Prowizja za jedną stronę transakcji (open lub close); łączny koszt = fee * 2
+
+[alerts]
+enabled                    = true              # Włącz alerty Telegram
+telegram_token             = "8768128197:AAH8hjBaoKWFhIzAC0-TeGYoKK0Nvzd4TIU"
+telegram_chat_id           = ""               # Uzupełnij: wyślij /start do bota i wklej chat_id
+cooldown_sec               = 300              # Min 5 minut między alertami tego samego typu
+grad_explode_threshold     = 5.0              # grad_norm > próg → alert
+action_collapse_threshold  = 0.95             # dominant_ratio > próg → alert
+loss_plateau_steps         = 2000             # Brak poprawy loss przez N kroków → alert
 
 [api]
 simulation_mode = true       # Tryb symulacji (true) lub realny handel (false)

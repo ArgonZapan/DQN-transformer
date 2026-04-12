@@ -23,7 +23,7 @@ class Conv1DBlock(nn.Module):
         x = F.pad(x, (self.causal_pad, 0))
         x = self.conv(x)
         x = self.bn(x)
-        x = F.relu(x)
+        x = F.leaky_relu(x, 0.01)
         x = self.dropout(x)
         # Global Average Pooling: [batch, filters, seq_len] -> [batch, filters]
         x = x.mean(dim=2)
@@ -39,7 +39,7 @@ class TransformerEncoderBlock(nn.Module):
         self.ln1 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
             nn.Dropout(dropout),
             nn.Linear(ff_dim, d_model)
         )
@@ -107,10 +107,10 @@ class TradingDQN(nn.Module):
 
         self.trunk = nn.Sequential(
             nn.Linear(trunk_dim, 512),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
             nn.Dropout(self.dropout),
             nn.Linear(512, 256),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),
             nn.Dropout(self.dropout)
         )
 
@@ -159,12 +159,6 @@ class TradingDQN(nn.Module):
             q_values = q_values.masked_fill(action_mask == 0, float('-inf'))
 
         return q_values
-
-    def get_confidence(self, q_values):
-        """Pewność modelu na podstawie rozrzutu Q-values."""
-        sorted_q = torch.sort(q_values, dim=1, descending=True)
-        confidence = sorted_q.values[:, 0] - sorted_q.values[:, 1]
-        return torch.sigmoid(confidence)
 
     def reset_noise(self):
         """Reset szumu w NoisyLinear (jeśli używane)."""

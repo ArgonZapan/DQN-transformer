@@ -26,6 +26,21 @@ results/*.json
 
 # Logs
 logs/*.log
+python/logs/
+
+# TensorBoard runs
+runs/
+
+# Virtual environment
+venv_cuda/
+
+# Diagnostics runtime data
+python/diagnostics/metrics.jsonl
+python/diagnostics/health_checks.jsonl
+python/diagnostics/baseline.json
+
+# Shutdown flag
+python/shutdown.flag
 
 # IDE
 .vscode/

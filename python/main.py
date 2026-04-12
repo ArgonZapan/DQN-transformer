@@ -11,6 +11,8 @@ from config import load_config
 from training.trainer import Trainer
 from server.zmq_server import ZMQServer
 from monitoring.monitor_client import MonitorClient
+from diagnostics.health_runner import HealthRunner
+from diagnostics.baseline_comparator import BaselineComparator
 
 logger = logging.getLogger('learner')
 
@@ -60,6 +62,10 @@ def main():
     trainer = Trainer(config)
     logger.info(f"Model initialized on {device}")
 
+    health_runner = HealthRunner(trainer, check_interval_sec=3600)
+    baseline_comparator = BaselineComparator(config, config['learner']['device'])
+    _baseline_done = baseline_comparator.computed   # True jeśli załadowano z pliku
+
     monitor = MonitorClient(config)
     try:
         monitor.connect()
@@ -67,6 +73,11 @@ def main():
         logger.warning(f"Could not connect to monitoring: {e}")
 
     zmq_server = ZMQServer(config, trainer)
+
+    # Ścieżka absolutna — niezależna od CWD
+    shutdown_flag = os.path.abspath(os.path.join(os.path.dirname(__file__), 'shutdown.flag'))
+    if os.path.exists(shutdown_flag):
+        os.remove(shutdown_flag)
 
     def graceful_shutdown(signum, frame):
         metrics = trainer.get_metrics()
@@ -78,12 +89,16 @@ def main():
         logger.info("Checkpoint saved. Shutting down.")
         zmq_server.close()
         monitor.close()
+        # Usuń flagę po zapisie — stop.bat czeka aż flaga zniknie
+        if os.path.exists(shutdown_flag):
+            os.remove(shutdown_flag)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, graceful_shutdown)
     signal.signal(signal.SIGINT, graceful_shutdown)
 
     def training_loop():
+        nonlocal _baseline_done
         push_interval = config['monitoring']['metrics_push_interval_sec']
         last_push = 0.0
         last_buffer_log = 0.0
@@ -103,7 +118,20 @@ def main():
             if loss is not None:
                 if not training_started:
                     logger.info(f"[Training] STARTED: buffer={len(trainer.buffer)}, step={trainer.step_count}")
+                    trainer.alert_system.notify_training_started(trainer.step_count, len(trainer.buffer))
                     training_started = True
+
+                # Baseline — raz po zapełnieniu buffera
+                if not _baseline_done:
+                    try:
+                        baseline_comparator.compute(trainer.buffer)
+                    except Exception as e:
+                        logger.warning(f"[Baseline] Failed: {e}")
+                    _baseline_done = True
+
+                # Hourly health check
+                health_runner.maybe_run()
+
                 if now - last_push >= push_interval:
                     metrics = trainer.get_metrics()
                     logger.info(f"[Training] step={metrics['step']}, loss={loss:.6f}, epsilon={metrics['epsilon']:.4f}")
@@ -130,8 +158,12 @@ def main():
     try:
         while True:
             time.sleep(1)
+            if os.path.exists(shutdown_flag):
+                logger.info("[Learner] Shutdown flag detected — saving checkpoint...")
+                graceful_shutdown(None, None)  # usuwa flagę po zapisie, potem sys.exit
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+        graceful_shutdown(None, None)
 
 
 if __name__ == '__main__':

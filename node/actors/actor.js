@@ -89,9 +89,9 @@ class Actor {
 
             if (Math.random() < this.epsilon) {
                 wasRandom = true;
-                // LONG=2%, SHORT=2%, HOLD=94%, CLOSE=2% — ważona losowość
+                // LONG=13%, SHORT=13%, HOLD=60%, CLOSE=13% — ważona losowość
                 // Zablokowane akcje (maska=0) dostają wagę 0, reszta renormalizowana
-                const WEIGHTS = [2, 2, 94, 2];
+                const WEIGHTS = [13, 13, 60, 13];
                 const weights = actionMask.map((m, i) => m === 1 ? WEIGHTS[i] : 0);
                 const total = weights.reduce((a, b) => a + b, 0);
                 let r = Math.random() * total;
@@ -203,6 +203,18 @@ class Actor {
         const metrics = this.env.getMetrics();
         const trades  = this.env.getTrades();
 
+        // ANSI helpers
+        const c = {
+            green:  s => `\x1b[32m${s}\x1b[0m`,
+            red:    s => `\x1b[31m${s}\x1b[0m`,
+            yellow: s => `\x1b[33m${s}\x1b[0m`,
+            cyan:   s => `\x1b[36m${s}\x1b[0m`,
+            gray:   s => `\x1b[2m${s}\x1b[0m`,
+            bold:   s => `\x1b[1m${s}\x1b[0m`,
+        };
+        // Kolor per akcja: LONG=zielony, SHORT=czerwony, HOLD=szary, CLOSE=żółty
+        const ACTION_COLORS = [c.green, c.red, c.gray, c.yellow];
+
         const ep = this.totalEpisodes + 1;
         const rc = this.config.reward;
         let totalNetPnl = 0;
@@ -213,8 +225,10 @@ class Actor {
             totalNetPnl += gross - rc.commission_open - rc.commission_close - rc.trade_penalty;
         }
 
-        const pnlStr = `${totalNetPnl >= 0 ? '+' : ''}${(totalNetPnl * 100).toFixed(3)}%`;
-        console.log(`\n[${this.symbol}] Episode ${ep} | Steps: ${episodeLog.length} | Trades: ${trades.length} | W:${metrics.wins} L:${metrics.losses} | PnL: ${pnlStr} | ε=${this.epsilon.toFixed(3)}`);
+        const pnlStr = totalNetPnl >= 0
+            ? c.green(`+${(totalNetPnl * 100).toFixed(3)}%`)
+            : c.red(`${(totalNetPnl * 100).toFixed(3)}%`);
+        console.log(`\n[${this.symbol}] Episode ${ep} | Steps: ${episodeLog.length} | Trades: ${trades.length} | W:${c.green(metrics.wins)} L:${c.red(metrics.losses)} | PnL: ${pnlStr} | ε=${this.epsilon.toFixed(3)}`);
 
         const table = new Table({
             head: ['#', 'Timestamp', 'Price', 'uPNL%', 'Pos', 'Src', 'Action', 'LONG', 'SHORT', 'HOLD', 'CLOSE', 'returnG'],
@@ -223,11 +237,14 @@ class Actor {
             style: { head: [], border: [] },
         });
 
-        const fmtQ = (q, blocked, chosen) => {
+        const fmtQ = (q, blocked, chosen, actionIdx) => {
             if (blocked) return '';
             const marker = chosen ? '►' : ' ';
             const val = !isFinite(q) ? '-Inf' : q.toFixed(4);
-            return `${marker}${val}`;
+            const str = `${marker}${val}`;
+            return chosen
+                ? c.bold(ACTION_COLORS[actionIdx](str))
+                : ACTION_COLORS[actionIdx](str);
         };
 
         for (let i = 0; i < episodeLog.length; i++) {
@@ -246,22 +263,28 @@ class Actor {
                 const raw = row.posAfter === 'SHORT'
                     ? (row.posOpenPrice - row.price) / row.posOpenPrice
                     : (row.price - row.posOpenPrice) / row.posOpenPrice;
-                uPnl = `${raw >= 0 ? '+' : ''}${(raw * 100).toFixed(3)}`;
+                const rawStr = `${raw >= 0 ? '+' : ''}${(raw * 100).toFixed(3)}`;
+                uPnl = raw >= 0 ? c.green(rawStr) : c.red(rawStr);
             }
 
             const posBefore = row.posBefore ? row.posBefore[0] : '─';
             const posAfter  = row.posAfter  ? row.posAfter[0]  : '─';
 
-            const src = row.wasRandom ? '' : 'model';
+            const src = row.wasRandom ? c.gray('rnd') : c.cyan('model');
 
-            const rewardStr = row.reward !== 0 ? ` r=${row.reward >= 0 ? '+' : ''}${row.reward.toFixed(4)}` : '';
-            const actionStr = `${A[row.action]}${rewardStr}`;
+            const rewardStr = row.reward !== 0
+                ? ` r=${row.reward >= 0 ? c.green(`+${row.reward.toFixed(4)}`) : c.red(row.reward.toFixed(4))}`
+                : '';
+            const actionStr = `${ACTION_COLORS[row.action](A[row.action])}${rewardStr}`;
 
             const qCells = row.qValues
-                ? row.qValues.map((q, ai) => fmtQ(q, row.mask[ai] === 0, ai === row.action))
-                : A.map((_, ai) => (row.mask[ai] === 0 ? '' : (ai === row.action ? '►' : '')));
+                ? row.qValues.map((q, ai) => fmtQ(q, row.mask[ai] === 0, ai === row.action, ai))
+                : A.map((_, ai) => (row.mask[ai] === 0 ? '' : (ai === row.action ? c.bold('►') : '')));
 
-            const returnG = mc ? `${mc.returnG >= 0 ? '+' : ''}${mc.returnG.toFixed(5)}` : '';
+            const returnGVal = mc ? mc.returnG : null;
+            const returnG = returnGVal != null
+                ? (returnGVal >= 0 ? c.green(`+${returnGVal.toFixed(5)}`) : c.red(returnGVal.toFixed(5)))
+                : '';
 
             table.push([i + 1, ts, price, uPnl, `${posBefore}→${posAfter}`, src, actionStr, ...qCells, returnG]);
         }

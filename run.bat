@@ -1,9 +1,9 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo Starting Trading DQN System with GPU...
+echo Starting Trading DQN System...
 
-:: Stop any existing processes that might be using our ports
+:: Stop any existing processes
 echo [Cleanup] Stopping existing processes...
 taskkill /F /IM "python.exe" >nul 2>&1
 taskkill /F /IM "node.exe" >nul 2>&1
@@ -23,7 +23,7 @@ if not exist "%~dp0node\node_modules" (
     call npm install
 )
 
-:: Dashboard (instaluj zależności jeśli potrzeba)
+:: Dashboard
 if exist "%~dp0dashboard\package.json" (
     if not exist "%~dp0dashboard\node_modules" (
         echo [Setup] Installing Dashboard dependencies...
@@ -41,24 +41,36 @@ if not exist "%~dp0venv_cuda\Scripts\python.exe" (
     call venv_cuda\Scripts\pip.exe install pyzmq msgpack toml tensorboard
 )
 
-:: Start processes using start command with full paths
-start "monitoring" node "%~dp0monitoring\server.js"
-start "learner" cmd /k "cd /d "%~dp0" && call venv_cuda\Scripts\activate.bat && python python\main.py"
+:: ROOT bez trailing backslash (unika problemu z "path\" w cudzysłowach)
+set ROOT=%~dp0
+set ROOT=%ROOT:~0,-1%
+set VENV=%ROOT%\venv_cuda\Scripts\activate.bat
 
-:: Wait for Learner to start
-timeout /t 5 /nobreak >nul
+:: Otwórz pierwsze okno Windows Terminal z zakładką Learner
+wt new-tab --title "Learner" cmd /k "cd /d "%ROOT%" && call "%VENV%" && python python\main.py"
+timeout /t 1 /nobreak >nul
 
-:: Start each actor in separate window
-start "actor_BTCUSDT" node "%~dp0node\index.js" --actor=BTCUSDT
-start "actor_ETHUSDT" node "%~dp0node\index.js" --actor=ETHUSDT
-start "actor_SOLUSDT" node "%~dp0node\index.js" --actor=SOLUSDT
+:: Dodaj pozostałe zakładki do tego samego okna (-w 0)
+wt -w 0 new-tab --title "Monitoring" cmd /k "cd /d "%ROOT%\monitoring" && node server.js"
+timeout /t 1 /nobreak >nul
 
-start "dashboard" cmd /k "cd /d "%~dp0dashboard" && npx vite"
+:: Aktorzy uruchamiani z ROOT (config.toml używa ścieżek relatywnych od roota)
+wt -w 0 new-tab --title "BTC" cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=BTCUSDT"
+timeout /t 1 /nobreak >nul
 
-start "tensorboard" cmd /k "cd /d "%~dp0" && call venv_cuda\Scripts\activate.bat && tensorboard --logdir=runs --port=6006 --bind_all"
+wt -w 0 new-tab --title "ETH" cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=ETHUSDT"
+timeout /t 1 /nobreak >nul
+
+wt -w 0 new-tab --title "SOL" cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=SOLUSDT"
+timeout /t 1 /nobreak >nul
+
+wt -w 0 new-tab --title "Dashboard" cmd /k "cd /d "%ROOT%\dashboard" && npx vite"
+timeout /t 1 /nobreak >nul
+
+wt -w 0 new-tab --title "TensorBoard" cmd /k "cd /d "%ROOT%" && call "%VENV%" && tensorboard --logdir=runs --port=6006 --bind_all"
 
 echo.
-echo System Trading DQN uruchomiony z GPU (RTX 3090).
+echo System uruchomiony w Windows Terminal (7 zakladek).
 echo TensorBoard: http://localhost:6006
 echo Aby zatrzymac: stop.bat
 

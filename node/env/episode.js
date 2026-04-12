@@ -6,9 +6,9 @@
 
 class Episode {
     constructor(config) {
-        this.trainDataFraction = config.training.train_data_fraction;
-        this.maxEpisodeLength  = config.training.episode_length;
-        this.stepInterval      = config.training.step_interval || 1;
+        this.validationDays   = config.training.validation_days;
+        this.maxEpisodeLength = config.training.episode_length;
+        this.stepInterval     = config.training.step_interval || 1;
         this.gamma = config.training.gamma;
 
         this.steps = [];
@@ -17,8 +17,13 @@ class Episode {
         this.done = false;
     }
 
+    _trainEnd(dataLength) {
+        // dataLength = liczba świec 1m; ostatnie validationDays * 1440 to walidacja
+        return Math.max(0, dataLength - this.validationDays * 24 * 60);
+    }
+
     getRandomStartIndex(dataLength) {
-        const trainEnd = Math.floor(dataLength * this.trainDataFraction);
+        const trainEnd = this._trainEnd(dataLength);
         const maxStart = trainEnd - this.maxEpisodeLength * this.stepInterval;
         if (maxStart <= 0) return 0;
         return Math.floor(Math.random() * maxStart);
@@ -39,7 +44,7 @@ class Episode {
     }
 
     isAtTrainEnd(dataLength) {
-        const trainEnd = Math.floor(dataLength * this.trainDataFraction);
+        const trainEnd = this._trainEnd(dataLength);
         const epEnd    = this.startIndex + this.maxEpisodeLength * this.stepInterval;
         return this.currentIndex >= Math.min(trainEnd, epEnd) - 1;
     }

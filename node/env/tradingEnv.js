@@ -51,6 +51,8 @@ class TradingEnv {
         this.tfAlignments = null;
         this.currentStepIndex = 0;
         this.trades = [];
+        this.stepsSinceClose = Infinity; // kroki od ostatniego zamknięcia pozycji
+        this.prevUnrealizedPnl = 0;     // poprzednie uPnL — do obliczania delty krok-po-kroku
     }
 
     setData(candlesPerTimeframe) {
@@ -103,6 +105,8 @@ class TradingEnv {
     reset() {
         this.position = null;
         this.trades = [];
+        this.stepsSinceClose = Infinity;
+        this.prevUnrealizedPnl = 0;
         const dataLen = this.getDataLength();
         this.currentStepIndex = this.episode.start(dataLen);
         return this._getState();
@@ -144,21 +148,41 @@ class TradingEnv {
 
         if (action === ACTIONS.LONG && this.position === null) {
             this.position = new Position('LONG', currentPrice, currentTime);
-            reward = calculateOpenPenalty(this.rewardConfig);
+            reward = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
+            this.stepsSinceClose = Infinity;
         } else if (action === ACTIONS.SHORT && this.position === null) {
             this.position = new Position('SHORT', currentPrice, currentTime);
-            reward = calculateOpenPenalty(this.rewardConfig);
+            reward = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
+            this.stepsSinceClose = Infinity;
         } else if (action === ACTIONS.CLOSE && this.position !== null) {
             this.position.close(currentPrice, currentTime);
             reward = calculateReward(this.position, this.rewardConfig);
             this.trades.push({ ...this.position });
             this.position = null;
+            this.prevUnrealizedPnl = 0;
+            this.stepsSinceClose = 0;
             if (this.maxTradesPerEpisode > 0 && this.trades.length >= this.maxTradesPerEpisode) {
                 tradeClosed = true;
             }
         }
 
+        // Licznik kroków od zamknięcia — inkrementuj przy każdym kroku gdy nie mamy pozycji
+        if (this.position === null && this.stepsSinceClose < Infinity) {
+            this.stepsSinceClose++;
+        }
+
+        // Intermediate reward: delta unrealized PnL w każdym kroku z otwartą pozycją.
+        // Daje sygnał uczący przy HOLD zamiast reward=0 przez całe trzymanie pozycji.
+        // Przy LONG/SHORT open: delta = 0 (openPrice = currentPrice → uPnl = 0 = prevUnrealizedPnl).
+        // Przy CLOSE: reward już naliczony wyżej, pozycja null — tu nic nie robimy.
         if (this.position !== null) {
+            const uPnl = this.position.side === 'LONG'
+                ? (currentPrice - this.position.openPrice) / this.position.openPrice
+                : (this.position.openPrice - currentPrice) / this.position.openPrice;
+            const delta = uPnl - this.prevUnrealizedPnl;
+            const cap = this.rewardConfig.intermediate_reward_max;
+            reward += Math.max(-cap, Math.min(cap, delta));
+            this.prevUnrealizedPnl = uPnl;
             this.position.updateDrawdown(currentPrice);
         }
 
@@ -174,6 +198,7 @@ class TradingEnv {
             reward = calculateReward(this.position, this.rewardConfig);
             this.trades.push({ ...this.position });
             this.position = null;
+            this.prevUnrealizedPnl = 0;
         }
 
         const nextState = done ? null : this._getState();

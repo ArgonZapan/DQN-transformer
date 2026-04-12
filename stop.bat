@@ -1,27 +1,30 @@
 @echo off
 echo Zatrzymywanie systemu Trading DQN...
 
-:: 1. Zatrzymaj Aktorzy (Node.js) - każdy w osobnym oknie
-echo [1/4] Zatrzymywanie Aktorow...
-taskkill /F /FI "WINDOWTITLE eq actor_BTCUSDT*" /T >nul 2>&1
-taskkill /F /FI "WINDOWTITLE eq actor_ETHUSDT*" /T >nul 2>&1
-taskkill /F /FI "WINDOWTITLE eq actor_SOLUSDT*" /T >nul 2>&1
-taskkill /F /FI "WINDOWTITLE eq actors*" /T >nul 2>&1
-timeout /t 3 /nobreak >nul
+:: 1. Zatrzymaj Learner gracefully przez plik-flagę (żeby zapisał checkpoint)
+echo [1/3] Wysylam sygnal shutdown do Learnera...
+echo. > "%~dp0python\shutdown.flag"
+echo Czekam max 60s na zapis checkpointu...
+set /a i=0
+:wait_loop
+timeout /t 1 /nobreak >nul
+set /a i+=1
+if not exist "%~dp0python\shutdown.flag" goto learner_done
+if %i% geq 60 goto force_kill
+goto wait_loop
 
-:: 2. Zatrzymaj Learner (Python) — zapisze checkpoint
-echo [2/4] Zatrzymywanie Learnera (zapisuje checkpoint)...
-taskkill /F /FI "WINDOWTITLE eq learner*" /T >nul 2>&1
-timeout /t 10 /nobreak >nul
+:force_kill
+echo UWAGA: Learner nie odpowiedzial w 60s, force kill...
 
-:: 3. Zatrzymaj Monitoring Service
-echo [3/4] Zatrzymywanie Monitoring Service...
-taskkill /F /FI "WINDOWTITLE eq monitoring*" /T >nul 2>&1
-timeout /t 2 /nobreak >nul
+:learner_done
 
-:: 4. Zatrzymaj Dashboard
-echo [4/4] Zatrzymywanie Dashboard...
-taskkill /F /FI "WINDOWTITLE eq dashboard*" /T >nul 2>&1
+:: 2. Zatrzymaj wszystkie procesy Python (Learner + TensorBoard)
+echo [2/3] Zatrzymywanie procesow Python...
+taskkill /F /IM "python.exe" /T >nul 2>&1
+
+:: 3. Zatrzymaj wszystkie procesy Node (Aktorzy + Monitoring + Dashboard)
+echo [3/3] Zatrzymywanie procesow Node...
+taskkill /F /IM "node.exe" /T >nul 2>&1
 
 echo.
 echo System zatrzymany.

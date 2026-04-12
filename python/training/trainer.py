@@ -14,6 +14,9 @@ from model.network import TradingDQN
 from training.replay_buffer import ReplayBuffer
 from training.prioritized_buffer import PrioritizedReplayBuffer
 from training.debugger import TensorBoardDebugger
+from diagnostics.metric_logger import MetricLogger
+from diagnostics.alert_system import AlertSystem
+from diagnostics.attention_monitor import AttentionMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +84,14 @@ class Trainer:
         self.debugger = TensorBoardDebugger(self.writer, config)
         self._last_debug_time = 0.0
 
+        # Moduł diagnostyczny
+        diag_dir = 'python/diagnostics'
+        self.metric_logger = MetricLogger(os.path.join(diag_dir, 'metrics.jsonl'), flush_every=50)
+        self.alert_system = AlertSystem(config)
+        self.attention_monitor = AttentionMonitor(self.main_network, self.writer)
+        self.attention_monitor.register()
+        self._last_advantage_std: float | None = None
+
         # Akumulatory metryk (sumowane między logowaniami)
         self._metrics_accumulator = {
             'loss_sum': 0.0,
@@ -129,6 +140,8 @@ class Trainer:
             return
 
         ckpt_dir = os.path.join('python', 'checkpoints')
+
+        # Zbierz WSZYSTKIE checkpointy i wybierz ten z najwyższym step jako model
         candidates = []
         for name in ('shutdown_checkpoint.pt', 'hourly_checkpoint.pt'):
             p = os.path.join(ckpt_dir, name)
@@ -138,13 +151,40 @@ class Trainer:
                     candidates.append((c.get('step', 0), p))
                 except Exception as e:
                     logger.warning(f"Could not read {p}: {e}")
-        if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            best_path = candidates[0][1]
-            logger.info(f"Resuming from: {best_path}")
-            self._load_checkpoint(best_path)
 
-    def _load_checkpoint(self, path):
+        for p in sorted(glob.glob(os.path.join(ckpt_dir, 'checkpoint_step_*.pt'))):
+            try:
+                c = torch.load(p, map_location='cpu', weights_only=False)
+                candidates.append((c.get('step', 0), p))
+            except Exception as e:
+                logger.warning(f"Could not read {p}: {e}")
+
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_model_path = candidates[0][1]
+        logger.info(f"[Checkpoint] Loading model from: {best_model_path} (step {candidates[0][0]})")
+        self._load_checkpoint(best_model_path, load_buffer=False)
+
+        # Buffer wczytaj z najnowszego pliku który go zawiera (shutdown > hourly)
+        buffer_candidates = []
+        for name in ('shutdown_checkpoint.pt', 'hourly_checkpoint.pt'):
+            p = os.path.join(ckpt_dir, name)
+            if os.path.exists(p):
+                try:
+                    c = torch.load(p, map_location='cpu', weights_only=False)
+                    if 'buffer' in c:
+                        buffer_candidates.append((c.get('step', 0), p))
+                except Exception:
+                    pass
+        if buffer_candidates:
+            buffer_candidates.sort(key=lambda x: x[0], reverse=True)
+            buf_path = buffer_candidates[0][1]
+            logger.info(f"[Checkpoint] Loading replay buffer from: {buf_path} (step {buffer_candidates[0][0]})")
+            self._load_buffer(buf_path)
+
+    def _load_checkpoint(self, path, load_buffer=True):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.main_network.load_state_dict(checkpoint['model_state_dict'])
         self.target_network.load_state_dict(checkpoint['model_state_dict'])
@@ -152,11 +192,18 @@ class Trainer:
         self.step_count = checkpoint.get('step', 0)
         self.epsilon = checkpoint.get('epsilon', self.epsilon_start)
         self.last_loss = checkpoint.get('loss', 0.0)
-        if 'buffer' in checkpoint:
+        if load_buffer and 'buffer' in checkpoint:
             logger.info(f"[Checkpoint] Restoring replay buffer ({checkpoint['buffer']['size']} experiences)...")
             self.buffer.load_state(checkpoint['buffer'])
             logger.info(f"[Checkpoint] Buffer restored: {len(self.buffer)} experiences")
         logger.info(f"Checkpoint loaded from {path} (step {self.step_count})")
+
+    def _load_buffer(self, path):
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        if 'buffer' in checkpoint:
+            logger.info(f"[Checkpoint] Restoring replay buffer ({checkpoint['buffer']['size']} experiences)...")
+            self.buffer.load_state(checkpoint['buffer'])
+            logger.info(f"[Checkpoint] Buffer restored: {len(self.buffer)} experiences")
 
     def save_checkpoint(self, path=None, include_buffer=False):
         if path is None:
@@ -356,7 +403,24 @@ class Trainer:
                     self.writer.add_scalar(f'{prefix}/transactions', data['transactions'], step)
             
             logger.debug(f"[TensorBoard] Logged at step {step}, accumulated {n} steps")
-        
+
+            # ---- Diagnostics: JSON Lines + alerty ----
+            total_actions = sum(acc['actions_total'])
+            diag_metrics = {
+                'loss': avg_loss,
+                'q_mean': avg_q,
+                'q_spread': acc['q_spread_sum'] / n,
+                'grad_norm': avg_grad,
+                'td_mean': avg_td,
+                'td_std': td_std,
+                'action_ratios': [c / total_actions for c in acc['actions_total']] if total_actions > 0 else [0.0] * 4,
+                'advantage_std': self._last_advantage_std,
+                'reward_mean': getattr(self, '_last_reward_mean', None),
+                'epsilon': self.epsilon,
+            }
+            self.metric_logger.log(step, diag_metrics)
+            self.alert_system.check_and_alert(diag_metrics, step)
+
         # Reset akumulatorów
         self._metrics_accumulator = {
             'loss_sum': 0.0,
@@ -394,6 +458,7 @@ class Trainer:
             self.debugger.log_q_diagnostics(self._last_q, step)
         if hasattr(self, '_last_rewards') and self._last_rewards is not None:
             self.debugger.log_reward_stats(self._last_rewards, step)
+            self._last_reward_mean = self._last_rewards.detach().cpu().mean().item()
         if hasattr(self, '_last_td') and self._last_td is not None:
             self.debugger.log_td_histogram(self._last_td, step)
 
@@ -468,6 +533,13 @@ class Trainer:
         if debug_now:
             self.debugger.log_gradient_flow(self.main_network, self.step_count)
 
+        # Zmierz normę gradientu PRZED clippingiem — po clip zawsze <= 1.0 (bez diagnostycznej wartości)
+        pre_clip_norm = 0.0
+        for p in self.main_network.parameters():
+            if p.grad is not None:
+                pre_clip_norm += p.grad.data.norm(2).item() ** 2
+        pre_clip_norm = pre_clip_norm ** 0.5
+
         torch.nn.utils.clip_grad_norm_(self.main_network.parameters(), 1.0)
         self.optimizer.step()
 
@@ -479,6 +551,9 @@ class Trainer:
                 self.main_network._debug_advantage,
                 self.step_count,
             )
+            attn_metrics = self.attention_monitor.log_diagnostics(self.step_count)
+            if self.main_network._debug_advantage is not None:
+                self._last_advantage_std = self.main_network._debug_advantage.detach().std().item()
             self._last_debug_time = time_module.time()
 
         if self.use_per:
@@ -488,6 +563,10 @@ class Trainer:
         self.last_loss = loss.item()
         self._update_epsilon()
 
+        if self.use_per:
+            beta_fraction = min(1.0, self.step_count / self.config['training']['buffer_capacity'])
+            self.buffer.update_beta(beta_fraction)
+
         # ===== Akumuluj metryki do późniejszego logowania =====
         acc = self._metrics_accumulator
         
@@ -495,11 +574,10 @@ class Trainer:
         acc['loss_sum'] += self.last_loss
         acc['loss_count'] += 1
         
-        # TD Error - używaj sum zamiast mean żeby poprawnie wyliczyć std
+        # TD Error — używaj mean żeby n=steps_accumulated był właściwym mianownikiem
         td_np = td_errors.detach().cpu().numpy()
-        batch_size = td_np.shape[0] if len(td_np.shape) > 0 else 1
-        acc['td_error_sum'] += float(np.sum(td_np))
-        acc['td_error_sq_sum'] += float(np.sum(td_np ** 2))
+        acc['td_error_sum'] += float(np.mean(td_np))
+        acc['td_error_sq_sum'] += float(np.mean(td_np ** 2))
         acc['td_error_max'] = max(acc['td_error_max'], float(np.max(np.abs(td_np))))
         
         # Q-values — mean/max/min po osi batch (per-sample best Q)
@@ -510,13 +588,8 @@ class Trainer:
         acc['q_min_sum']  += float(q_np.min(axis=1).mean())
         acc['q_count'] += q_batch_size
         
-        # Gradient norm
-        total_norm = 0.0
-        for p in self.main_network.parameters():
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-        total_norm = total_norm ** 0.5
-        acc['grad_norm_sum'] += total_norm
+        # Gradient norm — używamy pre_clip_norm obliczonego przed clip_grad_norm_()
+        acc['grad_norm_sum'] += pre_clip_norm
         
         # Actions
         for a in actions.cpu().numpy():
@@ -527,7 +600,9 @@ class Trainer:
         with torch.no_grad():
             q_det = current_q.detach()
             spread = (q_det.max(dim=1).values - q_det.min(dim=1).values).mean().item()
-            probs = torch.softmax(q_det, dim=1)
+            # Entropia tylko po dozwolonych akcjach — zablokowane muszą być -inf przed softmax
+            q_masked = q_det.masked_fill(action_masks == 0, float('-inf'))
+            probs = torch.softmax(q_masked, dim=1)
             entropy = -(probs * torch.log2(probs + 1e-8)).sum(dim=1).mean().item()
         acc['q_spread_sum'] += spread
         acc['action_entropy_sum'] += entropy
