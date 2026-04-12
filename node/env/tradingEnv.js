@@ -53,6 +53,7 @@ class TradingEnv {
         this.trades = [];
         this.stepsSinceClose = Infinity; // kroki od ostatniego zamknięcia pozycji
         this.prevUnrealizedPnl = 0;     // poprzednie uPnL — do obliczania delty krok-po-kroku
+        this._barsInTrade = 0;          // liczba kroków od otwarcia aktualnej pozycji
     }
 
     setData(candlesPerTimeframe) {
@@ -107,25 +108,44 @@ class TradingEnv {
         this.trades = [];
         this.stepsSinceClose = Infinity;
         this.prevUnrealizedPnl = 0;
+        this._barsInTrade = 0;
         const dataLen = this.getDataLength();
         this.currentStepIndex = this.episode.start(dataLen);
         return this._getState();
+    }
+
+    _getPositionFeatures() {
+        if (this.position === null) {
+            return [0, 0, 0, 0];
+        }
+        const currentPrice = this._getCurrentPrice();
+        const isLong  = this.position.side === 'LONG'  ? 1 : 0;
+        const isShort = this.position.side === 'SHORT' ? 1 : 0;
+        const unrealizedPnl = isLong
+            ? (currentPrice - this.position.openPrice) / this.position.openPrice
+            : (this.position.openPrice - currentPrice) / this.position.openPrice;
+        const barsNorm = Math.min(this._barsInTrade / 200, 1.0);
+        return [isLong, isShort, unrealizedPnl, barsNorm];
     }
 
     _getState() {
         const candle1m = this.allCandles['1m'];
         if (!candle1m || this.currentStepIndex >= candle1m.length) return null;
 
+        let state;
         if (this.precomputed) {
-            return buildStateFromPrecomputed(
+            state = buildStateFromPrecomputed(
                 this.precomputed, this.tfAlignments,
                 this.currentStepIndex, this.config
             );
+        } else {
+            // fallback (brak pre-kompilacji)
+            const currentTime = candle1m[this.currentStepIndex].close_time || Date.now();
+            state = buildState(this.allCandles, currentTime, this.config);
         }
 
-        // fallback (brak pre-kompilacji)
-        const currentTime = candle1m[this.currentStepIndex].close_time || Date.now();
-        return buildState(this.allCandles, currentTime, this.config);
+        if (state) state.position = this._getPositionFeatures();
+        return state;
     }
 
     _getCurrentPrice() {
@@ -148,10 +168,12 @@ class TradingEnv {
 
         if (action === ACTIONS.LONG && this.position === null) {
             this.position = new Position('LONG', currentPrice, currentTime);
+            this._barsInTrade = 0;
             reward = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
             this.stepsSinceClose = Infinity;
         } else if (action === ACTIONS.SHORT && this.position === null) {
             this.position = new Position('SHORT', currentPrice, currentTime);
+            this._barsInTrade = 0;
             reward = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
             this.stepsSinceClose = Infinity;
         } else if (action === ACTIONS.CLOSE && this.position !== null) {
@@ -160,6 +182,7 @@ class TradingEnv {
             this.trades.push({ ...this.position });
             this.position = null;
             this.prevUnrealizedPnl = 0;
+            this._barsInTrade = 0;
             this.stepsSinceClose = 0;
             if (this.maxTradesPerEpisode > 0 && this.trades.length >= this.maxTradesPerEpisode) {
                 tradeClosed = true;
@@ -191,6 +214,11 @@ class TradingEnv {
 
         this.currentStepIndex += this.stepInterval;
 
+        // Increment barsInTrade after currentState is captured so nextState reflects N+1 steps held
+        if (this.position !== null) {
+            this._barsInTrade++;
+        }
+
         const done = tradeClosed || this.episode.isAtTrainEnd(this.getDataLength()) || this._getState() === null;
 
         if (done && this.position !== null) {
@@ -199,6 +227,7 @@ class TradingEnv {
             this.trades.push({ ...this.position });
             this.position = null;
             this.prevUnrealizedPnl = 0;
+            this._barsInTrade = 0;
         }
 
         const nextState = done ? null : this._getState();

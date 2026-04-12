@@ -9,7 +9,6 @@ Usage:
 import argparse
 import csv
 import json
-import math
 import os
 import sys
 from datetime import datetime, date, timezone
@@ -54,148 +53,229 @@ def load_csv(path: str) -> list:
     return candles
 
 
-# ── Indicators — exact port from node/data/indicators.js ─────────────────────
+# ── Pre-computed indicators (numpy, O(N) once per TF) ────────────────────────
 
-def rolling_mean(values: list, window: int) -> list:
-    """Partial window at start (identical to calculateSMA / rollingMean in JS)."""
-    result = []
-    for i in range(len(values)):
-        sl = values[max(0, i - window + 1):i + 1]
-        result.append(sum(sl) / len(sl))
-    return result
+def _rolling_mean_np(arr: np.ndarray, window: int) -> np.ndarray:
+    """Partial-window rolling mean matching JS rollingMean."""
+    out = np.empty(len(arr), dtype=np.float64)
+    cumsum = np.cumsum(arr)
+    for i in range(len(arr)):
+        w = min(i + 1, window)
+        out[i] = (cumsum[i] - (cumsum[i - w] if i >= w else 0.0)) / w
+    return out
 
 
-def rolling_std(values: list, window: int) -> list:
-    """Population std — divides by n, NOT n-1. Matches rollingStd in JS."""
-    result = []
-    for i in range(len(values)):
-        sl = values[max(0, i - window + 1):i + 1]
-        n = len(sl)
-        if n < 2:
-            result.append(0.0)
+def _rolling_std_np(arr: np.ndarray, window: int) -> np.ndarray:
+    """Population std, sliding window O(N). Matches JS rollingStd (Welford)."""
+    n = len(arr)
+    out = np.zeros(n, dtype=np.float64)
+    sum_x = sum_x2 = 0.0
+    for i in range(n):
+        sum_x  += arr[i]
+        sum_x2 += arr[i] * arr[i]
+        if i >= window:
+            sum_x  -= arr[i - window]
+            sum_x2 -= arr[i - window] * arr[i - window]
+        w = min(i + 1, window)
+        if w < 2:
             continue
-        mean = sum(sl) / n
-        variance = sum((v - mean) ** 2 for v in sl) / n
-        result.append(math.sqrt(variance))
-    return result
+        mean = sum_x / w
+        var = sum_x2 / w - mean * mean
+        out[i] = var ** 0.5 if var > 0 else 0.0
+    return out
 
 
-def calculate_ema(values: list, span: int) -> list:
-    """Seed = values[0]. Matches calculateEMA in JS."""
-    if not values:
-        return []
+def _ema_np(arr: np.ndarray, span: int) -> np.ndarray:
     k = 2.0 / (span + 1)
-    ema = [values[0]]
-    for v in values[1:]:
-        ema.append((v - ema[-1]) * k + ema[-1])
-    return ema
+    out = np.empty(len(arr), dtype=np.float64)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        out[i] = (arr[i] - out[i - 1]) * k + out[i - 1]
+    return out
 
 
-def calculate_rsi(closes: list, period: int = 14) -> list:
-    """Wilder's RSI. Fills with 0.0 before index period+1. Matches calculateRSI in JS."""
-    rsi = [0.0] * len(closes)
-    if len(closes) < period + 1:
-        return rsi
-
+def _rsi_np(closes: np.ndarray, period: int = 14) -> np.ndarray:
+    n = len(closes)
+    out = np.zeros(n, dtype=np.float64)
+    if n < period + 1:
+        return out
     avg_gain = avg_loss = 0.0
     for i in range(1, period + 1):
         d = closes[i] - closes[i - 1]
         if d > 0:
             avg_gain += d
         else:
-            avg_loss += abs(d)
+            avg_loss -= d
     avg_gain /= period
     avg_loss /= period
-
-    rsi[period] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
-
-    for i in range(period + 1, len(closes)):
+    out[period] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    for i in range(period + 1, n):
         d = closes[i] - closes[i - 1]
         g = d if d > 0 else 0.0
-        l = abs(d) if d < 0 else 0.0
+        l = -d if d < 0 else 0.0
         avg_gain = (avg_gain * (period - 1) + g) / period
         avg_loss = (avg_loss * (period - 1) + l) / period
-        rsi[i] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
-
-    return rsi
-
-
-def calculate_macd_line(closes: list, fast: int = 12, slow: int = 26) -> list:
-    """Returns MACD line (ema_fast - ema_slow). Matches calculateMACD in JS."""
-    ema_f = calculate_ema(closes, fast)
-    ema_s = calculate_ema(closes, slow)
-    return [f - s for f, s in zip(ema_f, ema_s)]
+        out[i] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    return out
 
 
-# ── Feature Engineering — exact port of buildFeatures() from state.js ────────
-
-def build_features(candles: list, norm_window: int = 20) -> list:
-    """8 features per candle. Identical output to state.js buildFeatures()."""
-    if not candles:
-        return []
-
-    closes  = [c['close']  for c in candles]
-    opens   = [c['open']   for c in candles]
-    highs   = [c['high']   for c in candles]
-    lows    = [c['low']    for c in candles]
-    volumes = [c['volume'] for c in candles]
-
-    mean_c    = rolling_mean(closes, norm_window)
-    std_c     = rolling_std(closes, norm_window)
-    rsi       = calculate_rsi(closes)
-    macd      = calculate_macd_line(closes)
-    sma20     = rolling_mean(closes, 20)
-    mean_vol  = rolling_mean(volumes, norm_window)
-
-    features = []
-    for i, c in enumerate(candles):
-        cl, op, hi, lo, vo = closes[i], opens[i], highs[i], lows[i], volumes[i]
-        prev = closes[i - 1] if i > 0 else cl
-
-        features.append([
-            (cl - mean_c[i]) / std_c[i]  if std_c[i]   != 0 else 0.0,  # normalizedClose
-            (hi - lo) / cl               if cl          != 0 else 0.0,  # relativeRange
-            (cl - op) / cl               if cl          != 0 else 0.0,  # candleDirection
-            vo / mean_vol[i]             if mean_vol[i] != 0 else 0.0,  # normalizedVolume
-            rsi[i] / 100.0,                                              # rsiNorm
-            macd[i] / cl                 if cl          != 0 else 0.0,  # macdNorm
-            (cl - prev) / prev           if prev        != 0 else 0.0,  # pctChange
-            1.0 if cl > sma20[i] else 0.0,                              # aboveSma
-        ])
-    return features
-
-
-# ── State Building — port of buildState() / getAlignedCandles() from state.js ─
-
-def get_aligned_candles(all_candles: list, current_time_ms: int, num_candles: int) -> list:
-    if num_candles <= 0:
-        return []
-    filtered = [c for c in all_candles if c['close_time'] <= current_time_ms]
-    return filtered[-num_candles:]
-
-
-def build_state(all_candles_per_tf: dict, current_time_ms: int, config: dict) -> dict:
+def precompute_features(candles: list, norm_window: int) -> np.ndarray:
     """
-    Port of buildState() from state.js.
-    Zeros at FRONT, real features at END (matching JS padding order).
-    Returns {tf_name: np.ndarray([N, 8], float32)}.
+    Pre-compute all 8 features for the full candle array once.
+    Returns float32 array of shape [N, 8].
+    Matches build_features() output exactly.
     """
-    tf_config = config['timeframes']
+    n = len(candles)
+    closes  = np.array([c['close']  for c in candles], dtype=np.float64)
+    opens   = np.array([c['open']   for c in candles], dtype=np.float64)
+    highs   = np.array([c['high']   for c in candles], dtype=np.float64)
+    lows    = np.array([c['low']    for c in candles], dtype=np.float64)
+    volumes = np.array([c['volume'] for c in candles], dtype=np.float64)
+
+    mean_c   = _rolling_mean_np(closes, norm_window)
+    std_c    = _rolling_std_np(closes, norm_window)
+    rsi      = _rsi_np(closes)
+    ema12    = _ema_np(closes, 12)
+    ema26    = _ema_np(closes, 26)
+    macd     = ema12 - ema26
+    sma20    = _rolling_mean_np(closes, 20)
+    mean_vol = _rolling_mean_np(volumes, norm_window)
+
+    prev_closes = np.empty(n, dtype=np.float64)
+    prev_closes[0] = closes[0]
+    prev_closes[1:] = closes[:-1]
+
+    out = np.zeros((n, 8), dtype=np.float32)
+
+    # np.where avoids computing division where denominator is 0 (no RuntimeWarning)
+    out[:, 0] = np.where(std_c != 0,        (closes - mean_c) / np.where(std_c != 0,        std_c,    1.0), 0.0)
+    out[:, 1] = np.where(closes != 0,       (highs - lows)    / np.where(closes != 0,        closes,   1.0), 0.0)
+    out[:, 2] = np.where(closes != 0,       (closes - opens)  / np.where(closes != 0,        closes,   1.0), 0.0)
+    out[:, 3] = np.where(mean_vol != 0,     volumes           / np.where(mean_vol != 0,      mean_vol, 1.0), 0.0)
+    out[:, 4] = rsi / 100.0
+    out[:, 5] = np.where(closes != 0,       macd              / np.where(closes != 0,        closes,   1.0), 0.0)
+    out[:, 6] = np.where(prev_closes != 0,  (closes - prev_closes) / np.where(prev_closes != 0, prev_closes, 1.0), 0.0)
+    out[:, 7] = (closes > sma20).astype(np.float32)
+
+    return out
+
+
+def build_alignment_map(candles_1m: list, candles_tf: list) -> np.ndarray:
+    """
+    For each 1m candle index, find how many TF candles have close_time <= that 1m close_time.
+    Returns int32 array of shape [N_1m] — endIdx for slicing precomputed TF features.
+    Binary search O(N_1m * log(N_tf)).
+    """
+    n1m = len(candles_1m)
+    ntf = len(candles_tf)
+    tf_times = np.array([c['close_time'] for c in candles_tf], dtype=np.int64)
+    alignment = np.empty(n1m, dtype=np.int32)
+    for i in range(n1m):
+        t = candles_1m[i]['close_time']
+        # searchsorted: find rightmost position where tf_times <= t
+        alignment[i] = int(np.searchsorted(tf_times, t, side='right'))
+    return alignment
+
+
+def trim_candles(all_candles: dict, oos_start_1m: int, config: dict) -> tuple:
+    """
+    Trim all TF candle arrays to OOS + lookback only.
+    Lookback = state_window + indicator_warmup (RSI 14, MACD 35, SMA 20, rolling norm_w).
+    Returns (trimmed_candles, new_oos_start) where new_oos_start is relative to trimmed 1m.
+    """
     norm_w = config['data']['normalization_window']
-    tf_map = {
-        'candles_1m': '1m', 'candles_15m': '15m',
-        'candles_1h': '1h', 'candles_1d': '1d', 'candles_1w': '1w',
-    }
+    indicator_warmup = max(norm_w, 35, 20, 14)  # largest indicator window
+    tf_map = {'candles_1m': '1m', 'candles_15m': '15m',
+              'candles_1h': '1h', 'candles_1d': '1d', 'candles_1w': '1w'}
+
+    candles_1m = all_candles.get('1m', [])
+    state_window_1m = config['timeframes'].get('candles_1m', 0)
+    lookback_1m = state_window_1m + indicator_warmup
+
+    trim_start_1m = max(0, oos_start_1m - lookback_1m)
+    trim_time_ms = candles_1m[trim_start_1m]['timestamp']
+
+    trimmed = {}
+    for cfg_key, tf_name in tf_map.items():
+        candles = all_candles.get(tf_name)
+        if not candles:
+            continue
+        if tf_name == '1m':
+            trimmed[tf_name] = candles[trim_start_1m:]
+        else:
+            state_window_tf = config['timeframes'].get(cfg_key, 0)
+            lookback_tf = state_window_tf + indicator_warmup
+            # binary search: first candle with timestamp >= trim_time_ms
+            lo, hi = 0, len(candles)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if candles[mid]['timestamp'] < trim_time_ms:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            trim_idx = max(0, lo - lookback_tf)
+            trimmed[tf_name] = candles[trim_idx:]
+            kept = len(candles) - trim_idx
+            print(f"[Backtest]   Trimmed {tf_name}: {len(candles)} → {kept} candles")
+
+    new_oos_start = oos_start_1m - trim_start_1m
+    kept_1m = len(candles_1m) - trim_start_1m
+    print(f"[Backtest]   Trimmed 1m: {len(candles_1m)} → {kept_1m} candles (OOS starts at idx {new_oos_start})")
+    return trimmed, new_oos_start
+
+
+def precompute_all(all_candles: dict, config: dict) -> dict:
+    """Pre-compute features and alignment maps for all TFs. Called once per symbol."""
+    norm_w = config['data']['normalization_window']
+    tf_map = {'candles_1m': '1m', 'candles_15m': '15m',
+              'candles_1h': '1h', 'candles_1d': '1d', 'candles_1w': '1w'}
+
+    candles_1m = all_candles.get('1m', [])
+    result = {'features': {}, 'alignment': {}}
+
+    for cfg_key, tf_name in tf_map.items():
+        if config['timeframes'].get(cfg_key, 0) <= 0:
+            continue
+        candles = all_candles.get(tf_name, [])
+        if not candles:
+            continue
+        print(f"[Backtest] Pre-computing features for {tf_name} ({len(candles)} candles)...")
+        result['features'][tf_name] = precompute_features(candles, norm_w)
+        if tf_name != '1m':
+            result['alignment'][tf_name] = build_alignment_map(candles_1m, candles)
+
+    return result
+
+
+def build_state_fast(precomp: dict, idx_1m: int, config: dict) -> dict:
+    """
+    Build state from pre-computed arrays. O(num_candles) slice instead of O(N) rescan.
+    idx_1m = current 1m candle index in the FULL array (not OOS-relative).
+    """
+    tf_map = {'candles_1m': '1m', 'candles_15m': '15m',
+              'candles_1h': '1h', 'candles_1d': '1d', 'candles_1w': '1w'}
     state = {}
     for cfg_key, tf_name in tf_map.items():
-        num = tf_config.get(cfg_key, 0)
+        num = config['timeframes'].get(cfg_key, 0)
         if num <= 0:
             continue
-        aligned = get_aligned_candles(all_candles_per_tf.get(tf_name, []), current_time_ms, num)
-        feats = build_features(aligned, norm_w)
-        pad = num - len(feats)
-        combined = [[0.0] * 8] * pad + feats  # zeros first
-        state[tf_name] = np.array(combined, dtype=np.float32)
+        feats = precomp['features'].get(tf_name)
+        if feats is None:
+            continue
+
+        if tf_name == '1m':
+            end_idx = idx_1m + 1
+        else:
+            end_idx = int(precomp['alignment'][tf_name][idx_1m])
+
+        start_idx = max(0, end_idx - num)
+        actual = feats[start_idx:end_idx]  # shape [K, 8]
+
+        pad = num - len(actual)
+        if pad > 0:
+            actual = np.concatenate([np.zeros((pad, 8), dtype=np.float32), actual], axis=0)
+
+        state[tf_name] = actual
     return state
 
 
@@ -213,10 +293,11 @@ def load_model(checkpoint_path: str, config: dict, device: str) -> TradingDQN:
 
 @torch.no_grad()
 def predict(model: TradingDQN, state_dict: dict, action_mask: list,
-            config: dict, device: str) -> int:
+            config: dict, device: str, position_features: list | None = None) -> int:
     """
     Greedy prediction. Tensor order matches Trainer.predict():
     sorted active config keys → ['candles_15m', 'candles_1d', 'candles_1h', 'candles_1m']
+    position_features: [is_long, is_short, unrealized_pnl, bars_norm] or None
     """
     tf_keys = sorted(k for k, v in config['timeframes'].items() if v > 0)
     tensors = []
@@ -227,7 +308,8 @@ def predict(model: TradingDQN, state_dict: dict, action_mask: list,
         tensors.append(torch.tensor(arr, dtype=torch.float32).unsqueeze(0).to(device))
 
     mask = torch.tensor([action_mask], dtype=torch.float32).to(device)
-    q = model(tensors, action_mask=mask)
+    pos_tensor = torch.tensor([position_features], dtype=torch.float32).to(device) if position_features is not None else None
+    q = model(tensors, action_mask=mask, position_features=pos_tensor)
     return q.argmax(dim=1).item()
 
 
@@ -247,12 +329,12 @@ class Position:
 
 
 def net_pnl(pos: Position, config: dict) -> float:
-    """Gross PnL minus commissions and trade_penalty. Matches calculateReward() in reward.js."""
+    """Gross PnL minus exchange fee (open + close). No training penalties."""
     gross = ((pos.close_price - pos.open_price) / pos.open_price
              if pos.side == 'LONG'
              else (pos.open_price - pos.close_price) / pos.open_price)
-    r = config['reward']
-    return gross - r['commission_open'] - r['commission_close'] - r['trade_penalty']
+    fee = config['backtesting']['fee']
+    return gross - fee * 2
 
 
 def action_mask_for(position) -> list:
@@ -296,33 +378,66 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
         print(f"[Backtest] {symbol}: no 1m data — skipping")
         return {'trades': [], 'equity_curve': [0.0], 'daily_pnl': {}, 'total_steps': 0}
 
-    split = int(len(candles_1m) * config['training']['train_data_fraction'])
-    oos = candles_1m[split:]
+    validation_days = config['training']['validation_days']
+    split = max(0, len(candles_1m) - validation_days * 24 * 60)
 
-    if last_n is not None and last_n < len(oos):
-        oos = oos[-last_n:]
-        print(f"[Backtest] {symbol}: OOS = last {len(oos)} candles (of {split} OOS total)")
+    # Ogranicz OOS do ostatnich 60 dni (86 400 świec 1m)
+    max_oos_candles = config['backtesting'].get('max_oos_days', 60) * 24 * 60
+    oos_start = max(split, len(candles_1m) - max_oos_candles)
+
+    if last_n is not None and last_n < (len(candles_1m) - oos_start):
+        oos_start = len(candles_1m) - last_n
+        print(f"[Backtest] {symbol}: OOS = last {last_n} candles (of {len(candles_1m) - split} OOS total)")
     else:
-        print(f"[Backtest] {symbol}: OOS = {len(oos)} steps (split at {split}/{len(candles_1m)})")
+        print(f"[Backtest] {symbol}: OOS = {len(candles_1m) - oos_start} steps "
+              f"(last {(len(candles_1m) - oos_start) // 1440} days, split at {split}/{len(candles_1m)})")
+
+    # Trim excess candles — keep only OOS + lookback per TF
+    all_candles, oos_start = trim_candles(all_candles, oos_start, config)
+    candles_1m = all_candles['1m']
+
+    # Pre-compute indicators on trimmed arrays
+    precomp = precompute_all(all_candles, config)
 
     trades, equity_curve, daily_pnl = [], [0.0], {}
     cumulative_pnl = 0.0
     position = None
     hold_minutes = 0
+    bars_in_trade = 0
 
-    for candle in oos:
+    step_interval = config['backtesting'].get('step_interval', 1)
+
+    for abs_idx in range(oos_start, len(candles_1m)):
+        if (abs_idx - oos_start) % step_interval != 0:
+            if position is not None:
+                bars_in_trade += 1
+            hold_minutes += 1
+            continue
+
+        candle = candles_1m[abs_idx]
         t_ms = candle['close_time']
         price = candle['close']
 
-        state = build_state(all_candles, t_ms, config)
+        # Cechy pozycji: [is_long, is_short, unrealized_pnl, bars_norm]
+        if position is not None:
+            is_long  = 1 if position.side == 'LONG'  else 0
+            is_short = 1 if position.side == 'SHORT' else 0
+            upnl = ((price - position.open_price) / position.open_price if is_long
+                    else (position.open_price - price) / position.open_price)
+            pos_feat = [is_long, is_short, upnl, min(bars_in_trade / 200, 1.0)]
+        else:
+            pos_feat = [0, 0, 0, 0]
+
+        state = build_state_fast(precomp, abs_idx, config)
         mask = action_mask_for(position)
-        action = predict(model, state, mask, config, device)
+        action = predict(model, state, mask, config, device, position_features=pos_feat)
 
         if action == ACTION_LONG and position is None:
             if hold_minutes:
                 print(f"  [{symbol}] HOLD {hold_minutes} min")
                 hold_minutes = 0
             position = Position('LONG', price, t_ms)
+            bars_in_trade = 0
             print(f"  [{symbol}] OPEN LONG  @ {price:.4f}  {_fmt_time(t_ms)}")
 
         elif action == ACTION_SHORT and position is None:
@@ -330,6 +445,7 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
                 print(f"  [{symbol}] HOLD {hold_minutes} min")
                 hold_minutes = 0
             position = Position('SHORT', price, t_ms)
+            bars_in_trade = 0
             print(f"  [{symbol}] OPEN SHORT @ {price:.4f}  {_fmt_time(t_ms)}")
 
         elif action == ACTION_CLOSE and position is not None:
@@ -347,17 +463,21 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
                   f"PnL: {pnl_sign}{pnl:.4f}  held {held} min  "
                   f"cumPnL: {cumulative_pnl:.4f}  {_fmt_time(t_ms)}")
             position = None
+            bars_in_trade = 0
             hold_minutes = 0
 
         else:
+            if position is not None:
+                bars_in_trade += 1
             hold_minutes += 1
 
     if hold_minutes:
         print(f"  [{symbol}] HOLD {hold_minutes} min")
 
     # Force-close any open position at end of OOS
-    if position is not None and oos:
-        last = oos[-1]
+    bars_in_trade = 0
+    if position is not None and len(candles_1m) > oos_start:
+        last = candles_1m[-1]
         position.close(last['close'], last['close_time'])
         pnl = net_pnl(position, config)
         held = round((last['close_time'] - position.open_time_ms) / 60000)
@@ -374,7 +494,7 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
 
     print(f"[Backtest] {symbol}: {len(trades)} trades, cumulative PnL = {cumulative_pnl:.4f}")
     return {'trades': trades, 'equity_curve': equity_curve,
-            'daily_pnl': daily_pnl, 'total_steps': len(oos)}
+            'daily_pnl': daily_pnl, 'total_steps': len(candles_1m) - oos_start}
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
@@ -386,12 +506,11 @@ def calc_metrics(trades: list, equity_curve: list, daily_pnl: dict) -> dict:
                 'win_rate': 0.0, 'profit_factor': 0.0, 'avg_win': 0.0,
                 'avg_loss': 0.0, 'total_trades': 0, 'max_consecutive_losses': 0}
 
+    import math
     daily_returns = list(daily_pnl.values())
     if len(daily_returns) >= 2:
-        # Annualized daily Sharpe — industry standard
         ann_sharpe = sharpe_ratio(daily_returns) * math.sqrt(252)
     else:
-        # Fallback: per-trade (no annualization)
         ann_sharpe = sharpe_ratio([t['pnl'] for t in trades])
 
     wl = avg_win_loss(trades)

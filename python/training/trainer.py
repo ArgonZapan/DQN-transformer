@@ -478,9 +478,9 @@ class Trainer:
             self._logged_training_start = True
 
         if self.use_per:
-            states, actions, rewards, next_states, dones, action_masks, indices, is_weights = self.buffer.sample(self.batch_size)
+            states, actions, rewards, next_states, dones, action_masks, pos_features, next_pos_features, indices, is_weights = self.buffer.sample(self.batch_size)
         else:
-            states, actions, rewards, next_states, dones, action_masks, indices = self.buffer.sample(self.batch_size)
+            states, actions, rewards, next_states, dones, action_masks, pos_features, next_pos_features, indices = self.buffer.sample(self.batch_size)
             is_weights = None
 
         # Debugger v2: sprawdź czy czas na ciężkie metryki
@@ -495,7 +495,7 @@ class Trainer:
         state_tensors = [states[k] for k in sorted(states.keys())]
         next_state_tensors = [next_states[k] for k in sorted(next_states.keys())]
 
-        current_q = self.main_network(state_tensors)
+        current_q = self.main_network(state_tensors, position_features=pos_features)
         current_q_values = current_q.gather(1, actions.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
@@ -512,10 +512,10 @@ class Trainer:
 
             # Double DQN: main network wybiera akcję, target network ocenia wartość
             self.main_network.eval()
-            next_q_main = self.main_network(next_state_tensors, action_mask=next_masks)
+            next_q_main = self.main_network(next_state_tensors, action_mask=next_masks, position_features=next_pos_features)
             self.main_network.train()
             next_actions = next_q_main.argmax(dim=1)
-            next_q_target = self.target_network(next_state_tensors, action_mask=next_masks)
+            next_q_target = self.target_network(next_state_tensors, action_mask=next_masks, position_features=next_pos_features)
             next_q_values = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
             targets = rewards + (1 - dones) * self.gamma * next_q_values
 
@@ -651,7 +651,10 @@ class Trainer:
         if action_mask is not None:
             mask_tensor = torch.tensor([action_mask], dtype=torch.float32).to(self.device)
 
-        q_values = self.main_network(state_tensors, action_mask=mask_tensor)
+        pos_data = state.get('position') if isinstance(state, dict) else None
+        pos_tensor = torch.tensor([pos_data[:4]], dtype=torch.float32).to(self.device) if pos_data is not None else None
+
+        q_values = self.main_network(state_tensors, action_mask=mask_tensor, position_features=pos_tensor)
         action = q_values.argmax(dim=1).item()
 
         return action, q_values.squeeze(0).cpu().numpy()

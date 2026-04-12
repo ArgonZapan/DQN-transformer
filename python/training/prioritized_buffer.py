@@ -99,10 +99,14 @@ class PrioritizedReplayBuffer:
         r = torch.zeros(self.capacity, dtype=torch.float32)
         d = torch.zeros(self.capacity, dtype=torch.float32)
         m = torch.zeros(self.capacity, self.num_actions, dtype=torch.float32)
+        pf  = torch.zeros(self.capacity, 4, dtype=torch.float32)
+        npf = torch.zeros(self.capacity, 4, dtype=torch.float32)
         self.actions = a.pin_memory() if self.use_pin else a
         self.rewards = r.pin_memory() if self.use_pin else r
         self.dones = d.pin_memory() if self.use_pin else d
         self.action_masks = m.pin_memory() if self.use_pin else m
+        self.pos_features      = pf.pin_memory()  if self.use_pin else pf
+        self.next_pos_features = npf.pin_memory() if self.use_pin else npf
 
         self.tree = SumTree(self.capacity)
         self.max_priority = 1.0
@@ -177,6 +181,12 @@ class PrioritizedReplayBuffer:
         else:
             self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
 
+        pf = state.get('position') if isinstance(state, dict) else None
+        self.pos_features[idx] = torch.tensor(pf[:4], dtype=torch.float32) if pf is not None else torch.zeros(4)
+
+        npf = next_state.get('position') if isinstance(next_state, dict) else None
+        self.next_pos_features[idx] = torch.tensor(npf[:4], dtype=torch.float32) if npf is not None else torch.zeros(4)
+
         if td_error is not None:
             td_val = abs(td_error) if np.isfinite(td_error) else self.max_priority
             priority = min((td_val + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
@@ -234,8 +244,10 @@ class PrioritizedReplayBuffer:
         rewards = self.rewards[indices].to(self.device, non_blocking=True)
         dones = self.dones[indices].to(self.device, non_blocking=True)
         action_masks = self.action_masks[indices].to(self.device, non_blocking=True)
+        pos_features      = self.pos_features[indices].to(self.device, non_blocking=True)
+        next_pos_features = self.next_pos_features[indices].to(self.device, non_blocking=True)
 
-        return states_batch, actions, rewards, next_states_batch, dones, action_masks, indices, is_weights
+        return states_batch, actions, rewards, next_states_batch, dones, action_masks, pos_features, next_pos_features, indices, is_weights
 
     _MAX_PRIORITY = 1e6  # hard cap — prevents Inf propagating into the tree
 
@@ -272,6 +284,8 @@ class PrioritizedReplayBuffer:
             'rewards': self.rewards[:n].cpu().clone(),
             'dones': self.dones[:n].cpu().clone(),
             'action_masks': self.action_masks[:n].cpu().clone(),
+            'pos_features': self.pos_features[:n].cpu().clone(),
+            'next_pos_features': self.next_pos_features[:n].cpu().clone(),
         }
 
     def load_state(self, state):
@@ -293,3 +307,7 @@ class PrioritizedReplayBuffer:
         self.rewards[:n] = state['rewards'][:n]
         self.dones[:n] = state['dones'][:n]
         self.action_masks[:n] = state['action_masks'][:n]
+        if 'pos_features' in state:
+            self.pos_features[:n] = state['pos_features'][:n]
+        if 'next_pos_features' in state:
+            self.next_pos_features[:n] = state['next_pos_features'][:n]

@@ -114,15 +114,23 @@ class TradingDQN(nn.Module):
             nn.Dropout(self.dropout)
         )
 
-        # Dueling Architecture: oddzielenie wartości stanu od przewagi akcji
-        self.value_stream = nn.Linear(256, 1)
-        self.advantage_stream = nn.Linear(256, self.num_actions)
+        # Gałąź pozycji: [is_long, is_short, unrealized_pnl, bars_in_trade] → 32
+        self.pos_fc = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.LeakyReLU(0.01),
+        )
 
-    def forward(self, states, action_mask=None):
+        # Dueling Architecture: trunk(256) + pos(32) = 288
+        self.value_stream = nn.Linear(288, 1)
+        self.advantage_stream = nn.Linear(288, self.num_actions)
+
+    def forward(self, states, action_mask=None, position_features=None):
         """
         states: dict z kluczami timeframe'ów, każdy [batch, seq_len, num_features]
                 lub lista tensorów w kolejności timeframe_keys
         action_mask: [batch, num_actions] binary mask (1=dozwolone, 0=zablokowane)
+        position_features: [batch, 4] — [is_long, is_short, unrealized_pnl, bars_in_trade]
+                           None → zerowy wektor (brak kontekstu pozycji)
         """
         if isinstance(states, dict):
             tf_tensors = [states[k] for k in self.timeframe_keys]
@@ -143,7 +151,14 @@ class TradingDQN(nn.Module):
         else:
             x = torch.cat(conv_outputs, dim=1)
 
-        x = self.trunk(x)
+        x = self.trunk(x)  # [batch, 256]
+
+        # Konkatencja z cechami pozycji
+        if position_features is not None:
+            pos = self.pos_fc(position_features)   # [batch, 32]
+        else:
+            pos = torch.zeros(x.shape[0], 32, device=x.device, dtype=x.dtype)
+        x = torch.cat([x, pos], dim=1)            # [batch, 288]
 
         value = self.value_stream(x)
         advantage = self.advantage_stream(x)
