@@ -129,6 +129,11 @@ grad_explode_threshold     = 5.0              # grad_norm > próg → alert
 action_collapse_threshold  = 0.95             # dominant_ratio > próg → alert
 loss_plateau_steps         = 2000             # Brak poprawy loss przez N kroków → alert
 
+[onnx]
+enabled     = true                               # Włącz lokalny ONNX inference w aktorach
+export_path = "python/checkpoints/model.onnx"   # Ścieżka do eksportowanego pliku ONNX
+device      = "cpu"                              # Urządzenie wnioskowania w aktorach: "cpu" lub "cuda"
+
 [api]
 simulation_mode = true       # Tryb symulacji (true) lub realny handel (false)
 

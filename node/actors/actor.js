@@ -1,9 +1,18 @@
+const fs    = require('fs');
 const Table = require('cli-table3');
 const { TradingEnv } = require('../env/tradingEnv');
 const { BinanceClient } = require('../data/binance');
 const { PerPairNormalizer } = require('../data/normalizer');
 
 const TIMEFRAME_INTERVALS = ['1m', '15m', '1h', '1d', '1w'];
+
+// Lazy-load onnxruntime-node — brak pakietu nie blokuje startu aktora
+let ort = null;
+try {
+    ort = require('onnxruntime-node');
+} catch (_) {
+    // onnxruntime-node niedostępny — aktor użyje RPC
+}
 
 class Actor {
     constructor(actorConfig, globalConfig, pythonClient, monitorClient) {
@@ -22,6 +31,10 @@ class Actor {
         this.running = false;
         this.episodeEquity = 0;
         this.cumulativePnl = 0;
+
+        // ONNX local inference state
+        this._onnxSession = null;
+        this._onnxMtime   = 0;
     }
 
     async loadData() {
@@ -101,22 +114,30 @@ class Actor {
                     if (r <= 0) { action = i; break; }
                 }
             } else {
-                try {
-                    const response = await this.pythonClient.predict(state, actionMask);
-                    action = response.action;
-                    qValues = response.qValues;
-                    if (response.epsilon != null) this.epsilon = response.epsilon;
-                } catch (err) {
-                    wasRandom = true;
-                    console.warn(`[Actor:${this.symbol}] Python error: ${err.message}, using random`);
-                    const WEIGHTS = [2, 2, 94, 2];
-                    const weights = actionMask.map((m, i) => m === 1 ? WEIGHTS[i] : 0);
-                    const total = weights.reduce((a, b) => a + b, 0);
-                    let r = Math.random() * total;
-                    action = 0;
-                    for (let i = 0; i < weights.length; i++) {
-                        r -= weights[i];
-                        if (r <= 0) { action = i; break; }
+                // 1. Spróbuj lokalnego wnioskowania ONNX (brak latencji TCP)
+                const onnxResult = await this._inferOnnx(state, actionMask);
+                if (onnxResult) {
+                    action  = onnxResult.action;
+                    qValues = onnxResult.qValues;
+                } else {
+                    // 2. Fallback: RPC do Python
+                    try {
+                        const response = await this.pythonClient.predict(state, actionMask);
+                        action  = response.action;
+                        qValues = response.qValues;
+                        if (response.epsilon != null) this.epsilon = response.epsilon;
+                    } catch (err) {
+                        wasRandom = true;
+                        console.warn(`[Actor:${this.symbol}] Python error: ${err.message}, using random`);
+                        const WEIGHTS = [2, 2, 94, 2];
+                        const weights = actionMask.map((m, i) => m === 1 ? WEIGHTS[i] : 0);
+                        const total = weights.reduce((a, b) => a + b, 0);
+                        let r = Math.random() * total;
+                        action = 0;
+                        for (let i = 0; i < weights.length; i++) {
+                            r -= weights[i];
+                            if (r <= 0) { action = i; break; }
+                        }
                     }
                 }
             }
@@ -324,6 +345,94 @@ class Actor {
 
         console.log(table.toString());
         console.log('');
+    }
+
+    // ── ONNX local inference ────────────────────────────────────────────────
+
+    /**
+     * Zwraca aktywną sesję ONNX (wczytuje lub przeładowuje gdy plik się zmienił).
+     * Zwraca null gdy ONNX wyłączony, pakiet niedostępny lub plik nie istnieje jeszcze.
+     */
+    async _getOnnxSession() {
+        if (!ort) return null;
+        const onnxCfg = this.config.onnx || {};
+        if (!onnxCfg.enabled) return null;
+
+        const modelPath = onnxCfg.export_path || 'python/checkpoints/model.onnx';
+        try {
+            const stat  = fs.statSync(modelPath);
+            const mtime = stat.mtimeMs;
+            if (!this._onnxSession || mtime > this._onnxMtime) {
+                const providers = (onnxCfg.device === 'cuda')
+                    ? ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                    : ['CPUExecutionProvider'];
+                this._onnxSession = await ort.InferenceSession.create(modelPath, { executionProviders: providers });
+                this._onnxMtime   = mtime;
+                console.log(`[Actor:${this.symbol}] ONNX model loaded (step ~${this.totalSteps}, mtime: ${new Date(mtime).toISOString()})`);
+            }
+            return this._onnxSession;
+        } catch (_) {
+            return null;  // model jeszcze nie wyeksportowany
+        }
+    }
+
+    /**
+     * Lokalne wnioskowanie przez ONNX — O(0.1–0.5 ms) zamiast 1–5 ms TCP.
+     * Zwraca { action, qValues } lub null gdy ONNX niedostępny.
+     */
+    async _inferOnnx(state, actionMask) {
+        const session = await this._getOnnxSession();
+        if (!session) return null;
+
+        try {
+            const tfKeys      = Object.keys(this.config.timeframes)
+                .filter(k => this.config.timeframes[k] > 0)
+                .sort();
+            const numFeatures = this.config.features.num_features;
+
+            const feeds = {};
+
+            for (let i = 0; i < tfKeys.length; i++) {
+                const key    = tfKeys[i];
+                const tfName = key.replace('candles_', '');
+                const seqLen = this.config.timeframes[key];
+                const rows   = (state && state[tfName]) || [];
+
+                const arr = new Float32Array(seqLen * numFeatures);
+                const len = Math.min(rows.length, seqLen);
+                for (let s = 0; s < len; s++) {
+                    const row = rows[s] || [];
+                    for (let f = 0; f < numFeatures; f++) {
+                        arr[s * numFeatures + f] = row[f] || 0;
+                    }
+                }
+                feeds[`tf_${i}`] = new ort.Tensor('float32', arr, [1, seqLen, numFeatures]);
+            }
+
+            const posData = (state && state.position) || [0, 0, 0, 0];
+            feeds['pos_features'] = new ort.Tensor('float32', new Float32Array(posData.slice(0, 4)), [1, 4]);
+            feeds['action_mask']  = new ort.Tensor('float32', new Float32Array(actionMask), [1, 4]);
+
+            const results = await session.run(feeds);
+            const qRaw    = Array.from(results['q_values'].data);
+
+            // Wybierz najlepszą dozwoloną akcję
+            let bestAction = -1, bestQ = -Infinity;
+            for (let a = 0; a < qRaw.length; a++) {
+                if (actionMask[a] === 1 && qRaw[a] > bestQ) {
+                    bestQ = qRaw[a];
+                    bestAction = a;
+                }
+            }
+            if (bestAction === -1) bestAction = actionMask.indexOf(1);  // fallback
+
+            return { action: bestAction, qValues: qRaw };
+
+        } catch (err) {
+            console.warn(`[Actor:${this.symbol}] ONNX inference error: ${err.message}`);
+            this._onnxSession = null;  // wymuś przeładowanie przy następnej próbie
+            return null;
+        }
     }
 
     stop() {

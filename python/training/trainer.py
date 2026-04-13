@@ -635,6 +635,7 @@ class Trainer:
         if self.step_count % self.target_update_interval == 0:
             self.target_network.load_state_dict(self.main_network.state_dict())
             logger.info(f"[Trainer] Target network updated at step {self.step_count}")
+            self._export_onnx()
 
         if self.step_count % self.checkpoint_interval == 0:
             self.save_checkpoint()
@@ -685,6 +686,82 @@ class Trainer:
 
         action, _ = self.predict(state, action_mask)
         return action
+
+    def _export_onnx(self):
+        """Eksportuje sieć do formatu ONNX — wywoływana przy każdym update target network.
+        Aktorzy ładują plik lokalnie i wnioskują bez RPC (issue #28).
+        """
+        onnx_cfg = self.config.get('onnx', {})
+        if not onnx_cfg.get('enabled', False):
+            return
+
+        export_path = onnx_cfg.get('export_path', 'python/checkpoints/model.onnx')
+        tmp_path = export_path + '.tmp'
+
+        try:
+            import torch.onnx
+
+            tf_keys = [k for k in sorted(self.config['timeframes'].keys())
+                       if self.config['timeframes'][k] > 0]
+            num_features = self.config['features']['num_features']
+
+            # Wrapper spłaszcza listę tensorów TF + pos_features + action_mask
+            # do pozycyjnych argumentów — ONNX wymaga nazwanych skalarnych wejść.
+            class _OnnxWrapper(torch.nn.Module):
+                def __init__(self, model, n_tf):
+                    super().__init__()
+                    self.model = model
+                    self.n_tf = n_tf
+
+                def forward(self, *args):
+                    tf_tensors   = list(args[:self.n_tf])
+                    pos_features = args[self.n_tf]
+                    action_mask  = args[self.n_tf + 1]
+                    return self.model(tf_tensors,
+                                      action_mask=action_mask,
+                                      position_features=pos_features)
+
+            wrapper = _OnnxWrapper(self.main_network, len(tf_keys))
+            wrapper.eval()
+
+            dummy_inputs = []
+            for key in tf_keys:
+                seq_len = self.config['timeframes'][key]
+                dummy_inputs.append(torch.zeros(1, seq_len, num_features, device=self.device))
+            dummy_inputs.append(torch.zeros(1, 4, device=self.device))   # pos_features
+            dummy_inputs.append(torch.ones(1, 4, device=self.device))    # action_mask
+
+            input_names  = [f'tf_{i}' for i in range(len(tf_keys))] + ['pos_features', 'action_mask']
+            output_names = ['q_values']
+            dynamic_axes = {n: {0: 'batch'} for n in input_names + output_names}
+
+            os.makedirs(os.path.dirname(export_path), exist_ok=True)
+
+            with torch.no_grad():
+                torch.onnx.export(
+                    wrapper,
+                    tuple(dummy_inputs),
+                    tmp_path,
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamic_axes=dynamic_axes,
+                    opset_version=17,
+                    do_constant_folding=True,
+                )
+
+            # Atomowy rename — aktor nigdy nie widzi częściowego pliku
+            if os.path.exists(export_path):
+                os.remove(export_path)
+            os.rename(tmp_path, export_path)
+            logger.info(f"[ONNX] Exported model to {export_path} (step {self.step_count})")
+
+        except Exception as e:
+            logger.warning(f"[ONNX] Export failed at step {self.step_count}: {e}")
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def finish_current_step(self):
         # Force final log before closing
