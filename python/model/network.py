@@ -100,6 +100,12 @@ class TradingDQN(nn.Module):
         self.timeframe_keys = [k for k in sorted(timeframes_cfg.keys()) if timeframes_cfg[k] > 0]
         self.num_timeframes = len(self.timeframe_keys)
 
+        # Normalizacja wejścia — wyrównuje skale 8 cech zanim trafią do Conv1D.
+        # MACD jest unbounded, volume spikes >100x, ceny z-score ±3 — bez normy
+        # cechy o dużej skali dominują gradienty.
+        # LayerNorm zamiast BatchNorm: normalizuje per-sample, brak trybu train/eval.
+        self.input_norm = nn.LayerNorm(self.num_features)
+
         self.conv_blocks = nn.ModuleList([
             Conv1DBlock(self.num_features, self.conv_filters, self.kernel_size, self.dropout)
             for _ in range(self.num_timeframes)
@@ -153,7 +159,8 @@ class TradingDQN(nn.Module):
 
         conv_outputs = []
         for i, tf_input in enumerate(tf_tensors):
-            conv_out = self.conv_blocks[i](tf_input)  # [batch, seq_tf, conv_filters]
+            tf_input = self.input_norm(tf_input)       # [batch, seq_len, num_features]
+            conv_out = self.conv_blocks[i](tf_input)   # [batch, seq_tf, conv_filters]
             conv_outputs.append(conv_out)
 
         if self.n_transformer_blocks > 0:
