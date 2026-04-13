@@ -141,28 +141,61 @@ class Actor {
             });
         }
 
-        // Oblicz MC returns, wydrukuj log epizodu, wyślij batch
-        const mcExperiences = this.env.getEpisodeExperiences();
+        // Pobierz doświadczenia zgodnie z return_mode
+        const returnMode = (this.config.training.return_mode || 'mc').toLowerCase();
+        const nStep      = this.config.training.n_step || 5;
 
-        this._printEpisodeLog(episodeLog, mcExperiences);
+        let experiences;
+        let modeLabel;
+
+        if (returnMode === 'nstep') {
+            experiences = this.env.episode.getExperiencesNStep(nStep);
+            modeLabel   = `${nStep}-step`;
+        } else if (returnMode === 'td') {
+            experiences = this.env.episode.getExperiencesTD();
+            modeLabel   = 'TD';
+        } else {
+            // "mc" — zachowanie oryginalne
+            experiences = this.env.getEpisodeExperiences();
+            modeLabel   = 'MC';
+        }
+
+        this._printEpisodeLog(episodeLog, experiences);
 
         try {
-            if (mcExperiences.length > 0) {
-                const mcBatch = mcExperiences.map(step => ({
-                    actorId: this.symbol,
-                    state: step.state,
-                    action: step.action,
-                    reward: step.returnG,
-                    nextState: step.nextState,
-                    done: true,
-                    actionMask: step.actionMask
-                }));
-                const batchResp = await this.pythonClient.sendBatch(mcBatch);
+            if (experiences.length > 0) {
+                const batch = experiences.map(step => {
+                    const entry = {
+                        actorId:    this.symbol,
+                        state:      step.state,
+                        action:     step.action,
+                        actionMask: step.actionMask,
+                    };
+
+                    if (returnMode === 'mc') {
+                        // Oryginalny tryb: returnG jako reward, done=True wszędzie
+                        entry.reward    = step.returnG;
+                        entry.nextState = step.nextState;
+                        entry.done      = true;
+                    } else {
+                        // nstep / td: prawdziwe done i nextState, gamma^n w polu gammaToN
+                        entry.reward    = step.reward;
+                        entry.nextState = step.nextState;
+                        entry.done      = step.done;
+                        entry.gammaToN  = step.gammaToN;
+                        if (step.nextActionMask != null) {
+                            entry.nextActionMask = step.nextActionMask;
+                        }
+                    }
+                    return entry;
+                });
+
+                const batchResp = await this.pythonClient.sendBatch(batch);
                 if (batchResp && batchResp.epsilon != null) this.epsilon = batchResp.epsilon;
-                console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes + 1}: sent ${mcBatch.length} MC experiences, ε=${this.epsilon.toFixed(3)}`);
+                console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes + 1}: sent ${batch.length} ${modeLabel} experiences, ε=${this.epsilon.toFixed(3)}`);
             }
         } catch (err) {
-            console.warn(`[Actor:${this.symbol}] MC batch send failed: ${err.message}`);
+            console.warn(`[Actor:${this.symbol}] Batch send failed: ${err.message}`);
         }
 
         if (this.monitorClient) {

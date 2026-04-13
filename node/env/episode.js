@@ -78,6 +78,64 @@ class Episode {
         }));
     }
 
+    /**
+     * Zwraca doświadczenia z n-krokowym zwrotem.
+     *
+     * Dla każdego kroku t:
+     *   reward  = Σ_{k=0}^{min(n,T-t)-1} γ^k * r_{t+k}   (zdyskontowana suma n kroków)
+     *   nextState = steps[t+n].state  (jeśli t+n < T), inaczej null
+     *   done    = (t + n >= T)         (True gdy epizod kończy się w obrębie n kroków)
+     *
+     * Bellman target w trainerze:  reward + (1 - done) * γ^n * Q(nextState)
+     * γ^n jest przekazywane jako pole `gammaToN` — trainer mnoży przez nie next_q.
+     */
+    getExperiencesNStep(n) {
+        const T = this.steps.length;
+        const gamma = this.gamma;
+        const gammaN = Math.pow(gamma, n);
+        const result = [];
+
+        for (let t = 0; t < T; t++) {
+            // Skumulowany n-krokowy zwrot
+            let reward = 0;
+            for (let k = 0; k < n && (t + k) < T; k++) {
+                reward += Math.pow(gamma, k) * this.steps[t + k].reward;
+            }
+
+            const endIdx = t + n;
+            const done = endIdx >= T;
+            const nextState = done ? null : this.steps[endIdx].state;
+            const nextActionMask = done ? null : this.steps[endIdx].actionMask;
+
+            result.push({
+                state:          this.steps[t].state,
+                action:         this.steps[t].action,
+                reward,
+                nextState,
+                done,
+                actionMask:     this.steps[t].actionMask,
+                nextActionMask,
+                gammaToN:       gammaN,
+            });
+        }
+        return result;
+    }
+
+    /**
+     * Zwraca surowe doświadczenia (1-krokowe TD) bez żadnych transformacji.
+     */
+    getExperiencesTD() {
+        return this.steps.map(step => ({
+            state:      step.state,
+            action:     step.action,
+            reward:     step.reward,
+            nextState:  step.nextState,
+            done:       step.done,
+            actionMask: step.actionMask,
+            gammaToN:   this.gamma,
+        }));
+    }
+
     reset() {
         this.steps = [];
         this.startIndex = 0;

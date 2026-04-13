@@ -28,6 +28,17 @@ class Trainer:
 
         training_cfg = config['training']
         self.gamma = training_cfg['gamma']
+        self.return_mode = training_cfg.get('return_mode', 'mc').lower()
+        n_step = training_cfg.get('n_step', 1)
+        # gamma_n — mnożnik bootstrappingu w celach Bellmana
+        # mc:    done=True wszędzie → (1-done)*gamma_n = 0 → gamma_n nieistotne
+        # nstep: targets = R_t^n + (1-done) * gamma^n * Q(s_{t+n})
+        # td:    targets = r_t   + (1-done) * gamma   * Q(s_{t+1})
+        if self.return_mode == 'nstep':
+            self.gamma_n = self.gamma ** n_step
+        else:
+            self.gamma_n = self.gamma
+        logger.info(f"[Trainer] return_mode={self.return_mode}, n_step={n_step}, gamma_n={self.gamma_n:.6f}")
         self.lr = training_cfg['lr']
         self.batch_size = training_cfg['batch_size']
         self.min_buffer_size = training_cfg['min_buffer_size']
@@ -521,7 +532,7 @@ class Trainer:
             next_actions = next_q_main.argmax(dim=1)
             next_q_target = self.target_network(next_state_tensors, action_mask=next_masks, position_features=next_pos_features)
             next_q_values = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            targets = rewards + (1 - dones) * self.gamma * next_q_values
+            targets = rewards + (1 - dones) * self.gamma_n * next_q_values
 
         td_errors = targets - current_q_values
         loss_per_sample = self.loss_fn(current_q_values, targets)

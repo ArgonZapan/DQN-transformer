@@ -57,6 +57,8 @@ validation_days         = 60                # Ile ostatnich dni zarezerwowanych 
 episode_length          = 1000              # Długość epizodu w decyzjach (nie świecach); start losowany z całej dostępnej historii
 step_interval           = 5                 # Co ile świec 1m podejmować decyzję (1 = co minutę, 10 = co 10 minut, 60 = co godzinę)
 max_trades_per_episode  = 3                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
+return_mode             = "nstep"           # Tryb zwrotów: "mc" = Monte Carlo (done=True wszędzie), "nstep" = n-krokowe TD, "td" = 1-krokowe TD
+n_step                  = 5                 # Liczba kroków do przodu dla return_mode="nstep" (ignorowane w trybie mc/td)
 
 [per]
 alpha          = 0.6           # Priorytet α - jak bardzo priorytetyzować ważne próbki (0 = brak priorytetów, 1 = tylko priorytety)
