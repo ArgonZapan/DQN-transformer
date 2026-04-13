@@ -59,10 +59,11 @@ step_interval           = 5                 # Co ile świec 1m podejmować decyz
 max_trades_per_episode  = 3                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
 
 [per]
-alpha      = 0.6           # Priorytet α - jak bardzo priorytetyzować ważne próbki (0 = brak priorytetów, 1 = tylko priorytety)
-beta_start = 0.4           # Początkowy beta - kompensacja priorytetów (zaczyna od 40% importance sampling)
-beta_end   = 1.0           # Końcowy beta - pełne importance sampling na końcu treningu
-epsilon    = 0.0001        # Mała wartość dodawana do priorytetów (zapewnia że każda próbka ma szansę być wybrana)
+alpha          = 0.6           # Priorytet α - jak bardzo priorytetyzować ważne próbki (0 = brak priorytetów, 1 = tylko priorytety)
+beta_start     = 0.4           # Początkowy beta - kompensacja priorytetów (zaczyna od 40% importance sampling)
+beta_end       = 1.0           # Końcowy beta - pełne importance sampling na końcu treningu
+epsilon        = 0.0001        # Mała wartość dodawana do priorytetów (zapewnia że każda próbka ma szansę być wybrana)
+positive_ratio = 0.4           # Frakcja batcha gwarantowana z zyskownych próbek (0.0 = wyłączone, używa zwykłego PER)
 
 [model]
 num_actions          = 4            # Liczba akcji: 4 (HOLD, LONG, SHORT, CLOSE)

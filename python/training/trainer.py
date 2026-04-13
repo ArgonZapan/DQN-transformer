@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model.network import TradingDQN
 from training.replay_buffer import ReplayBuffer
-from training.prioritized_buffer import PrioritizedReplayBuffer
+from training.prioritized_buffer import PrioritizedReplayBuffer, DualPrioritizedBuffer
 from training.debugger import TensorBoardDebugger
 from diagnostics.metric_logger import MetricLogger
 from diagnostics.alert_system import AlertSystem
@@ -53,7 +53,11 @@ class Trainer:
 
         per_cfg = config.get('per', {})
         if per_cfg.get('alpha', 0) > 0:
-            self.buffer = PrioritizedReplayBuffer(config)
+            if per_cfg.get('positive_ratio', 0.0) > 0:
+                self.buffer = DualPrioritizedBuffer(config)
+                logger.info(f"[Trainer] Using DualPrioritizedBuffer (positive_ratio={per_cfg['positive_ratio']})")
+            else:
+                self.buffer = PrioritizedReplayBuffer(config)
             self.use_per = True
         else:
             self.buffer = ReplayBuffer(config)

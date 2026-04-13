@@ -1,3 +1,5 @@
+import copy
+
 import numpy as np
 import torch
 
@@ -311,3 +313,148 @@ class PrioritizedReplayBuffer:
             self.pos_features[:n] = state['pos_features'][:n]
         if 'next_pos_features' in state:
             self.next_pos_features[:n] = state['next_pos_features'][:n]
+
+
+class DualPrioritizedBuffer:
+    """
+    Dual Buffer z gwarantowaną proporcją zyskownych próbek w batchu.
+
+    Składa się z dwóch buforów:
+    - main:     PrioritizedReplayBuffer pełnej pojemności — wszystkie doświadczenia, PER
+    - positive: okrągły bufor (1/4 pojemności) — tylko reward > 0, próbkowanie jednostajne
+
+    Przy każdym sample() gwarantowana jest minimalna frakcja próbek z positive buffer
+    (parametr positive_ratio w [per]). Gdy positive buffer jest pusty lub za mały —
+    fallback na same próbki z main (brak błędu).
+
+    update_priorities() aktualizuje wyłącznie main buffer — indeksy z positive buffer
+    są enkodowane jako idx + capacity, co pozwala je odróżnić i pominąć.
+    """
+
+    def __init__(self, config):
+        per_cfg = config['per']
+        self.positive_ratio = per_cfg.get('positive_ratio', 0.4)
+        self.capacity = config['training']['buffer_capacity']
+
+        self.main = PrioritizedReplayBuffer(config)
+
+        # Pozytywny bufor: 1/4 pojemności, bez PER (uniform)
+        pos_config = copy.deepcopy(config)
+        pos_config['training']['buffer_capacity'] = max(1, self.capacity // 4)
+        # Importujemy tutaj, żeby uniknąć cyklicznych importów na poziomie modułu
+        from training.replay_buffer import ReplayBuffer
+        self.positive = ReplayBuffer(pos_config)
+
+        self._pos_capacity = pos_config['training']['buffer_capacity']
+
+    # ── Delegaty do main ──────────────────────────────────────────────────────
+    @property
+    def beta(self):
+        return self.main.beta
+
+    @property
+    def max_priority(self):
+        return self.main.max_priority
+
+    @property
+    def size(self):
+        return self.main.size
+
+    @property
+    def tree(self):
+        """Dostęp do drzewa SumTree dla logowania TensorBoard (delegacja do main)."""
+        return self.main.tree
+
+    def update_beta(self, fraction):
+        self.main.update_beta(fraction)
+
+    def __len__(self):
+        return len(self.main)
+
+    def is_ready(self, min_size):
+        return self.main.is_ready(min_size)
+
+    # ── Add ───────────────────────────────────────────────────────────────────
+    def add(self, state, action, reward, next_state, done, action_mask=None):
+        self.main.add(state, action, reward, next_state, done, action_mask)
+        if reward > 0:
+            self.positive.add(state, action, reward, next_state, done, action_mask)
+
+    # ── Sample ────────────────────────────────────────────────────────────────
+    def sample(self, batch_size):
+        n_pos = 0
+        if len(self.positive) > 0 and self.positive_ratio > 0:
+            n_pos = min(int(batch_size * self.positive_ratio), len(self.positive))
+
+        n_main = batch_size - n_pos
+        if n_main < 1:
+            # Fallback: weź wszystko z main (nie powinno się zdarzyć przy ratio < 1.0)
+            n_pos = 0
+            n_main = batch_size
+
+        # Próbkuj z main (PER) — zwraca 10 elementów
+        (states_m, actions_m, rewards_m, next_states_m, dones_m,
+         masks_m, pf_m, npf_m, idx_m, iw_m) = self.main.sample(n_main)
+
+        if n_pos == 0:
+            return (states_m, actions_m, rewards_m, next_states_m, dones_m,
+                    masks_m, pf_m, npf_m, idx_m, iw_m)
+
+        # Próbkuj z positive (uniform) — zwraca 9 elementów (bez is_weights)
+        (states_p, actions_p, rewards_p, next_states_p, dones_p,
+         masks_p, pf_p, npf_p, idx_p) = self.positive.sample(n_pos)
+
+        device = self.main.device
+
+        # Scal słowniki stanów
+        states = {k: torch.cat([states_m[k], states_p[k]], dim=0)
+                  for k in states_m}
+        next_states = {k: torch.cat([next_states_m[k], next_states_p[k]], dim=0)
+                       for k in next_states_m}
+
+        actions      = torch.cat([actions_m,  actions_p],  dim=0)
+        rewards      = torch.cat([rewards_m,  rewards_p],  dim=0)
+        dones        = torch.cat([dones_m,    dones_p],    dim=0)
+        masks        = torch.cat([masks_m,    masks_p],    dim=0)
+        pf           = torch.cat([pf_m,       pf_p],       dim=0)
+        npf          = torch.cat([npf_m,      npf_p],      dim=0)
+
+        # Wagi IS: main dostaje wagi PER, positive dostaje 1.0 (uniform)
+        # Re-normalizacja tak żeby max = 1.0 (standard IS-weight convention)
+        iw_pos = torch.ones(n_pos, device=device, dtype=torch.float32)
+        is_weights = torch.cat([iw_m, iw_pos], dim=0)
+        is_weights = is_weights / is_weights.max()
+
+        # Enkoduj indeksy: main → idx_m (< capacity),
+        #                  positive → idx_p + capacity (do odróżnienia w update_priorities)
+        idx_p_offset = idx_p + self.capacity
+        indices = np.concatenate([idx_m, idx_p_offset])
+
+        return (states, actions, rewards, next_states, dones,
+                masks, pf, npf, indices, is_weights)
+
+    # ── Priority updates ──────────────────────────────────────────────────────
+    def update_priorities(self, indices, td_errors):
+        """Aktualizuje priorytety wyłącznie w main buffer.
+        Indeksy z positive buffer (>= capacity) są pomijane."""
+        main_mask = indices < self.capacity
+        main_indices = indices[main_mask]
+        main_td = td_errors[main_mask]
+        if len(main_indices) > 0:
+            self.main.update_priorities(main_indices, main_td)
+
+    # ── Checkpoint ───────────────────────────────────────────────────────────
+    def get_state(self):
+        return {
+            'main':     self.main.get_state(),
+            'positive': self.positive.get_state(),
+        }
+
+    def load_state(self, state):
+        if 'main' in state:
+            self.main.load_state(state['main'])
+        if 'positive' in state:
+            self.positive.load_state(state['positive'])
+        # Backwards-compat: old checkpoint jest stanem main (bez zagnieżdżenia)
+        elif 'size' in state:
+            self.main.load_state(state)
