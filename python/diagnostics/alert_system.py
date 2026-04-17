@@ -46,7 +46,8 @@ class AlertSystem:
             return
         self._training_started_sent = True
         self._send_async('TRAINING_STARTED',
-                         f'🟢 Trening rozpoczęty\nKrok: {step}\nBufor: {buffer_size:,}')
+                         f'🟢 Trening rozpoczęty\nKrok: {step}\nBufor: {buffer_size:,}',
+                         retries=3, retry_delay=30.0)
 
     def check_and_alert(self, metrics: dict, step: int) -> None:
         """Sprawdza metryki i wysyła alerty. Nieblokujące — wszystko w wątkach tła."""
@@ -113,28 +114,36 @@ class AlertSystem:
 
     # ── wewnętrzne ────────────────────────────────────────────────────────
 
-    def _send_async(self, alert_type: str, message: str, ignore_cooldown: bool = False) -> None:
+    def _send_async(self, alert_type: str, message: str, ignore_cooldown: bool = False,
+                    retries: int = 0, retry_delay: float = 0.0) -> None:
         now = time.time()
         last = self._last_sent.get(alert_type, 0.0)
         if not ignore_cooldown and (now - last) < self._cooldown:
             return
         self._last_sent[alert_type] = now
-        t = threading.Thread(target=self._send, args=(message,), daemon=True)
+        t = threading.Thread(target=self._send, args=(message, retries, retry_delay), daemon=True)
         t.start()
 
-    def _send(self, message: str) -> None:
-        try:
-            import urllib.request
-            import urllib.parse
-            url = f'https://api.telegram.org/bot{self._token}/sendMessage'
-            data = urllib.parse.urlencode({
-                'chat_id': self._chat_id,
-                'text': message,
-                'parse_mode': 'HTML',
-            }).encode()
-            req = urllib.request.Request(url, data=data, method='POST')
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status != 200:
-                    logger.warning(f'[Alerts] Telegram HTTP {resp.status}')
-        except Exception as e:
-            logger.warning(f'[Alerts] Telegram send failed: {e}')
+    def _send(self, message: str, retries: int = 0, retry_delay: float = 0.0) -> None:
+        import urllib.request
+        import urllib.parse
+        url = f'https://api.telegram.org/bot{self._token}/sendMessage'
+        data = urllib.parse.urlencode({
+            'chat_id': self._chat_id,
+            'text': message,
+            'parse_mode': 'HTML',
+        }).encode()
+        req = urllib.request.Request(url, data=data, method='POST')
+        attempts = retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status != 200:
+                        logger.warning(f'[Alerts] Telegram HTTP {resp.status}')
+                    return
+            except Exception as e:
+                if attempt <= retries:
+                    logger.warning(f'[Alerts] Telegram send failed (próba {attempt}/{attempts}): {e} — retry za {retry_delay:.0f}s')
+                    time.sleep(retry_delay)
+                else:
+                    logger.warning(f'[Alerts] Telegram send failed (próba {attempt}/{attempts}): {e}')
