@@ -46,7 +46,8 @@ class SumTree:
             terminal = left >= tree_len
             if terminal.all():
                 break
-            left_vals = np.where(terminal, 0.0, self.tree[left])
+            safe_left = np.minimum(left, tree_len - 1)
+            left_vals = np.where(terminal, 0.0, self.tree[safe_left])
             go_right = (~terminal) & (s > left_vals)
             s[go_right] -= left_vals[go_right]
             idx = np.where(terminal, idx, np.where(go_right, left + 1, left))
