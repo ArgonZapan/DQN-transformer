@@ -94,8 +94,8 @@ post_close_cooldown_steps = 12             # Po zamknięciu: ile kroków trade_p
 clip_min               = -1.0              # Minimalna nagroda/kara (clamping)
 clip_max               = 1.0               # Maksymalna nagroda/kara (clamping)
 intermediate_reward_max = 0.1              # Max nagroda pośrednia (za małe zyski)
-drawdown_penalty      = 0.2                # Kara za duże obsunięcia kapitału
-time_decay_hours      = 1.0                # Czas bez akcji po którym zaczyna się kara za bezczynność
+drawdown_penalty      = 0.2                # Współczynnik kary za drawdown: reward -= maxDrawdown * drawdown_penalty (0 = wyłączone)
+time_decay_hours      = 4.0                # Half-life time decay (h): PnL spada o połowę po tym czasie trzymania pozycji (większa = łagodniejsza kara)
 
 [data]
 source               = "file"                           # Źródło danych: "file" = pliki CSV, "binance" = API Binance
@@ -125,8 +125,8 @@ fee           = 0.00075                                # Prowizja za jedną stro
 [report]
 enabled          = true             # Włącz raporty Telegram po każdym update sieci docelowej
 mode             = "full"           # "compact" = skrócony (1 ekran), "full" = pełny raport
-every_n_updates  = 15                # Co ile target network updates wysyłać raport (1 = każdy, 5 = co 5.)
-min_interval_sec = 1200            # Minimalny czas między raportami w sekundach (0 = bez limitu, 3600 = max 1/h)
+every_n_updates  = 10               # Co ile target network updates wysyłać raport (1 = każdy, 5 = co 5.)
+min_interval_sec = 0               # Minimalny czas między raportami w sekundach (0 = bez limitu, 3600 = max 1/h)
 # telegram_token   = ""            # Opcjonalnie: własny token; domyślnie używa [alerts].telegram_token
 # telegram_chat_id = ""            # Opcjonalnie: własny chat_id; domyślnie używa [alerts].telegram_chat_id
 
