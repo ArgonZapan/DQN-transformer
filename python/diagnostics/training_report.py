@@ -64,6 +64,13 @@ def _pct(value) -> str:
     return f'{value:.1%}' if value is not None else '—'
 
 
+def _act_pct(value) -> str:
+    """Formatuje udział akcji: 2 miejsca po przecinku gdy < 5%, inaczej 0."""
+    if value is None:
+        return '—'
+    return f'{value:.2%}' if value < 0.05 else f'{value:.0%}'
+
+
 def _fmt_pnl(value) -> str:
     return f'{value:+.4%}' if value is not None else '—'
 
@@ -401,7 +408,7 @@ class TrainingReport:
                     f'    Dł. epizodu:   {w["avg_length"]:.1f} kr' if w['avg_length'] else '    Dł. epizodu:   —',
                     f'    HT Efficiency: {w["hte"]:.4f}' if w['hte'] is not None else '    HT Efficiency: —',
                     f'    Long bias:     {_pct(w["long_bias"])} L / {_pct(1 - w["long_bias"]) if w["long_bias"] is not None else "—"} S',
-                    f'    Akcje:  H={w["act_dist"]["hold"]:.0%} L={w["act_dist"]["long"]:.0%} S={w["act_dist"]["short"]:.0%} C={w["act_dist"]["close"]:.0%}',
+                    f'    Akcje:  H={_act_pct(w["act_dist"]["hold"])} L={_act_pct(w["act_dist"]["long"])} S={_act_pct(w["act_dist"]["short"])} C={_act_pct(w["act_dist"]["close"])}',
                     f'    Prowizje:      {w["commission"]:.4f}',
                     f'    Koszt/PnL:     {_pct(w["slippage_pct"])}' if w['slippage_pct'] is not None else '    Koszt/PnL:     —',
                     f'  ↳ <i>Łącznie ({t["episodes"]} ep, {t["transactions"]} tr)</i>',
