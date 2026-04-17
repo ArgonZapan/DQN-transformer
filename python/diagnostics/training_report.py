@@ -190,6 +190,15 @@ class TrainingReport:
         if hasattr(trainer.buffer, 'get_reward_stats'):
             data['reward_stats'] = trainer.buffer.get_reward_stats(recent_n=10_000)
 
+        # Config prowizji — potrzebne w pętli aktorów
+        reward_cfg = trainer.config.get('reward', {})
+        data['cost_per_trade'] = (
+            reward_cfg.get('commission_open',  0.00075) +
+            reward_cfg.get('commission_close', 0.00075) +
+            reward_cfg.get('trade_penalty',    0.00050) +
+            reward_cfg.get('close_penalty',    0.00050)
+        )
+
         # ── Metryki aktorów z deltami ─────────────────────────────────────────
         prev_actors = prev.get('actors', {})
         actors = {}
@@ -323,15 +332,6 @@ class TrainingReport:
         n   = acc['steps_accumulated']
         data['policy_entropy'] = acc['action_entropy_sum'] / n if n > 0 else None
         data['q_hold_avg']     = acc['q_hold_sum']         / n if n > 0 else None
-
-        # Config prowizji — do obliczenia kosztu na transakcję
-        reward_cfg = trainer.config.get('reward', {})
-        data['cost_per_trade'] = (
-            reward_cfg.get('commission_open',  0.00075) +
-            reward_cfg.get('commission_close', 0.00075) +
-            reward_cfg.get('trade_penalty',    0.00050) +
-            reward_cfg.get('close_penalty',    0.00050)
-        )
 
         data['health'] = getattr(trainer, '_last_health', None)
         return data
