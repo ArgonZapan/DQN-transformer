@@ -12,8 +12,8 @@ niezależnie od tego czy every_n_updates wynosi 1 czy 10.
 """
 
 import logging
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -97,6 +97,7 @@ class TrainingReport:
         self._last_send_time: float = 0.0
         # Snapshot kumulatywnych wartości z momentu ostatniego raportu
         self._prev_snapshot: dict | None = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='report')
 
     # ── publiczne API ─────────────────────────────────────────────────────────
 
@@ -122,7 +123,7 @@ class TrainingReport:
         # Zapisz snapshot PRZED wysłaniem — delta dla następnego raportu
         self._prev_snapshot = self._make_snapshot(trainer)
 
-        threading.Thread(target=self._send, args=(message,), daemon=True).start()
+        self._executor.submit(self._send, message)
 
     # ── snapshot / delta ──────────────────────────────────────────────────────
 

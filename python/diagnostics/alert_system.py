@@ -14,6 +14,8 @@ import logging
 import math
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger('learner')
 
@@ -31,9 +33,10 @@ class AlertSystem:
 
         # Stan wewnętrzny
         self._last_sent: dict[str, float] = {}   # typ alertu → timestamp ostatniego wysłania
-        self._loss_history: list[float] = []
+        self._loss_history: deque = deque(maxlen=self._plateau_steps)
         self._advantage_dead_count: int = 0
         self._training_started_sent: bool = False
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='alert')
 
         if self.enabled and (not self._token or not self._chat_id):
             logger.warning('[Alerts] Telegram token lub chat_id nie skonfigurowane — alerty wyłączone')
@@ -89,8 +92,6 @@ class AlertSystem:
         # Plateau loss
         if loss is not None and not (isinstance(loss, float) and math.isnan(loss)):
             self._loss_history.append(loss)
-            if len(self._loss_history) > self._plateau_steps:
-                self._loss_history = self._loss_history[-self._plateau_steps:]
             if len(self._loss_history) == self._plateau_steps:
                 first_half = sum(self._loss_history[:self._plateau_steps // 2]) / (self._plateau_steps // 2)
                 second_half = sum(self._loss_history[self._plateau_steps // 2:]) / (self._plateau_steps // 2)
@@ -121,8 +122,7 @@ class AlertSystem:
         if not ignore_cooldown and (now - last) < self._cooldown:
             return
         self._last_sent[alert_type] = now
-        t = threading.Thread(target=self._send, args=(message, retries, retry_delay), daemon=True)
-        t.start()
+        self._executor.submit(self._send, message, retries, retry_delay)
 
     def _send(self, message: str, retries: int = 0, retry_delay: float = 0.0) -> None:
         import urllib.request

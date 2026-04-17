@@ -442,6 +442,10 @@ class Actor {
                 const providers = (onnxCfg.device === 'cuda')
                     ? ['CUDAExecutionProvider', 'CPUExecutionProvider']
                     : ['CPUExecutionProvider'];
+                if (this._onnxSession) {
+                    await this._onnxSession.release?.();
+                    this._onnxSession = null;
+                }
                 this._onnxSession = await ort.InferenceSession.create(modelPath, { executionProviders: providers });
                 this._onnxMtime   = mtime;
                 console.log(`[Actor:${this.symbol}] ONNX model loaded (step ~${this.totalSteps}, mtime: ${new Date(mtime).toISOString()})`);
