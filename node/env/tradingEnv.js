@@ -209,8 +209,19 @@ class TradingEnv {
                 ? (currentPrice - this.position.openPrice) / this.position.openPrice
                 : (this.position.openPrice - currentPrice) / this.position.openPrice;
             const delta = uPnl - this.prevUnrealizedPnl;
+
+            // Asymetryczne skalowanie: ujemne delty (spadki/boki) mnożone przez loss_scale.
+            // Pozycja idąca bokiem kumuluje ujemne netto nawet jeśli PnL ≈ 0.
+            const lossScale = this.rewardConfig.loss_scale ?? 1.0;
+            const scaledDelta = delta < 0 ? delta * lossScale : delta;
+
             const cap = this.rewardConfig.intermediate_reward_max;
-            reward += Math.max(-cap, Math.min(cap, delta));
+            reward += Math.max(-cap, Math.min(cap, scaledDelta));
+
+            // Stały koszt trzymania pozycji — penalizuje długie trzymanie nawet przy flat PnL.
+            const holdPenalty = this.rewardConfig.hold_penalty_per_bar ?? 0;
+            if (holdPenalty > 0) reward -= holdPenalty;
+
             this.prevUnrealizedPnl = uPnl;
             this.position.updateDrawdown(currentPrice);
         }

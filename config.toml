@@ -94,8 +94,10 @@ post_close_cooldown_steps = 12             # Po zamknięciu: ile kroków trade_p
 clip_min               = -1.0              # Minimalna nagroda/kara (clamping)
 clip_max               = 1.0               # Maksymalna nagroda/kara (clamping)
 intermediate_reward_max = 0.1              # Max nagroda pośrednia (za małe zyski)
-drawdown_penalty      = 0.2                # Współczynnik kary za drawdown: reward -= maxDrawdown * drawdown_penalty (0 = wyłączone)
-time_decay_hours      = 4.0                # Half-life time decay (h): PnL spada o połowę po tym czasie trzymania pozycji (większa = łagodniejsza kara)
+loss_scale            = 1.5               # Mnożnik ujemnych delt uPnL (>1 = boki/spadki bolą bardziej; 1.0 = symetrycznie)
+hold_penalty_per_bar  = 0.00005           # Stały koszt trzymania pozycji per krok (0 = wyłączone)
+drawdown_penalty      = 0.2               # Współczynnik kary za drawdown: reward -= maxDrawdown * drawdown_penalty (0 = wyłączone)
+time_decay_hours      = 4.0               # Half-life time decay (h): PnL spada o połowę po tym czasie trzymania pozycji (większa = łagodniejsza kara)
 
 [data]
 source               = "file"                           # Źródło danych: "file" = pliki CSV, "binance" = API Binance
