@@ -93,8 +93,10 @@ class AlertSystem:
         if loss is not None and not (isinstance(loss, float) and math.isnan(loss)):
             self._loss_history.append(loss)
             if len(self._loss_history) == self._plateau_steps:
-                first_half = sum(self._loss_history[:self._plateau_steps // 2]) / (self._plateau_steps // 2)
-                second_half = sum(self._loss_history[self._plateau_steps // 2:]) / (self._plateau_steps // 2)
+                history = list(self._loss_history)
+                half = self._plateau_steps // 2
+                first_half = sum(history[:half]) / half
+                second_half = sum(history[half:]) / half
                 if second_half >= first_half * 0.99:   # mniej niż 1% poprawy
                     self._send_async('LOSS_PLATEAU',
                                      f'📊 Plateau loss\nKrok: {step}\n'
