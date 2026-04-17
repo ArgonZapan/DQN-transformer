@@ -81,6 +81,7 @@ class Trainer:
         self._logged_training_start = False
         self._sps_step_anchor = 0
         self._sps_time_anchor = time_module.time()
+        self._timing_logged = 0  # ile razy zalogowano timing diagnostics
         
         # TensorBoard setup
         tensorboard_cfg = config.get('tensorboard', {})
@@ -173,6 +174,9 @@ class Trainer:
         self._action_counts = [0] * config['model']['num_actions']
 
         self._load_checkpoint_if_exists()
+        # Ustaw anchor SPS po załadowaniu checkpointu (step_count może być != 0 przy resume)
+        self._sps_step_anchor = self.step_count
+        self._sps_time_anchor = time_module.time()
         logger.info(f"[Trainer] Init: batch={self.batch_size}, min_buf={self.min_buffer_size}, steps={self.step_count}, resumed={self.step_count > 0}")
 
     def _load_checkpoint_if_exists(self):
@@ -663,8 +667,9 @@ class Trainer:
 
         _t5 = time_module.perf_counter()
 
-        # Timing diagnostics — loguj co 200 kroków przez pierwsze 1000, potem wyłącz
-        if self.step_count < 1000 and self.step_count % 200 == 0:
+        # Timing diagnostics — loguj 5 razy po starcie treningu, potem wyłącz
+        if self._timing_logged < 5:
+            self._timing_logged += 1
             logger.info(
                 f"[Timing] sample={(_t1-_t0)*1000:.1f}ms  fwd_main={(_t2-_t1)*1000:.1f}ms  "
                 f"fwd_double={(_t3-_t2)*1000:.1f}ms  bwd={(_t4-_t3)*1000:.1f}ms  "
