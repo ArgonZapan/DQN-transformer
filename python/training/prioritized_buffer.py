@@ -9,6 +9,8 @@ class SumTree:
     SumTree — drzewo binarne do efektywnego samplowania z rozkładem priorytetów.
     Liście przechowują priorytety, węzły wewnętrzne sumę potomków.
     Operacja sample i update w O(log n) zamiast O(n).
+
+    Implementacja iteracyjna (nie rekurencyjna) + wektoryzowane batch ops.
     """
 
     def __init__(self, capacity):
@@ -17,22 +19,38 @@ class SumTree:
         self.data_pointer = 0
 
     def _propagate(self, idx, change):
-        parent = (idx - 1) // 2
-        self.tree[parent] += change
-        if parent != 0:
-            self._propagate(parent, change)
+        # Iteracyjnie w górę drzewa — bez rekurencji (szybsze, brak stack overhead)
+        while idx != 0:
+            idx = (idx - 1) // 2
+            self.tree[idx] += change
 
     def _retrieve(self, idx, s):
-        left = 2 * idx + 1
-        right = left + 1
+        # Iteracyjna wersja — bez rekurencji
+        while True:
+            left = 2 * idx + 1
+            if left >= len(self.tree):
+                return idx
+            if s <= self.tree[left]:
+                idx = left
+            else:
+                s -= self.tree[left]
+                idx = left + 1
 
-        if left >= len(self.tree):
-            return idx
-
-        if s <= self.tree[left]:
-            return self._retrieve(left, s)
-        else:
-            return self._retrieve(right, s - self.tree[left])
+    def _retrieve_batch(self, s_array):
+        """Wektoryzowane batch samplowanie — jeden numpy pass zamiast N wywołań Pythona."""
+        idx = np.zeros(len(s_array), dtype=np.int64)
+        s = s_array.copy()
+        tree_len = len(self.tree)
+        while True:
+            left = 2 * idx + 1
+            terminal = left >= tree_len
+            if terminal.all():
+                break
+            left_vals = np.where(terminal, 0.0, self.tree[left])
+            go_right = (~terminal) & (s > left_vals)
+            s[go_right] -= left_vals[go_right]
+            idx = np.where(terminal, idx, np.where(go_right, left + 1, left))
+        return idx
 
     def total(self):
         return self.tree[0]
@@ -47,6 +65,18 @@ class SumTree:
         change = priority - self.tree[idx]
         self.tree[idx] = priority
         self._propagate(idx, change)
+
+    def update_batch(self, data_indices, priorities):
+        """Batch update priorytetów — jeden przebieg po drzewie dla każdego indeksu."""
+        tree_indices = data_indices + self.capacity - 1
+        changes = priorities - self.tree[tree_indices]
+        self.tree[tree_indices] = priorities
+        # Propaguj każdą zmianę w górę iteracyjnie
+        for i, idx in enumerate(tree_indices):
+            change = changes[i]
+            while idx != 0:
+                idx = (idx - 1) // 2
+                self.tree[idx] += change
 
     def get(self, s):
         idx = self._retrieve(0, s)
@@ -213,21 +243,16 @@ class PrioritizedReplayBuffer:
 
     def sample(self, batch_size):
         self._sanitize_tree()
-        indices = []
-        priorities = []
         total = self.tree.total()
         segment = total / batch_size
 
-        for i in range(batch_size):
-            a = segment * i
-            b = segment * (i + 1)
-            s = np.random.uniform(a, b)
-            _, priority, data_idx = self.tree.get(s)
-            indices.append(data_idx)
-            priorities.append(priority)
-
-        indices = np.array(indices)
-        priorities = np.array(priorities, dtype=np.float64)
+        # Wektoryzowane samplowanie: jeden batch numpy zamiast pętli Pythona
+        a = np.arange(batch_size, dtype=np.float64) * segment
+        b = a + segment
+        s_array = np.random.uniform(a, b)
+        tree_indices = self.tree._retrieve_batch(s_array)
+        indices = (tree_indices - self.tree.capacity + 1).astype(np.int64)
+        priorities = self.tree.tree[tree_indices]
 
         sampling_probs = priorities / total
         sampling_probs = np.clip(sampling_probs, 1e-10, None)
@@ -254,13 +279,11 @@ class PrioritizedReplayBuffer:
     _MAX_PRIORITY = 1e6  # hard cap — prevents Inf propagating into the tree
 
     def update_priorities(self, indices, td_errors):
-        for idx, td_err in zip(indices, td_errors):
-            td_val = abs(td_err)
-            if not np.isfinite(td_val):
-                td_val = self.max_priority
-            priority = min((td_val + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
-            self.tree.update(idx, priority)
-            self.max_priority = max(self.max_priority, priority)
+        td_vals = np.abs(td_errors).astype(np.float64)
+        td_vals = np.where(np.isfinite(td_vals), td_vals, self.max_priority)
+        priorities = np.minimum((td_vals + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
+        self.tree.update_batch(indices.astype(np.int64), priorities)
+        self.max_priority = max(self.max_priority, float(priorities.max()))
 
     def update_beta(self, fraction):
         self.beta = min(self.beta_end, self.beta_start + (self.beta_end - self.beta_start) * fraction)
@@ -289,6 +312,48 @@ class PrioritizedReplayBuffer:
             'pos_features': self.pos_features[:n].cpu().clone(),
             'next_pos_features': self.next_pos_features[:n].cpu().clone(),
         }
+
+    def get_reward_stats(self, recent_n: int = 10_000) -> dict:
+        """Rozkład nagród — identyczna logika jak w ReplayBuffer."""
+        n = self.size
+        if n == 0:
+            return {}
+        rewards = self.rewards[:n].cpu().float()
+        pos   = (rewards > 0).sum().item()
+        neg   = (rewards < 0).sum().item()
+        total = n
+        stats = {
+            'total':          total,
+            'positive':       int(pos),
+            'negative':       int(neg),
+            'zero':           int(total - pos - neg),
+            'positive_ratio': pos / total,
+            'mean':           rewards.mean().item(),
+            'std':            rewards.std().item() if total > 1 else 0.0,
+        }
+        rn = min(recent_n, n)
+        if self.size < self.capacity:
+            start  = max(0, self.position - rn)
+            recent = self.rewards[start:self.position].cpu().float()
+        else:
+            end = self.position
+            if end >= rn:
+                recent = self.rewards[end - rn:end].cpu().float()
+            else:
+                recent = torch.cat([
+                    self.rewards[self.capacity - (rn - end):self.capacity],
+                    self.rewards[:end],
+                ]).float()
+        r_pos = (recent > 0).sum().item()
+        r_n   = len(recent)
+        stats['recent'] = {
+            'n':              r_n,
+            'positive':       int(r_pos),
+            'negative':       int((recent < 0).sum().item()),
+            'positive_ratio': r_pos / r_n if r_n > 0 else 0.0,
+            'mean':           recent.mean().item() if r_n > 0 else 0.0,
+        }
+        return stats
 
     def load_state(self, state):
         """Przywraca bufor z zapisanego stanu."""
@@ -373,6 +438,9 @@ class DualPrioritizedBuffer:
 
     def is_ready(self, min_size):
         return self.main.is_ready(min_size)
+
+    def get_reward_stats(self, recent_n: int = 10_000) -> dict:
+        return self.main.get_reward_stats(recent_n=recent_n)
 
     # ── Add ───────────────────────────────────────────────────────────────────
     def add(self, state, action, reward, next_state, done, action_mask=None):
