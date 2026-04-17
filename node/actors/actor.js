@@ -115,14 +115,19 @@ class Actor {
 
     async start() {
         this.running = true;
+        this._startTime = Date.now();
         console.log(`[Actor:${this.symbol}] Started`);
         while (this.running) {
             try {
                 const episodeStart = Date.now();
+                const stepsBefore = this.totalSteps;
                 await this.runEpisode();
                 this.totalEpisodes++;
                 const episodeTime = Date.now() - episodeStart;
-                console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes} finished in ${episodeTime}ms, totalSteps=${this.totalSteps}, trades=${this.env.getTrades().length}`);
+                const episodeSteps = this.totalSteps - stepsBefore;
+                const episodeSps = episodeTime > 0 ? (episodeSteps / (episodeTime / 1000)).toFixed(0) : '?';
+                const totalSps = this._startTime ? (this.totalSteps / ((Date.now() - this._startTime) / 1000)).toFixed(1) : '?';
+                console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes} | ${episodeTime}ms | steps=${this.totalSteps} | sps=${episodeSps} (avg ${totalSps}) | trades=${this.env.getTrades().length}`);
             } catch (err) {
                 console.error(`[Actor:${this.symbol}] Episode error: ${err.message}`);
                 await new Promise(r => setTimeout(r, 1000));
@@ -278,6 +283,7 @@ class Actor {
                     episode_win_hold_steps:    epMetrics.win_hold_steps    || 0,
                     episode_loss_hold_steps:   epMetrics.loss_hold_steps   || 0,
                     episode_mfe_sum:           epMetrics.mfe_sum           || 0,
+                    episode_gap_steps:         epMetrics.gap_steps         || [],
                     episode_long_opens:        epMetrics.long_opens        || 0,
                     episode_short_opens:       epMetrics.short_opens       || 0,
                     // Rozkład akcji

@@ -79,6 +79,8 @@ class Trainer:
         self.epsilon = self.epsilon_start
         self.last_loss = 0.0
         self._logged_training_start = False
+        self._sps_step_anchor = 0
+        self._sps_time_anchor = time_module.time()
         
         # TensorBoard setup
         tensorboard_cfg = config.get('tensorboard', {})
@@ -159,6 +161,8 @@ class Trainer:
             'action_close': 0,
             # Deque ostatnich 200 episode PnL — do Sharpe/Sortino/MaxDD
             'episode_pnl_deque': deque(maxlen=200),
+            # Deque ostatnich 5000 gap_steps — do mediany/p10/p90 czasu między transakcjami
+            'gap_steps_deque': deque(maxlen=5000),
         })
         
         # EMA dla Q-values
@@ -352,6 +356,8 @@ class Trainer:
             actor_data['win_hold_steps']  += metrics['episode_win_hold_steps']
         if 'episode_loss_hold_steps' in metrics:
             actor_data['loss_hold_steps'] += metrics['episode_loss_hold_steps']
+        if 'episode_gap_steps' in metrics:
+            actor_data['gap_steps_deque'].extend(metrics['episode_gap_steps'])
         if 'episode_mfe_sum' in metrics:
             actor_data['mfe_sum']         += metrics['episode_mfe_sum']
         if 'episode_long_opens' in metrics:
@@ -707,7 +713,13 @@ class Trainer:
 
         if self.step_count % self.target_update_interval == 0:
             self.target_network.load_state_dict(self.main_network.state_dict())
-            logger.info(f"[Trainer] Target network updated at step {self.step_count}")
+            now_sps = time_module.time()
+            elapsed = now_sps - self._sps_time_anchor
+            steps_delta = self.step_count - self._sps_step_anchor
+            sps = steps_delta / elapsed if elapsed > 0 else 0.0
+            self._sps_step_anchor = self.step_count
+            self._sps_time_anchor = now_sps
+            logger.info(f"[Trainer] Target network updated at step {self.step_count} | {sps:.1f} steps/sec")
             self._export_onnx()
             self.training_report.maybe_send(self.step_count, self)
 
