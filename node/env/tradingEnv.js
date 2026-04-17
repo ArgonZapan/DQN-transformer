@@ -54,6 +54,7 @@ class TradingEnv {
         this.stepsSinceClose = Infinity; // kroki od ostatniego zamknięcia pozycji
         this.prevUnrealizedPnl = 0;     // poprzednie uPnL — do obliczania delty krok-po-kroku
         this._barsInTrade = 0;          // liczba kroków od otwarcia aktualnej pozycji
+        this._actionCounts = [0, 0, 0, 0]; // [LONG, SHORT, HOLD, CLOSE] — zliczane co krok epizodu
     }
 
     setData(candlesPerTimeframe) {
@@ -109,6 +110,7 @@ class TradingEnv {
         this.stepsSinceClose = Infinity;
         this.prevUnrealizedPnl = 0;
         this._barsInTrade = 0;
+        this._actionCounts = [0, 0, 0, 0];
         const dataLen = this.getDataLength();
         this.currentStepIndex = this.episode.start(dataLen);
         return this._getState();
@@ -166,6 +168,9 @@ class TradingEnv {
         let reward = 0;
         let tradeClosed = false;
 
+        // Zlicz każdą akcję podjętą w epizodzie (używane przez getMetrics → statystyki)
+        if (action >= 0 && action < 4) this._actionCounts[action]++;
+
         if (action === ACTIONS.LONG && this.position === null) {
             this.position = new Position('LONG', currentPrice, currentTime);
             this._barsInTrade = 0;
@@ -177,6 +182,7 @@ class TradingEnv {
             reward = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
             this.stepsSinceClose = Infinity;
         } else if (action === ACTIONS.CLOSE && this.position !== null) {
+            this.position.holdSteps = this._barsInTrade;
             this.position.close(currentPrice, currentTime);
             reward = calculateReward(this.position, this.rewardConfig);
             this.trades.push({ ...this.position });
@@ -222,6 +228,7 @@ class TradingEnv {
         const done = tradeClosed || this.episode.isAtTrainEnd(this.getDataLength()) || this._getState() === null;
 
         if (done && this.position !== null) {
+            this.position.holdSteps = this._barsInTrade;
             this.position.close(currentPrice, currentTime);
             reward = calculateReward(this.position, this.rewardConfig);
             this.trades.push({ ...this.position });
@@ -267,33 +274,70 @@ class TradingEnv {
 
     getMetrics() {
         const trades = this.trades;
+        const ac = this._actionCounts;
+
         if (trades.length === 0) {
-            return { win_rate: 0, profit_factor: 0, total_trades: 0 };
+            return {
+                win_rate: 0, profit_factor: 0, total_trades: 0, net_pnl: 0,
+                max_consecutive_losses: 0, wins: 0, losses: 0,
+                profit_sum: 0, loss_sum: 0,
+                win_hold_steps: 0, loss_hold_steps: 0,
+                mfe_sum: 0,
+                long_opens:    ac[0], short_opens: ac[1],
+                action_counts: [ac[0], ac[1], ac[2], ac[3]],
+            };
         }
 
         let wins = 0, losses = 0;
         let totalProfit = 0, totalLoss = 0;
+        let currentConsec = 0, maxConsec = 0;
+        let winHoldSteps = 0, lossHoldSteps = 0;
+        let mfeSum = 0;
 
-        const commission = this.rewardConfig.commission_open + this.rewardConfig.commission_close;
+        const commission  = this.rewardConfig.commission_open + this.rewardConfig.commission_close;
         const tradePenalty = this.rewardConfig.trade_penalty;
+
         for (const trade of trades) {
             const gross = trade.side === 'SHORT'
                 ? (trade.openPrice - trade.closePrice) / trade.openPrice
                 : (trade.closePrice - trade.openPrice) / trade.openPrice;
-            const pnl = gross - commission - tradePenalty;
-            if (pnl > 0) { wins++; totalProfit += pnl; }
-            else { losses++; totalLoss += Math.abs(pnl); }
+            const pnl       = gross - commission - tradePenalty;
+            const holdSteps = trade.holdSteps || 0;
+            mfeSum += (trade.peakPnl || 0);
+
+            if (pnl > 0) {
+                wins++;
+                totalProfit  += pnl;
+                winHoldSteps += holdSteps;
+                currentConsec = 0;
+            } else {
+                losses++;
+                totalLoss    += Math.abs(pnl);
+                lossHoldSteps += holdSteps;
+                currentConsec++;
+                if (currentConsec > maxConsec) maxConsec = currentConsec;
+            }
         }
 
-        const winRate = trades.length > 0 ? wins / trades.length : 0;
-        const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 999 : 0;
+        const winRate      = wins / trades.length;
+        const profitFactor = totalLoss > 0 ? totalProfit / totalLoss : (totalProfit > 0 ? 999 : 0);
 
         return {
-            win_rate: winRate,
-            profit_factor: profitFactor,
-            total_trades: trades.length,
+            win_rate:               winRate,
+            profit_factor:          profitFactor,
+            total_trades:           trades.length,
             wins,
-            losses
+            losses,
+            net_pnl:                totalProfit - totalLoss,
+            max_consecutive_losses: maxConsec,
+            profit_sum:             totalProfit,
+            loss_sum:               totalLoss,
+            win_hold_steps:         winHoldSteps,
+            loss_hold_steps:        lossHoldSteps,
+            mfe_sum:                mfeSum,
+            long_opens:             ac[0],
+            short_opens:            ac[1],
+            action_counts:          [ac[0], ac[1], ac[2], ac[3]],
         };
     }
 }

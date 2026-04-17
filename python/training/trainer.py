@@ -2,7 +2,7 @@ import os
 import logging
 import glob
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 import time as time_module
 
 import torch
@@ -17,6 +17,7 @@ from training.debugger import TensorBoardDebugger
 from diagnostics.metric_logger import MetricLogger
 from diagnostics.alert_system import AlertSystem
 from diagnostics.attention_monitor import AttentionMonitor
+from diagnostics.training_report import TrainingReport
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +104,11 @@ class Trainer:
         diag_dir = 'python/diagnostics'
         self.metric_logger = MetricLogger(os.path.join(diag_dir, 'metrics.jsonl'), flush_every=50)
         self.alert_system = AlertSystem(config)
+        self.training_report = TrainingReport(config)
         self.attention_monitor = AttentionMonitor(self.main_network, self.writer)
         self.attention_monitor.register()
         self._last_advantage_std: float | None = None
+        self._last_health: dict | None = None
 
         # Akumulatory metryk (sumowane między logowaniami)
         self._metrics_accumulator = {
@@ -123,6 +126,7 @@ class Trainer:
             'actions_total': [0] * config['model']['num_actions'],
             'q_spread_sum': 0.0,
             'action_entropy_sum': 0.0,
+            'q_hold_sum': 0.0,          # Q-value dla akcji HOLD (index 2)
         }
         
         # Metryki od actorów (per symbol)
@@ -136,6 +140,25 @@ class Trainer:
             'episode_count': 0,
             'max_consecutive_losses': 0,
             'current_consecutive_losses': 0,
+            # Statystyki epizodów (od aktora przez ZMQ)
+            'episode_length_sum': 0,
+            'episode_length_count': 0,
+            'episode_trade_wins': 0,
+            'episode_trade_losses': 0,
+            # Statystyki handlowe rozszerzone
+            'profit_sum': 0.0,          # suma zyskownych transakcji
+            'loss_sum': 0.0,            # suma stratnych transakcji (abs)
+            'win_hold_steps': 0,        # łączne kroki trzymania zyskownych pozycji
+            'loss_hold_steps': 0,       # łączne kroki trzymania stratnych pozycji
+            'mfe_sum': 0.0,             # suma MFE (Maximum Favorable Excursion)
+            'long_opens': 0,
+            'short_opens': 0,
+            'action_long': 0,
+            'action_short': 0,
+            'action_hold': 0,
+            'action_close': 0,
+            # Deque ostatnich 200 episode PnL — do Sharpe/Sortino/MaxDD
+            'episode_pnl_deque': deque(maxlen=200),
         })
         
         # EMA dla Q-values
@@ -201,23 +224,31 @@ class Trainer:
 
     def _load_checkpoint(self, path, load_buffer=True):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.main_network.load_state_dict(checkpoint['model_state_dict'])
-        self.target_network.load_state_dict(checkpoint['model_state_dict'])
+        try:
+            self.main_network.load_state_dict(checkpoint['model_state_dict'])
+            self.target_network.load_state_dict(checkpoint['model_state_dict'])
+        except RuntimeError as e:
+            logger.warning(f"[Checkpoint] Architecture mismatch — starting with fresh weights. ({e})")
+            return
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.step_count = checkpoint.get('step', 0)
         self.epsilon = checkpoint.get('epsilon', self.epsilon_start)
         self.last_loss = checkpoint.get('loss', 0.0)
         if load_buffer and 'buffer' in checkpoint:
-            logger.info(f"[Checkpoint] Restoring replay buffer ({checkpoint['buffer']['size']} experiences)...")
-            self.buffer.load_state(checkpoint['buffer'])
+            buf_state = checkpoint['buffer']
+            buf_size = buf_state.get('size', buf_state.get('main', {}).get('size', '?'))
+            logger.info(f"[Checkpoint] Restoring replay buffer ({buf_size} experiences)...")
+            self.buffer.load_state(buf_state)
             logger.info(f"[Checkpoint] Buffer restored: {len(self.buffer)} experiences")
         logger.info(f"Checkpoint loaded from {path} (step {self.step_count})")
 
     def _load_buffer(self, path):
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         if 'buffer' in checkpoint:
-            logger.info(f"[Checkpoint] Restoring replay buffer ({checkpoint['buffer']['size']} experiences)...")
-            self.buffer.load_state(checkpoint['buffer'])
+            buf_state = checkpoint['buffer']
+            buf_size = buf_state.get('size', buf_state.get('main', {}).get('size', '?'))
+            logger.info(f"[Checkpoint] Restoring replay buffer ({buf_size} experiences)...")
+            self.buffer.load_state(buf_state)
             logger.info(f"[Checkpoint] Buffer restored: {len(self.buffer)} experiences")
 
     def save_checkpoint(self, path=None, include_buffer=False):
@@ -273,19 +304,13 @@ class Trainer:
         if 'episode_pnl' in metrics:
             pnl = metrics['episode_pnl']
             actor_data['episode_pnl_sum'] += pnl
-            actor_data['episode_count'] += 1
-            
-            # Track consecutive wins/losses
+            # episode_count incremented from episode_length below (nie duplikuj)
             if pnl > 0:
                 actor_data['wins'] += 1
                 actor_data['current_consecutive_losses'] = 0
             elif pnl < 0:
                 actor_data['losses'] += 1
                 actor_data['current_consecutive_losses'] += 1
-                actor_data['max_consecutive_losses'] = max(
-                    actor_data['max_consecutive_losses'],
-                    actor_data['current_consecutive_losses']
-                )
         
         # Total PnL
         if 'total_pnl' in metrics:
@@ -295,11 +320,56 @@ class Trainer:
         if 'total_trades' in metrics:
             actor_data['total_trades'] = metrics['total_trades']
         
-        # Win rate tracking
+        # Win rate tracking (stary format binarny)
         if 'win' in metrics and metrics['win']:
             actor_data['wins'] += 1
         if 'loss' in metrics and metrics['loss']:
             actor_data['losses'] += 1
+
+        # Metryki epizodu — wysyłane przez aktora w ostatnim wpisie batcha
+        if 'episode_length' in metrics:
+            actor_data['episode_length_sum']   += metrics['episode_length']
+            actor_data['episode_length_count'] += 1
+            actor_data['episode_count']        += 1
+        if 'episode_trades' in metrics:
+            actor_data['transactions'] += metrics['episode_trades']
+        if 'episode_wins' in metrics:
+            actor_data['episode_trade_wins']   += metrics['episode_wins']
+        if 'episode_losses' in metrics:
+            actor_data['episode_trade_losses'] += metrics['episode_losses']
+        if 'episode_max_consec_losses' in metrics:
+            actor_data['max_consecutive_losses'] = max(
+                actor_data['max_consecutive_losses'],
+                metrics['episode_max_consec_losses']
+            )
+
+        # Rozszerzone statystyki handlowe
+        if 'episode_profit_sum' in metrics:
+            actor_data['profit_sum']      += metrics['episode_profit_sum']
+        if 'episode_loss_sum' in metrics:
+            actor_data['loss_sum']        += metrics['episode_loss_sum']
+        if 'episode_win_hold_steps' in metrics:
+            actor_data['win_hold_steps']  += metrics['episode_win_hold_steps']
+        if 'episode_loss_hold_steps' in metrics:
+            actor_data['loss_hold_steps'] += metrics['episode_loss_hold_steps']
+        if 'episode_mfe_sum' in metrics:
+            actor_data['mfe_sum']         += metrics['episode_mfe_sum']
+        if 'episode_long_opens' in metrics:
+            actor_data['long_opens']      += metrics['episode_long_opens']
+        if 'episode_short_opens' in metrics:
+            actor_data['short_opens']     += metrics['episode_short_opens']
+        if 'episode_action_long' in metrics:
+            actor_data['action_long']     += metrics['episode_action_long']
+        if 'episode_action_short' in metrics:
+            actor_data['action_short']    += metrics['episode_action_short']
+        if 'episode_action_hold' in metrics:
+            actor_data['action_hold']     += metrics['episode_action_hold']
+        if 'episode_action_close' in metrics:
+            actor_data['action_close']    += metrics['episode_action_close']
+
+        # Deque PnL epizodów — do Sharpe/Sortino/MaxDrawdown
+        if 'episode_pnl' in metrics:
+            actor_data['episode_pnl_deque'].append(metrics['episode_pnl'])
 
     def _update_epsilon(self):
         total_decay_steps = self.epsilon_decay_fraction * self.config['training']['buffer_capacity']
@@ -451,6 +521,7 @@ class Trainer:
             'steps_accumulated': 0,
             'q_spread_sum': 0.0,
             'action_entropy_sum': 0.0,
+            'q_hold_sum': 0.0,
             'actions_total': [0] * self.config['model']['num_actions'],
         }
         
@@ -621,6 +692,8 @@ class Trainer:
             entropy = -(probs * torch.log2(probs + 1e-8)).sum(dim=1).mean().item()
         acc['q_spread_sum'] += spread
         acc['action_entropy_sum'] += entropy
+        # Q-Value Anchor dla HOLD (akcja 2 = HOLD wg ACTIONS w tradingEnv.js)
+        acc['q_hold_sum'] += float(q_det[:, 2].mean().item())
 
         acc['steps_accumulated'] += 1
 
@@ -636,6 +709,7 @@ class Trainer:
             self.target_network.load_state_dict(self.main_network.state_dict())
             logger.info(f"[Trainer] Target network updated at step {self.step_count}")
             self._export_onnx()
+            self.training_report.maybe_send(self.step_count, self)
 
         if self.step_count % self.checkpoint_interval == 0:
             self.save_checkpoint()
@@ -738,16 +812,44 @@ class Trainer:
             os.makedirs(os.path.dirname(export_path), exist_ok=True)
 
             with torch.no_grad():
-                torch.onnx.export(
-                    wrapper,
-                    tuple(dummy_inputs),
-                    tmp_path,
+                export_kwargs = dict(
                     input_names=input_names,
                     output_names=output_names,
                     dynamic_axes=dynamic_axes,
-                    opset_version=17,
+                    opset_version=14,
                     do_constant_folding=True,
                 )
+                # PyTorch ≥2.1: dynamo=False wymusza legacy TorchScript exporter
+                # (nie wymaga onnxscript); starsze wersje nie mają tego parametru
+                import inspect
+                if 'dynamo' in inspect.signature(torch.onnx.export).parameters:
+                    export_kwargs['dynamo'] = False
+
+                # aten::_native_multi_head_attention (fused C++ kernel) nie jest exportowalny
+                # do żadnego opset ONNX. W PyTorch 2.4+ jest wywoływany bezpośrednio nawet
+                # podczas tracingu gdy batch_first=True. Monkey-patch na poziomie klasy wymusza
+                # slow path (F.multi_head_attention_forward z explicit attn_mask), który ONNX
+                # rozumie jako oddzielne operacje Linear + softmax.
+                _orig_mha_forward = torch.nn.MultiheadAttention.forward
+
+                def _mha_slow_forward(self, query, key, value,
+                                      key_padding_mask=None, need_weights=True,
+                                      attn_mask=None, **kwargs):
+                    if attn_mask is None:
+                        # Zero-mask to no-op matematycznie, ale `attn_mask is not None`
+                        # wyłącza warunek `_native_multi_head_attention` fast path.
+                        tgt = query.size(1) if self.batch_first else query.size(0)
+                        attn_mask = query.new_zeros(tgt, tgt)
+                    return _orig_mha_forward(self, query, key, value,
+                                             key_padding_mask=key_padding_mask,
+                                             need_weights=need_weights,
+                                             attn_mask=attn_mask, **kwargs)
+
+                torch.nn.MultiheadAttention.forward = _mha_slow_forward
+                try:
+                    torch.onnx.export(wrapper, tuple(dummy_inputs), tmp_path, **export_kwargs)
+                finally:
+                    torch.nn.MultiheadAttention.forward = _orig_mha_forward
 
             # Atomowy rename — aktor nigdy nie widzi częściowego pliku
             if os.path.exists(export_path):

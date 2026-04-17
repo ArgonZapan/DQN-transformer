@@ -264,13 +264,27 @@ class Actor {
 
                 // Dodaj metryki epizodu do ostatniego wpisu — learner zbiera je osobno
                 const epMetrics = this.env.getMetrics();
+                const ac = epMetrics.action_counts || [0, 0, 0, 0];
                 batch[batch.length - 1].metrics = {
                     episode_length:            experiences.length,
                     episode_trades:            epMetrics.total_trades,
-                    episode_wins:              epMetrics.wins   || 0,
-                    episode_losses:            epMetrics.losses || 0,
-                    episode_pnl:               epMetrics.net_pnl || 0,
+                    episode_wins:              epMetrics.wins              || 0,
+                    episode_losses:            epMetrics.losses            || 0,
+                    episode_pnl:               epMetrics.net_pnl           || 0,
                     episode_max_consec_losses: epMetrics.max_consecutive_losses || 0,
+                    // Statystyki handlowe
+                    episode_profit_sum:        epMetrics.profit_sum        || 0,
+                    episode_loss_sum:          epMetrics.loss_sum          || 0,
+                    episode_win_hold_steps:    epMetrics.win_hold_steps    || 0,
+                    episode_loss_hold_steps:   epMetrics.loss_hold_steps   || 0,
+                    episode_mfe_sum:           epMetrics.mfe_sum           || 0,
+                    episode_long_opens:        epMetrics.long_opens        || 0,
+                    episode_short_opens:       epMetrics.short_opens       || 0,
+                    // Rozkład akcji
+                    episode_action_long:       ac[0] || 0,
+                    episode_action_short:      ac[1] || 0,
+                    episode_action_hold:       ac[2] || 0,
+                    episode_action_close:      ac[3] || 0,
                 };
 
                 const batchResp = await this.pythonClient.sendBatch(batch);
