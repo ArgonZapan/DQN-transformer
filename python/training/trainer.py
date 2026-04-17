@@ -569,11 +569,15 @@ class Trainer:
             logger.info(f"[Trainer] TRAINING STARTED - Buffer full at {buffer_size} experiences, resuming={self.step_count > 0}")
             self._logged_training_start = True
 
+        _t0 = time_module.perf_counter()
+
         if self.use_per:
             states, actions, rewards, next_states, dones, action_masks, pos_features, next_pos_features, indices, is_weights = self.buffer.sample(self.batch_size)
         else:
             states, actions, rewards, next_states, dones, action_masks, pos_features, next_pos_features, indices = self.buffer.sample(self.batch_size)
             is_weights = None
+
+        _t1 = time_module.perf_counter()
 
         # Debugger v2: sprawdź czy czas na ciężkie metryki
         debug_now = (time_module.time() - self._last_debug_time) >= self.debugger.debug_interval_sec
@@ -589,6 +593,8 @@ class Trainer:
 
         current_q = self.main_network(state_tensors, position_features=pos_features)
         current_q_values = current_q.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+        _t2 = time_module.perf_counter()
 
         with torch.no_grad():
             # Wyinferuj action_mask dla next_state na podstawie wykonanej akcji:
@@ -610,6 +616,8 @@ class Trainer:
             next_q_target = self.target_network(next_state_tensors, action_mask=next_masks, position_features=next_pos_features)
             next_q_values = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
             targets = rewards + (1 - dones) * self.gamma_n * next_q_values
+
+        _t3 = time_module.perf_counter()
 
         td_errors = targets - current_q_values
         loss_per_sample = self.loss_fn(current_q_values, targets)
@@ -648,8 +656,20 @@ class Trainer:
                 self._last_advantage_std = self.main_network._debug_advantage.detach().std().item()
             self._last_debug_time = time_module.time()
 
+        _t4 = time_module.perf_counter()
+
         if self.use_per:
             self.buffer.update_priorities(indices, td_errors.detach().cpu().numpy())
+
+        _t5 = time_module.perf_counter()
+
+        # Timing diagnostics — loguj co 200 kroków przez pierwsze 1000, potem wyłącz
+        if self.step_count < 1000 and self.step_count % 200 == 0:
+            logger.info(
+                f"[Timing] sample={(_t1-_t0)*1000:.1f}ms  fwd_main={(_t2-_t1)*1000:.1f}ms  "
+                f"fwd_double={(_t3-_t2)*1000:.1f}ms  bwd={(_t4-_t3)*1000:.1f}ms  "
+                f"per_update={(_t5-_t4)*1000:.1f}ms  total={(_t5-_t0)*1000:.1f}ms"
+            )
 
         self.step_count += 1
         self.last_loss = loss.item()
