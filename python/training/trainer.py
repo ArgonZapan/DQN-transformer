@@ -60,8 +60,30 @@ class Trainer:
         self.target_network.load_state_dict(self.main_network.state_dict())
         self.target_network.eval()
 
+        # Mixed Precision (FP16) — Ampere GPU (3090) ma tensor cores; ~2x speedup
+        # CPU nie obsługuje GradScaler — wyłączamy automatycznie
+        self.use_amp = self.device != 'cpu' and torch.cuda.is_available()
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+        if self.use_amp:
+            logger.info("[Trainer] Mixed precision (AMP) enabled")
+
+        # torch.compile — kompiluje graf, +20-40% speedup. UWAGA: koliduje z hookami
+        # z debuggera/attention_monitora. Domyślnie wyłączone, włącz przez config.
+        compile_enabled = config.get('training', {}).get('compile_model', False)
+        if compile_enabled and hasattr(torch, 'compile') and self.device != 'cpu':
+            try:
+                self.main_network = torch.compile(self.main_network, mode='default', dynamic=False)
+                self.target_network = torch.compile(self.target_network, mode='default', dynamic=False)
+                logger.info("[Trainer] torch.compile enabled (mode=default)")
+            except Exception as e:
+                logger.warning(f"[Trainer] torch.compile failed, falling back to eager: {e}")
+
         self.optimizer = torch.optim.Adam(self.main_network.parameters(), lr=self.lr)
         self.loss_fn = nn.MSELoss(reduction='none')
+
+        # Prealokowane stałe maski dla Double DQN (wcześniej tworzone co krok)
+        self._mask_in_pos = torch.tensor([0, 0, 1, 1], dtype=torch.float32, device=self.device)
+        self._mask_no_pos = torch.tensor([1, 1, 1, 0], dtype=torch.float32, device=self.device)
 
         per_cfg = config.get('per', {})
         if per_cfg.get('alpha', 0) > 0:
@@ -595,22 +617,19 @@ class Trainer:
         state_tensors = [states[k] for k in sorted(states.keys())]
         next_state_tensors = [next_states[k] for k in sorted(next_states.keys())]
 
-        current_q = self.main_network(state_tensors, position_features=pos_features)
-        current_q_values = current_q.gather(1, actions.unsqueeze(1)).squeeze(1)
+        # ── Forward main (z grad) ──────────────────────────────────────────
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
+            current_q = self.main_network(state_tensors, position_features=pos_features)
+            current_q_values = current_q.gather(1, actions.unsqueeze(1)).squeeze(1)
 
         _t2 = time_module.perf_counter()
 
-        with torch.no_grad():
-            # Wyinferuj action_mask dla next_state na podstawie wykonanej akcji:
-            # LONG(0)/SHORT(1) → otwarto pozycję → next=[0,0,1,1]
-            # CLOSE(3)         → zamknięto pozycję → next=[1,1,1,0]
-            # HOLD(2)          → stan bez zmian → ta sama maska co current
-            in_pos  = torch.tensor([0, 0, 1, 1], dtype=torch.float32, device=self.device)
-            no_pos  = torch.tensor([1, 1, 1, 0], dtype=torch.float32, device=self.device)
+        # ── Forward Double DQN (bez grad, z autocast) ──────────────────────
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.use_amp):
             next_masks = action_masks.clone()
-            next_masks[actions == 0] = in_pos  # po LONG
-            next_masks[actions == 1] = in_pos  # po SHORT
-            next_masks[actions == 3] = no_pos  # po CLOSE
+            next_masks[actions == 0] = self._mask_in_pos  # po LONG
+            next_masks[actions == 1] = self._mask_in_pos  # po SHORT
+            next_masks[actions == 3] = self._mask_no_pos  # po CLOSE
 
             # Double DQN: main network wybiera akcję, target network ocenia wartość
             self.main_network.eval()
@@ -619,33 +638,45 @@ class Trainer:
             next_actions = next_q_main.argmax(dim=1)
             next_q_target = self.target_network(next_state_tensors, action_mask=next_masks, position_features=next_pos_features)
             next_q_values = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            targets = rewards + (1 - dones) * self.gamma_n * next_q_values
+            targets = (rewards + (1 - dones) * self.gamma_n * next_q_values).float()
 
         _t3 = time_module.perf_counter()
 
-        td_errors = targets - current_q_values
-        loss_per_sample = self.loss_fn(current_q_values, targets)
+        # ── Loss (poza autocast — MSE w fp32 dla stabilności) ──────────────
+        current_q_values_fp32 = current_q_values.float()
+        td_errors = targets - current_q_values_fp32
+        loss_per_sample = self.loss_fn(current_q_values_fp32, targets)
 
         if is_weights is not None:
             loss = (loss_per_sample * is_weights).mean()
         else:
             loss = loss_per_sample.mean()
 
-        self.optimizer.zero_grad()
-        loss.backward()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if debug_now:
             self.debugger.log_gradient_flow(self.main_network, self.step_count)
 
-        # Zmierz normę gradientu PRZED clippingiem — po clip zawsze <= 1.0 (bez diagnostycznej wartości)
-        pre_clip_norm = 0.0
-        for p in self.main_network.parameters():
-            if p.grad is not None:
-                pre_clip_norm += p.grad.data.norm(2).item() ** 2
-        pre_clip_norm = pre_clip_norm ** 0.5
+        # AMP: unscale przed obliczeniem normy gradientu i clippingiem
+        if self.use_amp:
+            self.scaler.unscale_(self.optimizer)
 
-        torch.nn.utils.clip_grad_norm_(self.main_network.parameters(), 1.0)
-        self.optimizer.step()
+        # clip_grad_norm_ zwraca normę PRZED clippingiem — jedno wywołanie zamiast pętli
+        # (poprzednia wersja iterowała .item() per parametr → N synchronizacji GPU)
+        pre_clip_norm = torch.nn.utils.clip_grad_norm_(
+            self.main_network.parameters(), 1.0
+        ).item()
+
+        if self.use_amp:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
         if debug_now:
             self.debugger.log_dead_neurons(self.step_count)

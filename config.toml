@@ -58,23 +58,24 @@ validation_weeks        = 0                 # Ile ostatnich TYGODNI zarezerwowa�
 training_months         = 24                # Ile miesięcy danych przed walidacją używać do treningu (0 = wszystkie dostępne)
 episode_length          = 3000              # Długość epizodu w decyzjach (nie świecach); start losowany z całej dostępnej historii
 step_interval           = 5                 # Co ile świec 1m podejmować decyzję (1 = co minutę, 10 = co 10 minut, 60 = co godzinę)
-max_trades_per_episode  = 3                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
+max_trades_per_episode  = 0                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
 return_mode             = "nstep"           # Tryb zwrotów: "mc" = Monte Carlo (done=True wszędzie), "nstep" = n-krokowe TD, "td" = 1-krokowe TD
 n_step                  = 5                 # Liczba kroków do przodu dla return_mode="nstep" (ignorowane w trybie mc/td)
+compile_model           = false             # torch.compile dla sieci (+20-40% speed, ale może kolidować z hookami debuggera)
 
 [per]
 alpha          = 0.6           # Priorytet α - jak bardzo priorytetyzować ważne próbki (0 = brak priorytetów, 1 = tylko priorytety)
 beta_start     = 0.4           # Początkowy beta - kompensacja priorytetów (zaczyna od 40% importance sampling)
 beta_end       = 1.0           # Końcowy beta - pełne importance sampling na końcu treningu
 epsilon        = 0.0001        # Mała wartość dodawana do priorytetów (zapewnia że każda próbka ma szansę być wybrana)
-positive_ratio = 0.4           # Frakcja batcha gwarantowana z zyskownych próbek (0.0 = wyłączone, używa zwykłego PER)
+positive_ratio = 0.2           # Frakcja batcha gwarantowana z zyskownych próbek (0.0 = wyłączone, używa zwykłego PER)
 
 [model]
 num_actions          = 4            # Liczba akcji: 4 (HOLD, LONG, SHORT, CLOSE)
 n_transformer_blocks = 3            # Liczba bloków Transformer
-n_attention_heads    = 8            # Liczba głów attention
-key_dim              = 16           # Wymiar klucza i query w attention (= conv1d_filters / n_attention_heads; nieużywany, PyTorch oblicza automatycznie)
-ff_dim               = 512          # Wymiar warstwy Feed-Forward
+n_attention_heads    = 4            # Liczba głów attention
+key_dim              = 32           # Wymiar klucza i query w attention (= conv1d_filters / n_attention_heads; nieużywany, PyTorch oblicza automatycznie)
+ff_dim               = 256          # Wymiar warstwy Feed-Forward
 conv_kernel_size     = 3            # Rozmiar jądra konwolucji 1D
 conv1d_filters       = 128          # Liczba filtrów w konwolucji 1D
 
@@ -89,13 +90,13 @@ use_sma20    = true       # SMA20 - Simple Moving Average 20 okresów
 commission_open         = 0.00075          # Prowizja za otwarcie pozycji 
 commission_close       = 0.00075           # Prowizja za zamknięcie pozycji 
 trade_penalty          = 0.00050           # Kara za otwarcie pozycji (zachęca do rzadszego wchodzenia)
-close_penalty          = 0.00050           # Kara za zamknięcie pozycji (zachęca do dłuższego trzymania)
+close_penalty          = 0.00000           # Kara za zamknięcie pozycji (zachęca do dłuższego trzymania)
 post_close_cooldown_steps = 12             # Po zamknięciu: ile kroków trade_penalty jest x2 (0 = wyłączone)
 clip_min               = -1.0              # Minimalna nagroda/kara (clamping)
 clip_max               = 1.0               # Maksymalna nagroda/kara (clamping)
 intermediate_reward_max = 0.1              # Max nagroda pośrednia (za małe zyski)
-loss_scale            = 1.5               # Mnożnik ujemnych delt uPnL (>1 = boki/spadki bolą bardziej; 1.0 = symetrycznie)
-hold_penalty_per_bar  = 0.00005           # Stały koszt trzymania pozycji per krok (0 = wyłączone)
+loss_scale            = 1.4               # Mnożnik ujemnych delt uPnL (>1 = boki/spadki bolą bardziej; 1.0 = symetrycznie)
+hold_penalty_per_bar  = 0.00002           # Stały koszt trzymania pozycji per krok (0 = wyłączone)
 drawdown_penalty      = 0.2               # Współczynnik kary za drawdown: reward -= maxDrawdown * drawdown_penalty (0 = wyłączone)
 time_decay_hours      = 4.0               # Half-life time decay (h): PnL spada o połowę po tym czasie trzymania pozycji (większa = łagodniejsza kara)
 
