@@ -59,7 +59,58 @@ class Actor {
                 }
             }
         }
+
+        this._applyDataWindow(candlesPerTf);
         this.env.setData(candlesPerTf);
+    }
+
+    /**
+     * Obcina dane do okna wyznaczonego przez training_months + validation_weeks/days.
+     * Zostawia też bufor rozgrzewki (candles_1d dni) przed treningiem — sieć potrzebuje
+     * pełnego okna 1d na początku danych treningowych.
+     * Tylko tryb file; w trybie API dane już są ograniczone do N ostatnich świec.
+     */
+    _applyDataWindow(candlesPerTf) {
+        const trainingMonths  = this.config.training.training_months  || 0;
+        const validationWeeks = this.config.training.validation_weeks || 0;
+        const validationDays  = validationWeeks
+            ? validationWeeks * 7
+            : this.config.training.validation_days;
+        // Warmup = okno 1d-owe (największy TF) — tyle dni musi być przed pierwszym epizod
+        const warmupDays = this.config.timeframes.candles_1d || 0;
+
+        const candles1m = candlesPerTf['1m'];
+        if (!candles1m || candles1m.length === 0) return;
+
+        const msPerDay = 24 * 60 * 60 * 1000;
+        const lastTs   = candles1m[candles1m.length - 1].timestamp;
+        const firstTs  = candles1m[0].timestamp;
+        const totalDaysRaw = Math.round((lastTs - firstTs) / msPerDay);
+
+        if (trainingMonths > 0) {
+            const valMs    = validationDays    * msPerDay;
+            const trainMs  = trainingMonths * 30 * msPerDay;
+            const warmupMs = warmupDays        * msPerDay;
+            const cutStart = lastTs - valMs - trainMs - warmupMs;
+
+            const countBefore = candles1m.length;
+            for (const tf of Object.keys(candlesPerTf)) {
+                candlesPerTf[tf] = candlesPerTf[tf].filter(c => c.timestamp >= cutStart);
+            }
+            const countAfter = (candlesPerTf['1m'] || []).length;
+
+            console.log(`[Actor:${this.symbol}] ── Okno danych (training_months=${trainingMonths}) ──`);
+            console.log(`  Rozgrzewka (buffor sieci):  ${warmupDays} dni`);
+            console.log(`  Trening:                    ${trainingMonths * 30} dni (~${trainingMonths} mies.)`);
+            console.log(`  Walidacja:                  ${validationDays} dni${validationWeeks ? ` (${validationWeeks} tyg.)` : ''}`);
+            console.log(`  Łącznie w oknie:            ${warmupDays + trainingMonths * 30 + validationDays} dni`);
+            console.log(`  Świece 1m: ${countBefore} → ${countAfter} (odcięto ${countBefore - countAfter})`);
+        } else {
+            // Brak obcinania treningu — pokaż tylko statystyki
+            const trainDays = totalDaysRaw - validationDays;
+            console.log(`[Actor:${this.symbol}] Dane: ${totalDaysRaw} dni łącznie`);
+            console.log(`  Trening: ~${trainDays} dni | Walidacja: ${validationDays} dni${validationWeeks ? ` (${validationWeeks} tyg.)` : ''} | Rozgrzewka: ${warmupDays} dni (buffor sieci)`);
+        }
     }
 
     async start() {
@@ -210,6 +261,17 @@ class Actor {
                     }
                     return entry;
                 });
+
+                // Dodaj metryki epizodu do ostatniego wpisu — learner zbiera je osobno
+                const epMetrics = this.env.getMetrics();
+                batch[batch.length - 1].metrics = {
+                    episode_length:            experiences.length,
+                    episode_trades:            epMetrics.total_trades,
+                    episode_wins:              epMetrics.wins   || 0,
+                    episode_losses:            epMetrics.losses || 0,
+                    episode_pnl:               epMetrics.net_pnl || 0,
+                    episode_max_consec_losses: epMetrics.max_consecutive_losses || 0,
+                };
 
                 const batchResp = await this.pythonClient.sendBatch(batch);
                 if (batchResp && batchResp.epsilon != null) this.epsilon = batchResp.epsilon;

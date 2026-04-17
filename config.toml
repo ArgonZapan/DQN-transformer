@@ -45,16 +45,18 @@ buffer_capacity         = 1000000           # Pojemność replay buffer - max li
 min_buffer_size         = 50000             # Minymalny rozmiar bufferu przed rozpoczęciem treningu
 target_update_interval  = 1000              # Co ile kroków aktualizować sieć docelową (target network)
 epsilon_start           = 0.96              # Początkowy epsilon (Exploration Rate) - start z pełną eksploracją
-epsilon_end             = 0.02              # Końcowy epsilon - minimalna eksploracja po długim treningu
-epsilon_decay_fraction  = 0.5               # Frakcja treningu przeznaczona na decay epsilon (0.5 = 50% treningu)
+epsilon_end             = 0.05              # Końcowy epsilon - minimalna eksploracja po długim treningu
+epsilon_decay_fraction  = 0.2               # Frakcja treningu przeznaczona na decay epsilon (0.5 = 50% treningu)
 dropout                 = 0.10              # Dropout rate - regularization (0.1 = 10% neuronów losowo wyłączanych)
 seed                    = 42                # Seed losowy dla powtarzalności eksperymentów
 resume_from_checkpoint  = ""                # Ścieżka do checkpointu do wznowienia treningu (puste = od zera)
 keep_last_n_checkpoints = 24                # Ile ostatnich checkpointów trzymać na dysku
-checkpoint_interval     = 5000              # Co ile kroków zapisywać checkpoint
-evaluation_interval     = 10000             # Co ile kroków uruchamiać ewaluację
-validation_days         = 60                # Ile ostatnich dni zarezerwowanych do walidacji (reszta = trening)
-episode_length          = 1000              # Długość epizodu w decyzjach (nie świecach); start losowany z całej dostępnej historii
+checkpoint_interval     = 20000             # Co ile kroków zapisywać checkpoint
+evaluation_interval     = 5000              # Co ile kroków uruchamiać ewaluację
+validation_days         = 60                # Ile ostatnich dni zarezerwowanych do walidacji (reszta = trening); używane tylko gdy validation_weeks = 0
+validation_weeks        = 0                 # Ile ostatnich TYGODNI zarezerwować na walidację (0 = użyj validation_days)
+training_months         = 24                # Ile miesięcy danych przed walidacją używać do treningu (0 = wszystkie dostępne)
+episode_length          = 3000              # Długość epizodu w decyzjach (nie świecach); start losowany z całej dostępnej historii
 step_interval           = 5                 # Co ile świec 1m podejmować decyzję (1 = co minutę, 10 = co 10 minut, 60 = co godzinę)
 max_trades_per_episode  = 3                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
 return_mode             = "nstep"           # Tryb zwrotów: "mc" = Monte Carlo (done=True wszędzie), "nstep" = n-krokowe TD, "td" = 1-krokowe TD
@@ -88,7 +90,7 @@ commission_open         = 0.00075          # Prowizja za otwarcie pozycji
 commission_close       = 0.00075           # Prowizja za zamknięcie pozycji 
 trade_penalty          = 0.00050           # Kara za otwarcie pozycji (zachęca do rzadszego wchodzenia)
 close_penalty          = 0.00050           # Kara za zamknięcie pozycji (zachęca do dłuższego trzymania)
-post_close_cooldown_steps = 5              # Po zamknięciu: ile kroków trade_penalty jest x2 (0 = wyłączone)
+post_close_cooldown_steps = 12             # Po zamknięciu: ile kroków trade_penalty jest x2 (0 = wyłączone)
 clip_min               = -1.0              # Minimalna nagroda/kara (clamping)
 clip_max               = 1.0               # Maksymalna nagroda/kara (clamping)
 intermediate_reward_max = 0.1              # Max nagroda pośrednia (za małe zyski)
@@ -120,19 +122,27 @@ step_interval = 5                                      # Co ile świec 1m podejm
 max_oos_days  = 30                                      # Ile ostatnich dni OOS używać do backtestu (60 = 2 miesiące = 86 400 świec 1m)
 fee           = 0.00075                                # Prowizja za jedną stronę transakcji (open lub close); łączny koszt = fee * 2
 
+[report]
+enabled          = true             # Włącz raporty Telegram po każdym update sieci docelowej
+mode             = "full"           # "compact" = skrócony (1 ekran), "full" = pełny raport
+every_n_updates  = 15                # Co ile target network updates wysyłać raport (1 = każdy, 5 = co 5.)
+min_interval_sec = 1200            # Minimalny czas między raportami w sekundach (0 = bez limitu, 3600 = max 1/h)
+# telegram_token   = ""            # Opcjonalnie: własny token; domyślnie używa [alerts].telegram_token
+# telegram_chat_id = ""            # Opcjonalnie: własny chat_id; domyślnie używa [alerts].telegram_chat_id
+
 [alerts]
-enabled                    = true              # Włącz alerty Telegram
-telegram_token             = "8768128197:AAH8hjBaoKWFhIzAC0-TeGYoKK0Nvzd4TIU"
-telegram_chat_id           = ""               # Uzupełnij: wyślij /start do bota i wklej chat_id
-cooldown_sec               = 300              # Min 5 minut między alertami tego samego typu
-grad_explode_threshold     = 5.0              # grad_norm > próg → alert
-action_collapse_threshold  = 0.95             # dominant_ratio > próg → alert
-loss_plateau_steps         = 2000             # Brak poprawy loss przez N kroków → alert
+enabled                    = true                                                   # Włącz alerty Telegram
+telegram_token             = "8692060831:AAFkyj2rRsAnv5AKwzn_KefjJblUO-3tF68"
+telegram_chat_id           = "8624710090"                                           # Uzupełnij: wyślij /start do bota i wklej chat_id
+cooldown_sec               = 300                                                    # Min 5 minut między alertami tego samego typu
+grad_explode_threshold     = 5.0                                                    # grad_norm > próg → alert
+action_collapse_threshold  = 0.95                                                   # dominant_ratio > próg → alert
+loss_plateau_steps         = 2000                                                   # Brak poprawy loss przez N kroków → alert
 
 [onnx]
-enabled     = true                               # Włącz lokalny ONNX inference w aktorach
-export_path = "python/checkpoints/model.onnx"   # Ścieżka do eksportowanego pliku ONNX
-device      = "cpu"                              # Urządzenie wnioskowania w aktorach: "cpu" lub "cuda"
+enabled     = true                                      # Włącz lokalny ONNX inference w aktorach
+export_path = "python/checkpoints/model.onnx"           # Ścieżka do eksportowanego pliku ONNX
+device      = "cpu"                                     # Urządzenie wnioskowania w aktorach: "cpu" lub "cuda"
 
 [api]
 simulation_mode = true       # Tryb symulacji (true) lub realny handel (false)

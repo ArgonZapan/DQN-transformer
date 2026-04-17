@@ -378,7 +378,8 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
         print(f"[Backtest] {symbol}: no 1m data — skipping")
         return {'trades': [], 'equity_curve': [0.0], 'daily_pnl': {}, 'total_steps': 0}
 
-    validation_days = config['training']['validation_days']
+    validation_weeks = config['training'].get('validation_weeks', 0)
+    validation_days = validation_weeks * 7 if validation_weeks else config['training']['validation_days']
     split = max(0, len(candles_1m) - validation_days * 24 * 60)
 
     # Ogranicz OOS do ostatnich 60 dni (86 400 świec 1m)

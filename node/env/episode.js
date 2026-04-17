@@ -6,10 +6,17 @@
 
 class Episode {
     constructor(config) {
-        this.validationDays   = config.training.validation_days;
+        // validation_weeks ma pierwszeństwo nad validation_days
+        this.validationDays   = config.training.validation_weeks
+            ? config.training.validation_weeks * 7
+            : config.training.validation_days;
         this.maxEpisodeLength = config.training.episode_length;
         this.stepInterval     = config.training.step_interval || 1;
         this.gamma = config.training.gamma;
+
+        // Minimalna pozycja startowa epizodu: sieć potrzebuje candles_1d pełnych świec dziennych
+        // jako kontekst. Przy training_months > 0 dane są obcinane od właśnie tego punktu.
+        this.warmupCandles = (config.timeframes.candles_1d || 0) * 24 * 60;
 
         this.steps = [];
         this.startIndex = 0;
@@ -24,9 +31,12 @@ class Episode {
 
     getRandomStartIndex(dataLength) {
         const trainEnd = this._trainEnd(dataLength);
+        // Epizod nie może startować wcześniej niż po warmup — sieć nie miałaby
+        // pełnego okna 1d. Przy training_months=0 warmup pochodzi z początku pełnej historii.
+        const minStart = this.warmupCandles;
         const maxStart = trainEnd - this.maxEpisodeLength * this.stepInterval;
-        if (maxStart <= 0) return 0;
-        return Math.floor(Math.random() * maxStart);
+        if (maxStart <= minStart) return minStart;
+        return minStart + Math.floor(Math.random() * (maxStart - minStart));
     }
 
     start(dataLength) {
