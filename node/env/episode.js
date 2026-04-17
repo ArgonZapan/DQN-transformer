@@ -100,6 +100,9 @@ class Episode {
      * γ^n jest przekazywane jako pole `gammaToN` — trainer mnoży przez nie next_q.
      */
     getExperiencesNStep(n) {
+        // Policz MC returns z góry — tylko do wyświetlania w tabeli epizodu
+        this.calculateMonteCarloReturns();
+
         const T = this.steps.length;
         const gamma = this.gamma;
         const gammaN = Math.pow(gamma, n);
@@ -126,6 +129,7 @@ class Episode {
                 actionMask:     this.steps[t].actionMask,
                 nextActionMask,
                 gammaToN:       gammaN,
+                returnG:        this.steps[t].returnG,  // MC return — tylko do wyświetlania
             });
         }
         return result;
@@ -135,6 +139,7 @@ class Episode {
      * Zwraca surowe doświadczenia (1-krokowe TD) bez żadnych transformacji.
      */
     getExperiencesTD() {
+        this.calculateMonteCarloReturns();
         return this.steps.map(step => ({
             state:      step.state,
             action:     step.action,
@@ -143,6 +148,7 @@ class Episode {
             done:       step.done,
             actionMask: step.actionMask,
             gammaToN:   this.gamma,
+            returnG:    step.returnG,  // MC return — tylko do wyświetlania
         }));
     }
 
