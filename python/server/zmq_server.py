@@ -104,33 +104,29 @@ class ZMQServer:
     def _handle_batch(self, batch):
         validate_batch_request(batch)
 
-        results = []
+        # Aktorzy z ONNX robią inference lokalnie i ignorują predict z odpowiedzi —
+        # czytają tylko epsilon. Nie wywołujemy trainer.predict() per item (były to
+        # tysiące zbędnych forward passów GPU size=1 konkurujących z treningiem).
         for item in batch:
             actor_id = item['actorId']
-            symbol = item.get('symbol', actor_id)  # Symbol do metryk
-            state = item['state']
+            symbol = item.get('symbol', actor_id)
             action = item.get('action')
             reward = item.get('reward', 0)
             next_state = item.get('nextState')
             done = item.get('done', False)
             action_mask = item.get('actionMask')
-            metrics = item.get('metrics', {})  # Metryki od aktora
+            metrics = item.get('metrics', {})
 
             if action is not None:
-                self.trainer.add_experience(state, action, reward, next_state, done, action_mask, actor_id=actor_id)
+                self.trainer.add_experience(
+                    item['state'], action, reward, next_state, done, action_mask,
+                    actor_id=actor_id
+                )
 
-            # Przekaż metryki aktora do TensorBoard accumulation
             if metrics:
                 self.trainer.add_actor_metrics(symbol, metrics)
 
-            pred_action, q_values = self.trainer.predict(state, action_mask)
-            results.append({
-                'actorId': actor_id,
-                'action': pred_action,
-                'qValues': q_values
-            })
-
-        return build_batch_response(results, epsilon=self.trainer.epsilon)
+        return {'epsilon': float(self.trainer.epsilon)}
 
     def close(self):
         self.running = False
