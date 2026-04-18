@@ -326,13 +326,18 @@ class Trainer:
             'actions_total': torch.zeros(self._num_actions, dtype=torch.long, device=self.device),
         }
 
-    def _sync_gpu_accumulator(self):
-        """JEDEN sync GPU→CPU — stackuje wszystkie skalary i zwraca dict float'ów.
-        Reset akumulatora po synchronizacji."""
-        if self._gpu_acc_steps == 0:
-            return None
+    def _snapshot_gpu_accumulator(self):
+        """Snapshot akumulatora — jeden sync GPU→CPU, BEZ resetu."""
         n = self._gpu_acc_steps
-        # Stack wszystkich 11 skalarów w jeden tensor → jeden transfer
+        if n == 0:
+            return {
+                'steps_accumulated': 0,
+                'loss_sum': 0.0, 'td_error_sum': 0.0, 'td_error_sq_sum': 0.0,
+                'td_error_max': 0.0, 'q_mean_sum': 0.0, 'q_max_sum': 0.0,
+                'q_min_sum': 0.0, 'grad_norm_sum': 0.0, 'q_spread_sum': 0.0,
+                'action_entropy_sum': 0.0, 'q_hold_sum': 0.0,
+                'actions_total': [0] * self._num_actions,
+            }
         scalars = torch.stack([
             self._gpu_acc['loss_sum'],       self._gpu_acc['td_sum'],
             self._gpu_acc['td_sq_sum'],      self._gpu_acc['td_max'],
@@ -342,7 +347,7 @@ class Trainer:
             self._gpu_acc['q_hold_sum'],
         ]).cpu().numpy()
         actions_total = self._gpu_acc['actions_total'].cpu().numpy().tolist()
-        result = {
+        return {
             'steps_accumulated': n,
             'loss_sum':       float(scalars[0]),
             'td_error_sum':   float(scalars[1]),
@@ -357,10 +362,21 @@ class Trainer:
             'q_hold_sum':     float(scalars[10]),
             'actions_total':  actions_total,
         }
-        # Reset — nowe GPU tensory (stare mogą być cached przez stack)
+
+    def _sync_gpu_accumulator(self):
+        """Sync + reset — wywoływane tylko w _log_tensorboard."""
+        if self._gpu_acc_steps == 0:
+            return None
+        result = self._snapshot_gpu_accumulator()
         self._gpu_acc = self._make_gpu_accumulator()
         self._gpu_acc_steps = 0
         return result
+
+    @property
+    def _metrics_accumulator(self):
+        """Backward-compat: callery zewnętrzne (training_report, get_metrics) oczekują dict.
+        Każde odczytanie = jeden sync GPU→CPU. NIE wywoływać w hot path."""
+        return self._snapshot_gpu_accumulator()
 
     def add_experience(self, state, action, reward, next_state, done, action_mask=None, actor_id=None):
         # Nie blokuj ZMQ thread — jeśli kolejka pełna, pomijamy (bezpieczne przy PER)
