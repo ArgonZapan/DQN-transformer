@@ -329,16 +329,16 @@ class Trainer:
             pass
 
     def _drain_experience_queue(self) -> int:
-        """Przenosi doświadczenia z kolejki do buffera. Wywołuje training thread."""
-        added = 0
+        """Przenosi doświadczenia z kolejki do buffera jednym batch_add zamiast N add()."""
+        experiences = []
         try:
             while True:
-                state, action, reward, next_state, done, action_mask = self._experience_queue.get_nowait()
-                self.buffer.add(state, action, reward, next_state, done, action_mask)
-                added += 1
+                experiences.append(self._experience_queue.get_nowait())
         except queue.Empty:
             pass
-        return added
+        if experiences:
+            self.buffer.batch_add(experiences)
+        return len(experiences)
 
     def add_actor_metrics(self, symbol, metrics):
         """Dodaje metryki od aktora do akumulatora TensorBoard."""

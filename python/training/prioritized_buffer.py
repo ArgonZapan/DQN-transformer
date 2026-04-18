@@ -68,16 +68,15 @@ class SumTree:
         self._propagate(idx, change)
 
     def update_batch(self, data_indices, priorities):
-        """Batch update priorytetów — jeden przebieg po drzewie dla każdego indeksu."""
-        tree_indices = data_indices + self.capacity - 1
+        """Batch update priorytetów — wektoryzowana propagacja w górę drzewa."""
+        tree_indices = (data_indices + self.capacity - 1).astype(np.int64)
         changes = priorities - self.tree[tree_indices]
         self.tree[tree_indices] = priorities
-        # Propaguj każdą zmianę w górę iteracyjnie
-        for i, idx in enumerate(tree_indices):
-            change = changes[i]
-            while idx != 0:
-                idx = (idx - 1) // 2
-                self.tree[idx] += change
+        idx = tree_indices.copy()
+        while idx.max() > 0:
+            mask = idx > 0
+            idx[mask] = (idx[mask] - 1) // 2
+            np.add.at(self.tree, idx[mask], changes[mask])
 
     def get(self, s):
         idx = self._retrieve(0, s)
@@ -229,6 +228,69 @@ class PrioritizedReplayBuffer:
         self.tree.add(priority)
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+
+    def batch_add(self, experiences):
+        """Batch insert — one numpy/tensor pass instead of N individual add() calls."""
+        n = len(experiences)
+        if n == 0:
+            return
+        positions = (self.position + np.arange(n, dtype=np.int64)) % self.capacity
+
+        for key in self.timeframe_keys:
+            tf_name = key.replace('candles_', '')
+            seq_len = self.timeframe_sizes[key]
+            s_batch = np.zeros((n, seq_len, self.num_features), dtype=np.float32)
+            ns_batch = np.zeros((n, seq_len, self.num_features), dtype=np.float32)
+            for i, (state, _, _, next_state, _, _) in enumerate(experiences):
+                sd = state.get(key) or state.get(tf_name)
+                if sd:
+                    arr = np.asarray(sd, dtype=np.float32)
+                    al = min(arr.shape[0], seq_len)
+                    s_batch[i, :al] = arr[:al]
+                if next_state is not None:
+                    nd = next_state.get(key) or next_state.get(tf_name)
+                    if nd:
+                        arr = np.asarray(nd, dtype=np.float32)
+                        al = min(arr.shape[0], seq_len)
+                        ns_batch[i, :al] = arr[:al]
+            self.states[key][positions] = torch.from_numpy(s_batch)
+            self.next_states[key][positions] = torch.from_numpy(ns_batch)
+
+        self.actions[positions] = torch.from_numpy(
+            np.array([e[1] for e in experiences], dtype=np.int64))
+        self.rewards[positions] = torch.from_numpy(
+            np.array([e[2] for e in experiences], dtype=np.float32))
+        self.dones[positions] = torch.from_numpy(
+            np.array([float(e[4]) for e in experiences], dtype=np.float32))
+
+        masks = np.ones((n, self.num_actions), dtype=np.float32)
+        for i, e in enumerate(experiences):
+            am = e[5]
+            if am is not None:
+                arr = np.asarray(am, dtype=np.float32)
+                if len(arr) == self.num_actions:
+                    masks[i] = arr
+        self.action_masks[positions] = torch.from_numpy(masks)
+
+        pf = np.zeros((n, 4), dtype=np.float32)
+        npf = np.zeros((n, 4), dtype=np.float32)
+        for i, (state, _, _, next_state, _, _) in enumerate(experiences):
+            p = state.get('position') if isinstance(state, dict) else None
+            if p is not None:
+                pf[i] = np.asarray(p[:4], dtype=np.float32)
+            np_ = next_state.get('position') if isinstance(next_state, dict) else None
+            if np_ is not None:
+                npf[i] = np.asarray(np_[:4], dtype=np.float32)
+        self.pos_features[positions] = torch.from_numpy(pf)
+        self.next_pos_features[positions] = torch.from_numpy(npf)
+
+        self.position = int((self.position + n) % self.capacity)
+        self.size = min(self.size + n, self.capacity)
+
+        priority = min(self.max_priority ** self.alpha, self._MAX_PRIORITY)
+        priorities = np.full(n, priority, dtype=np.float64)
+        self.tree.update_batch(positions, priorities)
+        self.tree.data_pointer = self.position
 
     def _sanitize_tree(self):
         """Reset tree to uniform priorities if it contains invalid values."""
@@ -448,6 +510,12 @@ class DualPrioritizedBuffer:
         self.main.add(state, action, reward, next_state, done, action_mask)
         if reward > 0:
             self.positive.add(state, action, reward, next_state, done, action_mask)
+
+    def batch_add(self, experiences):
+        self.main.batch_add(experiences)
+        pos_exps = [e for e in experiences if e[2] > 0]
+        if pos_exps:
+            self.positive.batch_add(pos_exps)
 
     # ── Sample ────────────────────────────────────────────────────────────────
     def sample(self, batch_size):
