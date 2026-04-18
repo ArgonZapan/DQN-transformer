@@ -1,6 +1,7 @@
 import os
 import logging
 import glob
+import queue
 from datetime import datetime
 from collections import defaultdict, deque
 import time as time_module
@@ -84,6 +85,10 @@ class Trainer:
         # Prealokowane stałe maski dla Double DQN (wcześniej tworzone co krok)
         self._mask_in_pos = torch.tensor([0, 0, 1, 1], dtype=torch.float32, device=self.device)
         self._mask_no_pos = torch.tensor([1, 1, 1, 0], dtype=torch.float32, device=self.device)
+
+        # Kolejka doświadczeń: ZMQ thread tylko enqueue (szybkie), training thread
+        # drainuje na początku każdego train_step — eliminuje GIL contention
+        self._experience_queue: queue.Queue = queue.Queue(maxsize=50000)
 
         per_cfg = config.get('per', {})
         if per_cfg.get('alpha', 0) > 0:
@@ -317,7 +322,23 @@ class Trainer:
             logger.info(f"Removed old checkpoint: {old}")
 
     def add_experience(self, state, action, reward, next_state, done, action_mask=None, actor_id=None):
-        self.buffer.add(state, action, reward, next_state, done, action_mask)
+        # Nie blokuj ZMQ thread — jeśli kolejka pełna, pomijamy (bezpieczne przy PER)
+        try:
+            self._experience_queue.put_nowait((state, action, reward, next_state, done, action_mask))
+        except queue.Full:
+            pass
+
+    def _drain_experience_queue(self) -> int:
+        """Przenosi doświadczenia z kolejki do buffera. Wywołuje training thread."""
+        added = 0
+        try:
+            while True:
+                state, action, reward, next_state, done, action_mask = self._experience_queue.get_nowait()
+                self.buffer.add(state, action, reward, next_state, done, action_mask)
+                added += 1
+        except queue.Empty:
+            pass
+        return added
 
     def add_actor_metrics(self, symbol, metrics):
         """Dodaje metryki od aktora do akumulatora TensorBoard."""
@@ -594,6 +615,9 @@ class Trainer:
         if not self._logged_training_start:
             logger.info(f"[Trainer] TRAINING STARTED - Buffer full at {buffer_size} experiences, resuming={self.step_count > 0}")
             self._logged_training_start = True
+
+        # Drain kolejki doświadczeń (ZMQ thread enqueue, tu robimy buffer.add)
+        self._drain_experience_queue()
 
         _t0 = time_module.perf_counter()
 
