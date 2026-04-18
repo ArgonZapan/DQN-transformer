@@ -135,29 +135,16 @@ class Trainer:
         self.metric_logger = MetricLogger(os.path.join(diag_dir, 'metrics.jsonl'), flush_every=50)
         self.alert_system = AlertSystem(config)
         self.training_report = TrainingReport(config)
+        # Attention monitor — hooki robią .cpu() na KAŻDY forward pass (GPU sync).
+        # Rejestrujemy dynamicznie tylko w oknie debug_now, potem usuwamy.
         self.attention_monitor = AttentionMonitor(self.main_network, self.writer)
-        self.attention_monitor.register()
         self._last_advantage_std: float | None = None
         self._last_health: dict | None = None
 
-        # Akumulatory metryk (sumowane między logowaniami)
-        self._metrics_accumulator = {
-            'loss_sum': 0.0,
-            'loss_count': 0,
-            'td_error_sum': 0.0,
-            'td_error_sq_sum': 0.0,
-            'td_error_max': 0.0,
-            'q_mean_sum': 0.0,
-            'q_max_sum': 0.0,
-            'q_min_sum': 0.0,
-            'q_count': 0,
-            'grad_norm_sum': 0.0,
-            'steps_accumulated': 0,
-            'actions_total': [0] * config['model']['num_actions'],
-            'q_spread_sum': 0.0,
-            'action_entropy_sum': 0.0,
-            'q_hold_sum': 0.0,          # Q-value dla akcji HOLD (index 2)
-        }
+        # Akumulatory metryk — GPU tensory, jeden sync na log_interval zamiast 8+/krok
+        self._num_actions = config['model']['num_actions']
+        self._gpu_acc = self._make_gpu_accumulator()
+        self._gpu_acc_steps = 0
         
         # Metryki od actorów (per symbol)
         self._actor_metrics = defaultdict(lambda: {
@@ -321,6 +308,60 @@ class Trainer:
             os.remove(old)
             logger.info(f"Removed old checkpoint: {old}")
 
+    def _make_gpu_accumulator(self):
+        """Tworzy nowy zestaw GPU tensorów do akumulacji metryk — bez sync CPU."""
+        z = lambda: torch.zeros((), device=self.device)
+        return {
+            'loss_sum': z(),
+            'td_sum': z(),
+            'td_sq_sum': z(),
+            'td_max': z(),
+            'q_mean_sum': z(),
+            'q_max_sum': z(),
+            'q_min_sum': z(),
+            'grad_norm_sum': z(),
+            'q_spread_sum': z(),
+            'action_entropy_sum': z(),
+            'q_hold_sum': z(),
+            'actions_total': torch.zeros(self._num_actions, dtype=torch.long, device=self.device),
+        }
+
+    def _sync_gpu_accumulator(self):
+        """JEDEN sync GPU→CPU — stackuje wszystkie skalary i zwraca dict float'ów.
+        Reset akumulatora po synchronizacji."""
+        if self._gpu_acc_steps == 0:
+            return None
+        n = self._gpu_acc_steps
+        # Stack wszystkich 11 skalarów w jeden tensor → jeden transfer
+        scalars = torch.stack([
+            self._gpu_acc['loss_sum'],       self._gpu_acc['td_sum'],
+            self._gpu_acc['td_sq_sum'],      self._gpu_acc['td_max'],
+            self._gpu_acc['q_mean_sum'],     self._gpu_acc['q_max_sum'],
+            self._gpu_acc['q_min_sum'],      self._gpu_acc['grad_norm_sum'],
+            self._gpu_acc['q_spread_sum'],   self._gpu_acc['action_entropy_sum'],
+            self._gpu_acc['q_hold_sum'],
+        ]).cpu().numpy()
+        actions_total = self._gpu_acc['actions_total'].cpu().numpy().tolist()
+        result = {
+            'steps_accumulated': n,
+            'loss_sum':       float(scalars[0]),
+            'td_error_sum':   float(scalars[1]),
+            'td_error_sq_sum':float(scalars[2]),
+            'td_error_max':   float(scalars[3]),
+            'q_mean_sum':     float(scalars[4]),
+            'q_max_sum':      float(scalars[5]),
+            'q_min_sum':      float(scalars[6]),
+            'grad_norm_sum':  float(scalars[7]),
+            'q_spread_sum':   float(scalars[8]),
+            'action_entropy_sum': float(scalars[9]),
+            'q_hold_sum':     float(scalars[10]),
+            'actions_total':  actions_total,
+        }
+        # Reset — nowe GPU tensory (stare mogą być cached przez stack)
+        self._gpu_acc = self._make_gpu_accumulator()
+        self._gpu_acc_steps = 0
+        return result
+
     def add_experience(self, state, action, reward, next_state, done, action_mask=None, actor_id=None):
         # Nie blokuj ZMQ thread — jeśli kolejka pełna, pomijamy (bezpieczne przy PER)
         try:
@@ -443,12 +484,13 @@ class Trainer:
         log_histograms = (current_time - self._last_histogram_log_time) >= self.histogram_interval_sec
         
         step = self.step_count
-        acc = self._metrics_accumulator
-        
-        if acc['steps_accumulated'] > 0:
+        acc = self._sync_gpu_accumulator()  # JEDEN sync GPU→CPU
+
+        if acc is not None:
             # Oblicz średnie
             n = acc['steps_accumulated']
             avg_loss = acc['loss_sum'] / n
+            self.last_loss = avg_loss  # aktualizuj float dla main.py logger
             avg_td = acc['td_error_sum'] / n
             td_std = np.sqrt(max(0.0, acc['td_error_sq_sum'] / n - avg_td**2)) if n > 1 else 0
             avg_q = acc['q_mean_sum'] / n
@@ -559,25 +601,7 @@ class Trainer:
             self.metric_logger.log(step, diag_metrics)
             self.alert_system.check_and_alert(diag_metrics, step)
 
-        # Reset akumulatorów
-        self._metrics_accumulator = {
-            'loss_sum': 0.0,
-            'loss_count': 0,
-            'td_error_sum': 0.0,
-            'td_error_sq_sum': 0.0,
-            'td_error_max': 0.0,
-            'q_mean_sum': 0.0,
-            'q_max_sum': 0.0,
-            'q_min_sum': 0.0,
-            'q_count': 0,
-            'grad_norm_sum': 0.0,
-            'steps_accumulated': 0,
-            'q_spread_sum': 0.0,
-            'action_entropy_sum': 0.0,
-            'q_hold_sum': 0.0,
-            'actions_total': [0] * self.config['model']['num_actions'],
-        }
-        
+        # Reset akumulatora zrobiony w _sync_gpu_accumulator()
         self._last_tb_log_time = current_time
         
         # Histogramy (rzadziej)
@@ -637,6 +661,7 @@ class Trainer:
         if debug_now:
             self.debugger.register_hooks(self.main_network)
             self.debugger.snapshot_weights(self.main_network)
+            self.attention_monitor.register()
 
         state_tensors = [states[k] for k in sorted(states.keys())]
         next_state_tensors = [next_states[k] for k in sorted(next_states.keys())]
@@ -690,11 +715,10 @@ class Trainer:
         if self.use_amp:
             self.scaler.unscale_(self.optimizer)
 
-        # clip_grad_norm_ zwraca normę PRZED clippingiem — jedno wywołanie zamiast pętli
-        # (poprzednia wersja iterowała .item() per parametr → N synchronizacji GPU)
+        # Trzymaj normę jako tensor — sync CPU dopiero przy logowaniu (jeden batch sync)
         pre_clip_norm = torch.nn.utils.clip_grad_norm_(
             self.main_network.parameters(), 1.0
-        ).item()
+        )
 
         if self.use_amp:
             self.scaler.step(self.optimizer)
@@ -711,6 +735,7 @@ class Trainer:
                 self.step_count,
             )
             attn_metrics = self.attention_monitor.log_diagnostics(self.step_count)
+            self.attention_monitor._remove_hooks()
             if self.main_network._debug_advantage is not None:
                 self._last_advantage_std = self.main_network._debug_advantage.detach().std().item()
             self._last_debug_time = time_module.time()
@@ -722,71 +747,56 @@ class Trainer:
 
         _t5 = time_module.perf_counter()
 
-        # Timing diagnostics — loguj 5 razy po starcie treningu, potem wyłącz
-        if self._timing_logged < 5:
+        # Timing diagnostics — loguj 5 razy po starcie treningu, potem co 500 kroków
+        if self._timing_logged < 5 or self.step_count % 500 == 0:
             self._timing_logged += 1
+            _t_total = time_module.perf_counter()
             logger.info(
                 f"[Timing] sample={(_t1-_t0)*1000:.1f}ms  fwd_main={(_t2-_t1)*1000:.1f}ms  "
                 f"fwd_double={(_t3-_t2)*1000:.1f}ms  bwd={(_t4-_t3)*1000:.1f}ms  "
-                f"per_update={(_t5-_t4)*1000:.1f}ms  total={(_t5-_t0)*1000:.1f}ms"
+                f"per_update={(_t5-_t4)*1000:.1f}ms  total_hot={(_t5-_t0)*1000:.1f}ms"
             )
 
         self.step_count += 1
-        self.last_loss = loss.item()
         self._update_epsilon()
 
         if self.use_per:
             beta_fraction = min(1.0, self.step_count / self.config['training']['buffer_capacity'])
             self.buffer.update_beta(beta_fraction)
 
-        # ===== Akumuluj metryki do późniejszego logowania =====
-        acc = self._metrics_accumulator
-        
-        # Loss
-        acc['loss_sum'] += self.last_loss
-        acc['loss_count'] += 1
-        
-        # TD Error — używaj mean żeby n=steps_accumulated był właściwym mianownikiem
-        td_np = td_errors.detach().cpu().numpy()
-        acc['td_error_sum'] += float(np.mean(td_np))
-        acc['td_error_sq_sum'] += float(np.mean(td_np ** 2))
-        acc['td_error_max'] = max(acc['td_error_max'], float(np.max(np.abs(td_np))))
-        
-        # Q-values — mean/max/min po osi batch (per-sample best Q)
-        q_np = current_q.detach().cpu().numpy()   # [batch, num_actions]
-        q_batch_size = q_np.shape[0]
-        acc['q_mean_sum'] += float(q_np.mean())
-        acc['q_max_sum']  += float(q_np.max(axis=1).mean())
-        acc['q_min_sum']  += float(q_np.min(axis=1).mean())
-        acc['q_count'] += q_batch_size
-        
-        # Gradient norm — używamy pre_clip_norm obliczonego przed clip_grad_norm_()
-        acc['grad_norm_sum'] += pre_clip_norm
-        
-        # Actions
-        for a in actions.cpu().numpy():
-            if a < len(acc['actions_total']):
-                acc['actions_total'][a] += 1
-
-        # Debugger v2: lekkie metryki akumulowane co krok
+        # ===== Akumuluj metryki — wszystko na GPU, żadnych .item() ani .cpu() =====
+        acc = self._gpu_acc
         with torch.no_grad():
             q_det = current_q.detach()
-            spread = (q_det.max(dim=1).values - q_det.min(dim=1).values).mean().item()
-            # Entropia tylko po dozwolonych akcjach — zablokowane muszą być -inf przed softmax
+            td_det = td_errors.detach()
+            td_abs = td_det.abs()
+
+            acc['loss_sum']    += loss.detach()
+            acc['td_sum']      += td_det.mean()
+            acc['td_sq_sum']   += (td_det * td_det).mean()
+            acc['td_max']      = torch.maximum(acc['td_max'], td_abs.max())
+            acc['q_mean_sum']  += q_det.mean()
+            q_max_row = q_det.max(dim=1).values
+            q_min_row = q_det.min(dim=1).values
+            acc['q_max_sum']   += q_max_row.mean()
+            acc['q_min_sum']   += q_min_row.mean()
+            acc['grad_norm_sum'] += pre_clip_norm
+            acc['q_spread_sum']  += (q_max_row - q_min_row).mean()
+
             q_masked = q_det.masked_fill(action_masks == 0, float('-inf'))
             probs = torch.softmax(q_masked, dim=1)
-            entropy = -(probs * torch.log2(probs + 1e-8)).sum(dim=1).mean().item()
-        acc['q_spread_sum'] += spread
-        acc['action_entropy_sum'] += entropy
-        # Q-Value Anchor dla HOLD (akcja 2 = HOLD wg ACTIONS w tradingEnv.js)
-        acc['q_hold_sum'] += float(q_det[:, 2].mean().item())
+            acc['action_entropy_sum'] += -(probs * torch.log2(probs + 1e-8)).sum(dim=1).mean()
+            acc['q_hold_sum'] += q_det[:, 2].mean()
 
-        acc['steps_accumulated'] += 1
+            # Zamiast pętli Python nad actions.cpu().numpy() — bincount na GPU
+            acc['actions_total'] += torch.bincount(actions, minlength=self._num_actions)
 
-        # Zachowaj ostatni batch dla histogramów
-        self._last_q = current_q.detach()
+        self._gpu_acc_steps += 1
+
+        # Zachowaj ostatni batch dla histogramów (wciąż na GPU, sync dopiero w _log_histograms)
+        self._last_q = q_det
         self._last_rewards = rewards.detach()
-        self._last_td = td_errors.detach()
+        self._last_td = td_det
 
         # ---- Loguj do TensorBoard co określony interwał ----
         self._log_tensorboard()
