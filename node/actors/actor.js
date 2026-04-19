@@ -542,7 +542,7 @@ class Actor {
             head: ['#', 'Timestamp', 'Price', 'uPNL%', 'Pos', 'Src', 'Action',
                    'LONG', 'SHORT', 'HOLD', 'CLOSE',
                    'rOpen', 'rClose', 'rIdle', 'rΔuPnL', 'ruPnL', 'rHold', 'rΣ',
-                   'returnG'],
+                   'r5step'],
             colWidths: [5, 17, 11, 8, 5, 6, 12, 10, 10, 10, 10, 9, 9, 9, 9, 9, 9, 10, 11],
             colAligns: ['right', 'left', 'right', 'right', 'middle', 'middle', 'left',
                         'right', 'right', 'right', 'right',
@@ -601,9 +601,9 @@ class Actor {
             const rb = row.rewardBreakdown || {};
             const rTotal = fmtR(row.reward);
 
-            const returnGVal = mc ? mc.returnG : null;
-            const returnG = returnGVal != null
-                ? (returnGVal >= 0 ? c.green(`+${returnGVal.toFixed(5)}`) : c.red(returnGVal.toFixed(5)))
+            const nstepVal = mc ? mc.reward : null;
+            const returnG = nstepVal != null
+                ? (nstepVal >= 0 ? c.green(`+${nstepVal.toFixed(5)}`) : c.red(nstepVal.toFixed(5)))
                 : '';
 
             table.push([
