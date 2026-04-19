@@ -3,4 +3,7 @@ numpy
 pyzmq
 msgpack
 toml
+tomlkit
 pytest
+onnx
+onnxscript

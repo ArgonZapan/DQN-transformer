@@ -1,3 +1,7 @@
+# ── Aktywne symbole ────────────────────────────────────────────────────────────
+# Każdy [[actors]] to osobny aktor (osobny wątek Node.js).
+# leverage > 1 jedynie przy API simulation_mode = false.
+
 [[actors]]
 symbol = "BTCUSDT"
 exchange = "binance"
@@ -13,150 +17,189 @@ symbol = "SOLUSDT"
 exchange = "binance"
 leverage = 1
 
+# ── Learner (Python / GPU) ─────────────────────────────────────────────────────
 [learner]
 host = "tcp://127.0.0.1"
-port = 5555
-metrics_port = 5556
-device = "cuda"
-num_threads = 4
+port = 5555             # ZMQ PULL — odbiera batche od aktorów
+metrics_port = 5556     # ZMQ PUB — wysyła epsilon, loss_scale do aktorów
+device = "cuda"         # "cuda" | "cpu" | "auto"
+num_threads = 4         # wątki CPU dla torch (operacje poza GPU)
 
+# ── Okna czasowe ───────────────────────────────────────────────────────────────
+# Liczba świec na każdy timeframe w stanie sieci. 0 = wyłączony TF.
 [timeframes]
-candles_1m = 30
+candles_1m  = 30
 candles_15m = 24
-candles_1h = 48
-candles_1d = 30
-candles_1w = 0
+candles_1h  = 48
+candles_1d  = 30
+candles_1w  = 0
 
+# ── Monitor (dashboard) ────────────────────────────────────────────────────────
 [monitoring]
 host = "tcp://127.0.0.1"
-port = 3001
-metrics_pull_port = 3002
-metrics_push_interval_sec = 5
-dashboard_poll_interval_sec = 60
+port = 3001                      # ZMQ PUSH — metryki z learner → monitor
+metrics_pull_port = 3002         # ZMQ PULL — monitor odbiera metryki aktorów
+metrics_push_interval_sec = 5    # jak często learner wysyła metryki
+dashboard_poll_interval_sec = 60 # jak często monitor odpytuje aktorów
 
+# ── Trening ────────────────────────────────────────────────────────────────────
 [training]
-gamma = 0.97
-lr = 2.5e-5
+gamma = 0.97                    # współczynnik dyskontowania nagród
+lr = 2.5e-5                     # learning rate (nadpisuje checkpoint przy resume)
 batch_size = 256
-buffer_capacity = 500000
-min_buffer_size = 100000
-target_update_interval = 1000
-epsilon_start = 1.0
-epsilon_end = 0.1
-epsilon_decay_fraction = 0.5
+buffer_capacity = 500000        # maksymalna pojemność bufora PER
+min_buffer_size = 100000        # minimalna liczba doświadczeń przed startem treningu
+target_update_interval = 1000   # co ile kroków synchronizować sieć docelową
+
+epsilon_start = 1.0             # eksploracja na początku treningu
+epsilon_end = 0.1               # minimalna eksploracja
+epsilon_decay_fraction = 0.5    # po jakim ułamku łącznych kroków epsilon osiąga minimum
+
 dropout = 0.2
 seed = 42
-resume_from_checkpoint = ""
-keep_last_n_checkpoints = 24
-checkpoint_interval = 20000
-evaluation_interval = 5000
-validation_days = 7
-validation_weeks = 0
-training_months = 48
-episode_length = 960
-step_interval = 15
-max_trades_per_episode = 1
-return_mode = "nstep"
-n_step = 5
-compile_model = false
-min_hold_steps = 5
-lr_scheduler = "none"
-lr_min = 1e-5
-hold_bias_min = 0.3
-hold_bias_max = 0.7
 
+resume_from_checkpoint = ""     # ścieżka do checkpointu lub "" dla treningu od zera
+keep_last_n_checkpoints = 24    # liczba zachowanych checkpointów krokowych
+checkpoint_interval = 20000     # co ile kroków zapis checkpointu
+evaluation_interval = 5000      # co ile kroków ewaluacja / raport
+
+validation_days = 7             # ostatnie N dni danych zarezerwowane jako OOS
+validation_weeks = 0            # alternatywa: tygodnie (nadpisuje validation_days gdy > 0)
+training_months = 48            # liczba miesięcy danych treningowych (0 = cała historia)
+
+episode_length = 960            # maksymalna liczba kroków epizodu
+step_interval = 15              # co ile świec 1m wykonywany jest krok (1 = każda świeca)
+max_trades_per_episode = 1      # limit transakcji per epizod (1 = zamknięcie kończy epizod)
+
+return_mode = "nstep"           # "mc" | "nstep" | "td"
+n_step = 5                      # horyzont n-krokowy (tylko przy return_mode = "nstep")
+
+compile_model = false           # torch.compile — przyspiesza trening, wymaga PyTorch 2+
+
+min_hold_steps = 5              # minimalna liczba kroków od otwarcia przed możliwością zamknięcia
+
+lr_scheduler = "none"           # "none" | "cosine" — scheduler LR zsynchronizowany z epsilon
+lr_min = 1e-5                   # dolna granica LR dla schedulera cosine
+
+hold_bias_min = 0.3             # minimalna szansa na HOLD przy losowej eksploracji
+hold_bias_max = 0.7             # maksymalna szansa na HOLD przy losowej eksploracji
+
+epsilon_reset_target   = 0.80   # docelowy epsilon przy /ereset
+epsilon_reset_duration = 5000   # na ile kroków epsilon_reset_target jest utrzymywany
+episode_mirror         = false  # dublowanie epizodów LONG→SHORT, balansuje dane treningowe
+
+# ── Prioritized Experience Replay ──────────────────────────────────────────────
 [per]
-alpha = 0.6
-beta_start = 0.4
-beta_end = 1.0
-epsilon = 0.0001
-positive_ratio = 0.4
-long_short_balance = 0.0
+alpha = 0.6             # stopień priorytyzacji (0 = uniform, 1 = pełny PER)
+beta_start = 0.4        # początkowa waga IS (korekcja biasu samplowania)
+beta_end = 1.0          # docelowa waga IS (osiągana pod koniec treningu)
+epsilon = 0.0001        # małe ε dodawane do TD error (zapobiega zerowym priorytetom)
 
+positive_ratio = 0.4    # frakcja batcha z bufora pozytywnych nagród (reward > 0)
+long_short_balance = 0.0 # frakcja batcha z osobnych buforów LONG/SHORT (0 = wyłączone)
+
+# ── Architektura modelu ────────────────────────────────────────────────────────
 [model]
-num_actions = 4
-n_transformer_blocks = 3
-n_attention_heads = 4
-key_dim = 32
-ff_dim = 256
-conv_kernel_size = 3
-conv1d_filters = 128
+num_actions = 4              # LONG, SHORT, HOLD, CLOSE
+n_transformer_blocks = 3     # liczba bloków Transformer encoder
+n_attention_heads = 4        # głowice uwagi per blok
+key_dim = 32                 # wymiar klucza/zapytania per głowicę
+ff_dim = 256                 # wymiar warstwy feed-forward w bloku
+conv_kernel_size = 3         # kernel Conv1D (ekstrakcja lokalnych wzorców)
+conv1d_filters = 128         # liczba filtrów Conv1D
 
+# ── Cechy wejściowe ────────────────────────────────────────────────────────────
 [features]
-num_features = 8
+num_features = 8   # musi zgadzać się z liczbą cech w state.js (buildFeatures)
 use_ohlcv = true
-use_rsi = true
-use_macd = true
+use_rsi   = true
+use_macd  = true
 use_sma20 = true
 
+# ── System nagród ──────────────────────────────────────────────────────────────
 [reward]
-commission_open = 0.00075
-commission_close = 0.00075
-trade_penalty = 0.0005
-close_penalty = 0.0
-post_close_cooldown_steps = 12
-intermediate_reward_max = 0.1
-loss_scale = 1.4
-hold_penalty_per_bar = 0.0002
-time_decay_hours = 4.0
-drawdown_penalty = 0.0
-idle_penalty_per_bar = 0.0001
-clip_min = -1.0
-clip_max = 1.0
-reward_scale = 10.0
-unrealized_reward_scale = 0.1
+commission_open  = 0.00075   # prowizja Binance za otwarcie (taker)
+commission_close = 0.00075   # prowizja Binance za zamknięcie (taker)
+trade_penalty    = 0.0005    # dodatkowa kara za każde otwarcie pozycji
+close_penalty    = 0.0       # dodatkowa kara za zamknięcie (0 = brak)
 
+post_close_cooldown_steps = 12  # trade_penalty x2 gdy nowe otwarcie < N kroków po zamknięciu
+intermediate_reward_max   = 0.1 # cap na nagrodę delta uPnL per krok (kap absolutny)
+
+loss_scale = 1.4             # mnożnik ujemnych delt uPnL (asymetria: straty ważniejsze)
+
+hold_penalty_per_bar = 0.0002  # kara per krok za trzymanie otwartej pozycji (anty-przetrzymanie)
+time_decay_hours     = 4.0     # half-life PnL: po N godzinach realizowany PnL * 0.5
+drawdown_penalty     = 0.0     # kara proporcjonalna do max drawdown podczas trzymania
+
+idle_penalty_per_bar = 0.0001  # kara per krok bez otwartej pozycji (anty-HOLD collapse)
+
+clip_min = -1.0   # dolny clip całkowitej nagrody per krok (przed reward_scale)
+clip_max =  1.0   # górny clip całkowitej nagrody per krok
+
+reward_scale          = 10.0  # globalny mnożnik wszystkich nagród (wzmacnia sygnał)
+unrealized_reward_scale = 0.1 # mnożnik absolutnego uPnL dodawanego per krok z pozycją
+
+# ── Dane historyczne ────────────────────────────────────────────────────────────
 [data]
-source = "file"
-path = "node/data/historical/"
-cache_path = "node/data/cache/"
-binance_rate_limit = 1000
-normalization_window = 60
-allow_partial_history = false
-api_retry_interval_sec = 60
+source = "file"                    # "file" | "api"
+path = "node/data/historical/"     # katalog z plikami CSV
+cache_path = "node/data/cache/"    # cache przetworzonych danych
+binance_rate_limit = 1000          # ms między żądaniami API (tryb "api")
+normalization_window = 60          # okno rolling mean/std do normalizacji cech
+allow_partial_history = false      # true = uruchom nawet gdy brakuje danych dla TF
+api_retry_interval_sec = 60        # przerwa po błędzie API przed ponowną próbą
 
+# ── Logowanie ──────────────────────────────────────────────────────────────────
 [logging]
-level = "INFO"
+level = "INFO"         # DEBUG | INFO | WARNING | ERROR
 max_file_size_mb = 10
 max_files = 5
 log_dir = "logs"
 
+# ── Backtest (OOS) ─────────────────────────────────────────────────────────────
 [backtesting]
 enabled = false
 model_path = "python/checkpoints/best_model.pt"
 start_date = "2023-01-01"
-end_date = "2023-12-31"
+end_date   = "2023-12-31"
 results_dir = "results"
-step_interval = 5
-max_oos_days = 30
+step_interval = 5    # co ile świec 1m krok backtestowy
+max_oos_days = 30    # maksymalny horyzont OOS
 fee = 0.00075
 
+# ── Raporty treningowe ─────────────────────────────────────────────────────────
 [report]
 enabled = true
-mode = "full"
-every_n_updates = 5
-min_interval_sec = 0
+mode = "full"           # "full" | "short"
+every_n_updates = 5     # raport co N tysięcy update'ów
+min_interval_sec = 0    # minimalny odstęp między raportami (0 = bez limitu)
 
+# ── Alerty Telegram ────────────────────────────────────────────────────────────
 [alerts]
 enabled = true
-telegram_token = "8692060831:AAFkyj2rRsAnv5AKwzn_KefjJblUO-3tF68"
+telegram_token  = "8692060831:AAFkyj2rRsAnv5AKwzn_KefjJblUO-3tF68"
 telegram_chat_id = "8624710090"
-cooldown_sec = 300
-grad_explode_threshold = 5.0
-action_collapse_threshold = 0.95
-loss_plateau_steps = 2000
+cooldown_sec = 300                  # minimalny czas między kolejnymi alertami
 
+grad_explode_threshold    = 5.0     # alert gdy grad norm > próg
+action_collapse_threshold = 0.95    # alert gdy frakcja jednej akcji > próg
+loss_plateau_steps        = 2000    # alert gdy loss nie spada przez N kroków
+
+# ── Eksport ONNX ────────────────────────────────────────────────────────────────
 [onnx]
 enabled = true
 export_path = "python/checkpoints/model.onnx"
-device = "cpu"
+device = "cpu"  # eksport zawsze na CPU żeby nie blokować GPU
 
+# ── API / tryb symulacji ────────────────────────────────────────────────────────
 [api]
-simulation_mode = true
+simulation_mode = true  # true = dane historyczne, false = real-time Binance API
 
+# ── TensorBoard ────────────────────────────────────────────────────────────────
 [tensorboard]
 log_dir = "runs"
-log_interval_sec = 300
-histogram_interval_sec = 60
-enable_actor_metrics = true
-debug_interval_sec = 300
+log_interval_sec      = 300  # jak często zapisywać metryki skalarne
+histogram_interval_sec = 60  # jak często zapisywać histogramy wag
+enable_actor_metrics  = true
+debug_interval_sec    = 300
