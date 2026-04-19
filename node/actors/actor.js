@@ -31,7 +31,8 @@ class Actor {
         this.running = false;
         this.episodeEquity = 0;
         this.cumulativePnl = 0;
-        this._lastEpisodeLogTime = 0;
+        this._lastEpisodeLogTime = 0;  // throttle dla linii informacyjnej w start()
+        this._lastTableLogTime   = 0;  // throttle dla tabeli epizodu (niezależny)
         this.episodeMirror = globalConfig.training.episode_mirror ?? false;
 
         // ONNX local inference state
@@ -253,8 +254,8 @@ class Actor {
         }
 
         const _now = Date.now();
-        if (_now - this._lastEpisodeLogTime >= 5000) {
-            this._lastEpisodeLogTime = _now;
+        if (_now - this._lastTableLogTime >= 5000) {
+            this._lastTableLogTime = _now;
             this._printEpisodeLog(episodeLog, experiences, mirrorEnabled ? 'ORYGINAŁ' : '');
             if (mirrorEnabled && mirrorExperiences) {
                 this._printEpisodeLog(mirrorEpisodeLog, mirrorExperiences, 'MIRROR');
