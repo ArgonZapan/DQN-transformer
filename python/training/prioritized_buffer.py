@@ -485,7 +485,7 @@ class DualPrioritizedBuffer:
         self.short_buf = None
         if self.long_short_balance > 0.0:
             dir_config = copy.deepcopy(config)
-            dir_config['training']['buffer_capacity'] = max(1, self.capacity // 2)
+            dir_config['training']['buffer_capacity'] = max(1, self.capacity // 4)
             self.long_buf  = PrioritizedReplayBuffer(dir_config)
             self.short_buf = PrioritizedReplayBuffer(dir_config)
             self._dir_capacity = dir_config['training']['buffer_capacity']
