@@ -49,7 +49,7 @@ class ZMQServer:
                 else:
                     self._msg_count = 1
                     
-                if self._msg_count % 500 == 0:
+                if self._msg_count % 10000 == 0:
                     logger.info(f"[ZMQ] Processed {self._msg_count} messages, buffer={len(self.trainer.buffer)}")
             except zmq.Again:
                 continue
@@ -126,7 +126,10 @@ class ZMQServer:
             if metrics:
                 self.trainer.add_actor_metrics(symbol, metrics)
 
-        return {'epsilon': float(self.trainer.epsilon)}
+        return {
+            'epsilon':    float(self.trainer.epsilon),
+            'loss_scale': float(self.trainer.dynamic_loss_scale),
+        }
 
     def close(self):
         self.running = False

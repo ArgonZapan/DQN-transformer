@@ -42,6 +42,10 @@ python/diagnostics/baseline.json
 # Shutdown flag
 python/shutdown.flag
 
+# Restart helper scripts (generowane dynamicznie)
+_restart.vbs
+_restart.ps1
+
 # IDE
 .vscode/
 .idea/

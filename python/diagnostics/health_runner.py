@@ -47,10 +47,12 @@ class HealthRunner:
         step = self.trainer.step_count
 
         # Próbkuj stany z buffera
+        # Zwraca: (states, actions, rewards, next_states, dones, action_masks,
+        #          pos_features, next_pos_features, indices[, is_weights])
         sample = self.trainer.buffer.sample(n)
-        # sample = (states, actions, rewards, next_states, dones, action_masks, indices[, is_weights])
-        states = sample[0]
+        states       = sample[0]
         action_masks = sample[5]
+        pos_features = sample[6]   # [n, 4] — kontekst pozycji (is_long, is_short, pnl, bars)
 
         network = self.trainer.main_network
         device = self.trainer.device
@@ -58,7 +60,7 @@ class HealthRunner:
         network.eval()
         with torch.no_grad():
             state_list = [states[k] for k in sorted(states.keys())]
-            q = network(state_list)              # [n, 4]
+            q = network(state_list, position_features=pos_features)  # [n, 4]
             value = network._debug_value         # [n, 1]
             advantage = network._debug_advantage # [n, 4]
 
@@ -66,14 +68,15 @@ class HealthRunner:
 
         q_cpu = q.cpu()
         spread = (q_cpu.max(1).values - q_cpu.min(1).values)
-        greedy_actions = q_cpu.argmax(1)
+
+        # Masked Q (tylko dozwolone akcje) — używany też do wyboru dominującej akcji
+        q_masked = q_cpu.masked_fill(action_masks.cpu() == 0, float('-inf'))
+        spread_masked = (q_masked.max(1).values - q_masked.min(1).values)
+
+        greedy_actions = q_masked.argmax(1)  # respektuje action_masks
         unique_actions = greedy_actions.unique()
         dominant = greedy_actions.mode().values.item()
         dominant_ratio = (greedy_actions == dominant).float().mean().item()
-
-        # Masked spread (tylko dozwolone akcje)
-        q_masked = q_cpu.masked_fill(action_masks.cpu() == 0, float('-inf'))
-        spread_masked = (q_masked.max(1).values - q_masked.min(1).values)
         spread_masked_finite = spread_masked[spread_masked.isfinite()]
 
         action_names = ['LONG', 'SHORT', 'HOLD', 'CLOSE']

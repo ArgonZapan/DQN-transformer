@@ -12,6 +12,7 @@ def sharpe_ratio(returns, risk_free_rate=0.0):
 
 
 def max_drawdown(equity_curve):
+    """Max drawdown jako wartość bezwzględna (nie %) — peak minus trough w jednostkach PnL."""
     if not equity_curve or len(equity_curve) < 2:
         return 0.0
     peak = equity_curve[0]
@@ -19,7 +20,7 @@ def max_drawdown(equity_curve):
     for value in equity_curve:
         if value > peak:
             peak = value
-        dd = (peak - value) / peak if peak != 0 else 0
+        dd = peak - value          # absolutny spadek od szczytu (w jednostkach equity)
         if dd > max_dd:
             max_dd = dd
     return -max_dd

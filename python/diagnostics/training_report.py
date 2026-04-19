@@ -17,7 +17,29 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+from diagnostics.backtest_runner import run_backtest, format_backtest_telegram
+
 logger = logging.getLogger('learner')
+
+_TG_LIMIT = 4096
+
+
+def _split_message(text: str) -> list[str]:
+    """Split message into ≤4096-char chunks on newline boundaries."""
+    if len(text) <= _TG_LIMIT:
+        return [text]
+    chunks, current = [], []
+    size = 0
+    for line in text.split('\n'):
+        line_len = len(line) + 1  # +1 for '\n'
+        if size + line_len > _TG_LIMIT and current:
+            chunks.append('\n'.join(current))
+            current, size = [], 0
+        current.append(line)
+        size += line_len
+    if current:
+        chunks.append('\n'.join(current))
+    return chunks
 
 
 # ── funkcje statystyczne ──────────────────────────────────────────────────────
@@ -65,10 +87,9 @@ def _pct(value) -> str:
 
 
 def _act_pct(value) -> str:
-    """Formatuje udział akcji: 2 miejsca po przecinku gdy < 5%, inaczej 0."""
     if value is None:
         return '—'
-    return f'{value:.2%}' if value < 0.05 else f'{value:.0%}'
+    return f'{value:.2%}'
 
 
 def _fmt_pnl(value) -> str:
@@ -95,9 +116,11 @@ class TrainingReport:
 
         self._update_count:   int   = 0
         self._last_send_time: float = 0.0
-        # Snapshot kumulatywnych wartości z momentu ostatniego raportu
         self._prev_snapshot: dict | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='report')
+
+        # Backtest config — opcjonalnie wyłącz przez report.backtest_enabled = false
+        self._backtest_enabled = report_cfg.get('backtest_enabled', True)
 
     # ── publiczne API ─────────────────────────────────────────────────────────
 
@@ -123,7 +146,9 @@ class TrainingReport:
         # Zapisz snapshot PRZED wysłaniem — delta dla następnego raportu
         self._prev_snapshot = self._make_snapshot(trainer)
 
-        self._executor.submit(self._send, message)
+        config = trainer.config
+        backtest_enabled = self._backtest_enabled
+        self._executor.submit(self._send_with_backtest, message, config, backtest_enabled, trainer)
 
     # ── snapshot / delta ──────────────────────────────────────────────────────
 
@@ -290,6 +315,15 @@ class TrainingReport:
             max_dd        = _max_drawdown(pnl_deque)
             recovery      = d['episode_pnl_sum'] / max_dd if max_dd > 1e-9 else None
 
+            # Gap steps: czas między transakcjami (CLOSE → OPEN)
+            gap_arr       = list(d.get('gap_steps_deque', []))
+            if len(gap_arr) >= 2:
+                gap_p10    = float(np.percentile(gap_arr, 10))
+                gap_median = float(np.percentile(gap_arr, 50))
+                gap_p90    = float(np.percentile(gap_arr, 90))
+            else:
+                gap_p10 = gap_median = gap_p90 = None
+
             actors[symbol] = {
                 'window': {
                     'episodes':      ep_delta,
@@ -329,6 +363,9 @@ class TrainingReport:
                     'sortino':       sortino,
                     'max_dd':        max_dd,
                     'recovery':      recovery,
+                    'gap_p10':       gap_p10,
+                    'gap_median':    gap_median,
+                    'gap_p90':       gap_p90,
                 },
                 'pnl_arrow': _arrow(pnl_avg_w, None),
             }
@@ -423,9 +460,11 @@ class TrainingReport:
                     f'    Long bias:     {_pct(t["long_bias"])} L / {_pct(1 - t["long_bias"]) if t["long_bias"] is not None else "—"} S',
                     f'    Sharpe:        {t["sharpe"]:.3f}'   if t['sharpe']   is not None else '    Sharpe:        —',
                     f'    Sortino:       {t["sortino"]:.3f}'  if t['sortino']  is not None else '    Sortino:       —',
-                    f'    Max Drawdown:  {_fmt_pnl(t["max_dd"])}',
+                    f'    Max Drawdown:  {t["max_dd"]:+.4f}' if t['max_dd'] is not None else '    Max Drawdown:  —',
                     f'    Recovery:      {_ratio(t["recovery"])}',
                     f'    Max strat z rz:{t["max_consec_losses"]}',
+                    (f'    Gap p10/med/p90:{t["gap_p10"]:.0f} / {t["gap_median"]:.0f} / {t["gap_p90"]:.0f} kr'
+                     if t['gap_median'] is not None else '    Gap p10/med/p90:—'),
                 ]
 
         # ── Diagnostyka sieci ─────────────────────────────────────────────────
@@ -497,19 +536,34 @@ class TrainingReport:
 
     # ── wysyłanie ─────────────────────────────────────────────────────────────
 
+    def _send_with_backtest(self, message: str, config: dict, backtest_enabled: bool, trainer=None) -> None:
+        """Wysyła raport treningowy, a następnie oddzielną wiadomość z backtest."""
+        self._send(message)
+        if backtest_enabled:
+            try:
+                logger.info('[Report] Running validation backtest...')
+                bt_result = run_backtest(config, trainer=trainer)
+                bt_section = format_backtest_telegram(bt_result)
+                self._send(bt_section)
+            except Exception as e:
+                logger.warning(f'[Report] Backtest failed: {e}')
+                self._send(f'⚠️ <i>Backtest error: {e}</i>')
+
     def _send(self, message: str) -> None:
-        try:
-            import urllib.request
-            import urllib.parse
-            url  = f'https://api.telegram.org/bot{self._token}/sendMessage'
-            body = urllib.parse.urlencode({
-                'chat_id':    self._chat_id,
-                'text':       message,
-                'parse_mode': 'HTML',
-            }).encode()
-            req = urllib.request.Request(url, data=body, method='POST')
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status != 200:
-                    logger.warning(f'[Report] Telegram HTTP {resp.status}')
-        except Exception as e:
-            logger.warning(f'[Report] Telegram send failed: {e}')
+        import urllib.request
+        import urllib.parse
+        url = f'https://api.telegram.org/bot{self._token}/sendMessage'
+        for chunk in _split_message(message):
+            try:
+                body = urllib.parse.urlencode({
+                    'chat_id':    self._chat_id,
+                    'text':       chunk,
+                    'parse_mode': 'HTML',
+                }).encode()
+                req = urllib.request.Request(url, data=body, method='POST')
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status != 200:
+                        logger.warning(f'[Report] Telegram HTTP {resp.status}')
+            except Exception as e:
+                logger.warning(f'[Report] Telegram send failed: {e}')
+                break

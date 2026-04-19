@@ -62,7 +62,7 @@ def _validate_config(config):
         'target_update_interval', 'epsilon_start', 'epsilon_end',
         'epsilon_decay_fraction', 'dropout', 'seed',
         'checkpoint_interval', 'evaluation_interval',
-        'train_data_fraction', 'episode_length', 'step_interval', 'max_trades_per_episode'
+        'validation_days', 'episode_length', 'step_interval', 'max_trades_per_episode'
     ]
     for key in required_training:
         if key not in config['training']:

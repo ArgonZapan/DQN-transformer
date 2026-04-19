@@ -13,6 +13,7 @@ from server.zmq_server import ZMQServer
 from monitoring.monitor_client import MonitorClient
 from diagnostics.health_runner import HealthRunner
 from diagnostics.baseline_comparator import BaselineComparator
+from diagnostics.telegram_commands import TelegramCommands
 
 logger = logging.getLogger('learner')
 
@@ -53,8 +54,14 @@ def main():
     device = config['learner']['device']
     logger.info(f"Device: {device}")
 
+    import torch
+    num_threads = config['learner'].get('num_threads', 0)
+    if num_threads > 0:
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(max(1, num_threads // 2))
+    logger.info(f"CPU threads: {torch.get_num_threads()} intra / {torch.get_num_interop_threads()} interop")
+
     if device == 'cuda':
-        import torch
         gpu_name = torch.cuda.get_device_name(0)
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
         logger.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
@@ -65,6 +72,9 @@ def main():
     health_runner = HealthRunner(trainer, check_interval_sec=3600)
     baseline_comparator = BaselineComparator(config, config['learner']['device'])
     _baseline_done = baseline_comparator.computed   # True jeśli załadowano z pliku
+
+    telegram_commands = TelegramCommands(config, trainer, trainer.training_report)
+    telegram_commands.start()
 
     monitor = MonitorClient(config)
     try:
@@ -103,8 +113,12 @@ def main():
         last_push = 0.0
         last_buffer_log = 0.0
         training_started = False
+        sps_anchor_step = None  # None = czekaj na pierwszy log żeby ustawić anchor
 
         while zmq_server.running:
+            if getattr(trainer, '_paused', False):
+                time.sleep(0.1)
+                continue
             try:
                 loss = trainer.train_step()
             except Exception as e:
@@ -130,13 +144,27 @@ def main():
                     _baseline_done = True
 
                 # Hourly health check
-                health_runner.maybe_run()
+                health_result = health_runner.maybe_run()
+                if health_result:
+                    trainer._last_health = health_result
 
-                if now - last_push >= push_interval:
+                if trainer.step_count % 250 == 0:
+                    if sps_anchor_step is None:
+                        sps_anchor_step = trainer.step_count
+                        sps_anchor_time = now
+                        sps = 0.0
+                    else:
+                        elapsed = now - sps_anchor_time
+                        sps = (trainer.step_count - sps_anchor_step) / elapsed if elapsed > 0 else 0.0
+                        sps_anchor_step = trainer.step_count
+                        sps_anchor_time = now
                     metrics = trainer.get_metrics()
-                    logger.info(f"[Training] step={metrics['step']}, loss={loss:.6f}, epsilon={metrics['epsilon']:.4f}")
-                    monitor.send_metrics('learner', metrics)
-                    last_push = now
+                    grad = metrics.get('grad_norm', 0.0)
+                    grad_str = f", grad={grad:.2f}" if grad > 0 else ""
+                    logger.info(f"[Training] step={metrics['step']}, loss={loss:.6f}, epsilon={metrics['epsilon']:.4f}, sps={sps:.1f}{grad_str}")
+                    if now - last_push >= push_interval:
+                        monitor.send_metrics('learner', metrics)
+                        last_push = now
             else:
                 if now - last_buffer_log >= 5.0:
                     buf = len(trainer.buffer)

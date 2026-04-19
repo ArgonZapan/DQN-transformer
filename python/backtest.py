@@ -343,6 +343,45 @@ def action_mask_for(position) -> list:
 
 # ── Per-Symbol Backtest ────────────────────────────────────────────────────────
 
+# Module-level cache: symbol → {precomp, oos_start, candles_1m}
+# Keyed by (symbol, data_path, validation_days, max_oos_days) to survive config changes.
+_DATA_CACHE: dict = {}
+
+
+def _cache_key(symbol: str, config: dict) -> tuple:
+    vw = config['training'].get('validation_weeks', 0)
+    vd = vw * 7 if vw else config['training']['validation_days']
+    return (symbol, config['data']['path'],
+            vd, config['backtesting'].get('max_oos_days', 60))
+
+
+def preload_backtest_data(symbols: list, config: dict) -> None:
+    """Load, trim, and precompute backtest data for all symbols once.
+    Call this once at startup; run_symbol_backtest will use the cache."""
+    for symbol in symbols:
+        key = _cache_key(symbol, config)
+        if key in _DATA_CACHE:
+            continue
+        all_candles = load_all_candles(symbol, config)
+        candles_1m = all_candles.get('1m', [])
+        if not candles_1m:
+            _DATA_CACHE[key] = None
+            continue
+        validation_weeks = config['training'].get('validation_weeks', 0)
+        validation_days = validation_weeks * 7 if validation_weeks else config['training']['validation_days']
+        split = max(0, len(candles_1m) - validation_days * 24 * 60)
+        max_oos_candles = config['backtesting'].get('max_oos_days', 60) * 24 * 60
+        oos_start = max(split, len(candles_1m) - max_oos_candles)
+        trimmed, oos_start = trim_candles(all_candles, oos_start, config)
+        precomp = precompute_all(trimmed, config)
+        _DATA_CACHE[key] = {
+            'candles_1m': trimmed['1m'],
+            'oos_start': oos_start,
+            'precomp': precomp,
+        }
+        print(f"[Backtest] Preloaded {symbol}: {len(trimmed['1m'])} candles cached")
+
+
 def load_all_candles(symbol: str, config: dict) -> dict:
     data_path = config['data']['path']
     tf_map = {
@@ -370,35 +409,43 @@ def _fmt_time(ms: int) -> str:
 
 def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: str,
                         last_n: int | None = None) -> dict:
-    """Sequential OOS backtest for one symbol."""
-    all_candles = load_all_candles(symbol, config)
-    candles_1m = all_candles.get('1m', [])
+    """Sequential OOS backtest for one symbol. Uses _DATA_CACHE when available."""
+    key = _cache_key(symbol, config)
+    cached = _DATA_CACHE.get(key)
 
-    if not candles_1m:
-        print(f"[Backtest] {symbol}: no 1m data — skipping")
-        return {'trades': [], 'equity_curve': [0.0], 'daily_pnl': {}, 'total_steps': 0}
-
-    validation_weeks = config['training'].get('validation_weeks', 0)
-    validation_days = validation_weeks * 7 if validation_weeks else config['training']['validation_days']
-    split = max(0, len(candles_1m) - validation_days * 24 * 60)
-
-    # Ogranicz OOS do ostatnich 60 dni (86 400 świec 1m)
-    max_oos_candles = config['backtesting'].get('max_oos_days', 60) * 24 * 60
-    oos_start = max(split, len(candles_1m) - max_oos_candles)
-
-    if last_n is not None and last_n < (len(candles_1m) - oos_start):
-        oos_start = len(candles_1m) - last_n
-        print(f"[Backtest] {symbol}: OOS = last {last_n} candles (of {len(candles_1m) - split} OOS total)")
+    if cached is not None:
+        candles_1m = cached['candles_1m']
+        oos_start  = cached['oos_start']
+        precomp    = cached['precomp']
+        print(f"[Backtest] {symbol}: using cached data ({len(candles_1m)} candles, OOS from {oos_start})")
     else:
-        print(f"[Backtest] {symbol}: OOS = {len(candles_1m) - oos_start} steps "
-              f"(last {(len(candles_1m) - oos_start) // 1440} days, split at {split}/{len(candles_1m)})")
+        # Cache miss — load, trim, precompute (and populate cache for next call)
+        all_candles = load_all_candles(symbol, config)
+        candles_1m = all_candles.get('1m', [])
 
-    # Trim excess candles — keep only OOS + lookback per TF
-    all_candles, oos_start = trim_candles(all_candles, oos_start, config)
-    candles_1m = all_candles['1m']
+        if not candles_1m:
+            print(f"[Backtest] {symbol}: no 1m data — skipping")
+            return {'trades': [], 'equity_curve': [0.0], 'daily_pnl': {}, 'total_steps': 0}
 
-    # Pre-compute indicators on trimmed arrays
-    precomp = precompute_all(all_candles, config)
+        validation_weeks = config['training'].get('validation_weeks', 0)
+        validation_days = validation_weeks * 7 if validation_weeks else config['training']['validation_days']
+        split = max(0, len(candles_1m) - validation_days * 24 * 60)
+        max_oos_candles = config['backtesting'].get('max_oos_days', 60) * 24 * 60
+        oos_start = max(split, len(candles_1m) - max_oos_candles)
+
+        all_candles, oos_start = trim_candles(all_candles, oos_start, config)
+        candles_1m = all_candles['1m']
+        precomp = precompute_all(all_candles, config)
+
+        _DATA_CACHE[key] = {'candles_1m': candles_1m, 'oos_start': oos_start, 'precomp': precomp}
+
+    split_total = len(candles_1m)
+    if last_n is not None and last_n < (split_total - oos_start):
+        oos_start = split_total - last_n
+        print(f"[Backtest] {symbol}: OOS = last {last_n} candles")
+    else:
+        print(f"[Backtest] {symbol}: OOS = {split_total - oos_start} steps "
+              f"(last {(split_total - oos_start) // 1440} days)")
 
     trades, equity_curve, daily_pnl = [], [0.0], {}
     cumulative_pnl = 0.0

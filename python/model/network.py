@@ -34,7 +34,7 @@ class Conv1DBlock(nn.Module):
         x = self.conv(x)                        # [batch, conv_filters, seq_len]
         x = x.transpose(1, 2)                  # [batch, seq_len, conv_filters]
         x = self.ln(x)                          # LayerNorm po osi conv_filters
-        x = F.leaky_relu(x, 0.01)
+        x = F.gelu(x)
         x = self.dropout(x)
         # Zwracamy pełną sekwencję [batch, seq_len, conv_filters] — bez GAP
         return x
@@ -49,7 +49,7 @@ class TransformerEncoderBlock(nn.Module):
         self.ln1 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_dim),
-            nn.LeakyReLU(0.01),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(ff_dim, d_model)
         )
@@ -127,22 +127,28 @@ class TradingDQN(nn.Module):
 
         self.trunk = nn.Sequential(
             nn.Linear(trunk_dim, 512),
-            nn.LeakyReLU(0.01),
+            nn.GELU(),
             nn.Dropout(self.dropout),
             nn.Linear(512, 256),
-            nn.LeakyReLU(0.01),
+            nn.GELU(),
             nn.Dropout(self.dropout)
         )
 
         # Gałąź pozycji: [is_long, is_short, unrealized_pnl, bars_in_trade] → 32
         self.pos_fc = nn.Sequential(
             nn.Linear(4, 32),
-            nn.LeakyReLU(0.01),
+            nn.GELU(),
         )
 
         # Dueling Architecture: trunk(256) + pos(32) = 288
         self.value_stream = nn.Linear(288, 1)
         self.advantage_stream = nn.Linear(288, self.num_actions)
+
+        # Inicjalizacja głowic do bliskich zera — zapobiega wczesnemu action collapse
+        nn.init.uniform_(self.advantage_stream.weight, -0.01, 0.01)
+        nn.init.zeros_(self.advantage_stream.bias)
+        nn.init.uniform_(self.value_stream.weight, -0.01, 0.01)
+        nn.init.zeros_(self.value_stream.bias)
 
     def forward(self, states, action_mask=None, position_features=None):
         """

@@ -28,3 +28,8 @@ taskkill /F /IM "node.exe" /T >nul 2>&1
 
 echo.
 echo System zatrzymany.
+
+:: 4. Zamknij Windows Terminal (wszystkie zakladki) i pozostale okna cmd
+echo [4/4] Zamykanie okien...
+taskkill /F /IM "WindowsTerminal.exe" >nul 2>&1
+taskkill /F /IM cmd.exe >nul 2>&1
