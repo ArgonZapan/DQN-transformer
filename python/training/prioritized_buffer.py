@@ -462,6 +462,7 @@ class DualPrioritizedBuffer:
     def __init__(self, config):
         per_cfg = config['per']
         self.positive_ratio = per_cfg.get('positive_ratio', 0.4)
+        self.long_short_balance = per_cfg.get('long_short_balance', 0.0)
         self.capacity = config['training']['buffer_capacity']
 
         self.main = PrioritizedReplayBuffer(config)
@@ -472,8 +473,22 @@ class DualPrioritizedBuffer:
         # Importujemy tutaj, żeby uniknąć cyklicznych importów na poziomie modułu
         from training.replay_buffer import ReplayBuffer
         self.positive = ReplayBuffer(pos_config)
-
         self._pos_capacity = pos_config['training']['buffer_capacity']
+
+        # Kierunkowe bufory PER: osobny PER dla LONG (action=0) i SHORT (action=1).
+        # Pojemność = capacity/2, bo każdy kierunek to ~50% wszystkich doświadczeń.
+        # Enkodowanie indeksów w update_priorities:
+        #   main:  idx <  capacity
+        #   long:  idx >= capacity  (idx - capacity)
+        #   short: idx >= 2*capacity (idx - 2*capacity)
+        self.long_buf = None
+        self.short_buf = None
+        if self.long_short_balance > 0.0:
+            dir_config = copy.deepcopy(config)
+            dir_config['training']['buffer_capacity'] = max(1, self.capacity // 2)
+            self.long_buf  = PrioritizedReplayBuffer(dir_config)
+            self.short_buf = PrioritizedReplayBuffer(dir_config)
+            self._dir_capacity = dir_config['training']['buffer_capacity']
 
     # ── Delegaty do main ──────────────────────────────────────────────────────
     @property
@@ -510,82 +525,136 @@ class DualPrioritizedBuffer:
         self.main.add(state, action, reward, next_state, done, action_mask)
         if reward > 0:
             self.positive.add(state, action, reward, next_state, done, action_mask)
+        if self.long_buf is not None:
+            if action == 0:
+                self.long_buf.add(state, action, reward, next_state, done, action_mask)
+            elif action == 1:
+                self.short_buf.add(state, action, reward, next_state, done, action_mask)
 
     def batch_add(self, experiences):
         self.main.batch_add(experiences)
         pos_exps = [e for e in experiences if e[2] > 0]
         if pos_exps:
             self.positive.batch_add(pos_exps)
+        if self.long_buf is not None:
+            long_exps  = [e for e in experiences if e[1] == 0]
+            short_exps = [e for e in experiences if e[1] == 1]
+            if long_exps:
+                self.long_buf.batch_add(long_exps)
+            if short_exps:
+                self.short_buf.batch_add(short_exps)
 
     # ── Sample ────────────────────────────────────────────────────────────────
     def sample(self, batch_size):
+        # ── Oblicz podział próbek ──────────────────────────────────────────
         n_pos = 0
         if len(self.positive) > 0 and self.positive_ratio > 0:
             n_pos = min(int(batch_size * self.positive_ratio), len(self.positive))
 
-        n_main = batch_size - n_pos
+        n_long = n_short = 0
+        if (self.long_buf is not None
+                and len(self.long_buf) > 0 and len(self.short_buf) > 0
+                and self.long_short_balance > 0):
+            half = int(batch_size * self.long_short_balance / 2)
+            n_long  = min(half, len(self.long_buf))
+            n_short = min(half, len(self.short_buf))
+
+        n_main = batch_size - n_pos - n_long - n_short
         if n_main < 1:
-            # Fallback: weź wszystko z main (nie powinno się zdarzyć przy ratio < 1.0)
-            n_pos = 0
+            n_pos = n_long = n_short = 0
             n_main = batch_size
 
-        # Próbkuj z main (PER) — zwraca 10 elementów
+        # ── Próbkowanie z main (PER) ──────────────────────────────────────
         (states_m, actions_m, rewards_m, next_states_m, dones_m,
          masks_m, pf_m, npf_m, idx_m, iw_m) = self.main.sample(n_main)
 
-        if n_pos == 0:
+        if n_pos == 0 and n_long == 0 and n_short == 0:
             return (states_m, actions_m, rewards_m, next_states_m, dones_m,
                     masks_m, pf_m, npf_m, idx_m, iw_m)
 
-        # Próbkuj z positive (uniform) — zwraca 9 elementów (bez is_weights)
-        (states_p, actions_p, rewards_p, next_states_p, dones_p,
-         masks_p, pf_p, npf_p, idx_p) = self.positive.sample(n_pos)
-
         device = self.main.device
+        parts_s, parts_ns = {k: [states_m[k]] for k in states_m}, {k: [next_states_m[k]] for k in states_m}
+        parts_a   = [actions_m]
+        parts_r   = [rewards_m]
+        parts_d   = [dones_m]
+        parts_mk  = [masks_m]
+        parts_pf  = [pf_m]
+        parts_npf = [npf_m]
+        parts_iw  = [iw_m]
+        parts_idx = [idx_m]
 
-        # Scal słowniki stanów
-        states = {k: torch.cat([states_m[k], states_p[k]], dim=0)
-                  for k in states_m}
-        next_states = {k: torch.cat([next_states_m[k], next_states_p[k]], dim=0)
-                       for k in next_states_m}
+        # ── Positive buffer (uniform, brak PER) ───────────────────────────
+        if n_pos > 0:
+            (states_p, actions_p, rewards_p, next_states_p, dones_p,
+             masks_p, pf_p, npf_p, idx_p) = self.positive.sample(n_pos)
+            for k in parts_s: parts_s[k].append(states_p[k]); parts_ns[k].append(next_states_p[k])
+            parts_a.append(actions_p); parts_r.append(rewards_p); parts_d.append(dones_p)
+            parts_mk.append(masks_p); parts_pf.append(pf_p); parts_npf.append(npf_p)
+            parts_iw.append(torch.ones(n_pos, device=device, dtype=torch.float32))
+            parts_idx.append(idx_p + self.capacity)
 
-        actions      = torch.cat([actions_m,  actions_p],  dim=0)
-        rewards      = torch.cat([rewards_m,  rewards_p],  dim=0)
-        dones        = torch.cat([dones_m,    dones_p],    dim=0)
-        masks        = torch.cat([masks_m,    masks_p],    dim=0)
-        pf           = torch.cat([pf_m,       pf_p],       dim=0)
-        npf          = torch.cat([npf_m,      npf_p],      dim=0)
+        # ── Long buffer (PER) ─────────────────────────────────────────────
+        if n_long > 0:
+            (states_l, actions_l, rewards_l, next_states_l, dones_l,
+             masks_l, pf_l, npf_l, idx_l, iw_l) = self.long_buf.sample(n_long)
+            for k in parts_s: parts_s[k].append(states_l[k]); parts_ns[k].append(next_states_l[k])
+            parts_a.append(actions_l); parts_r.append(rewards_l); parts_d.append(dones_l)
+            parts_mk.append(masks_l); parts_pf.append(pf_l); parts_npf.append(npf_l)
+            parts_iw.append(iw_l)
+            parts_idx.append(idx_l + 2 * self.capacity)
 
-        # Wagi IS: main dostaje wagi PER, positive dostaje 1.0 (uniform)
-        # Re-normalizacja tak żeby max = 1.0 (standard IS-weight convention)
-        iw_pos = torch.ones(n_pos, device=device, dtype=torch.float32)
-        is_weights = torch.cat([iw_m, iw_pos], dim=0)
-        is_weights = is_weights / is_weights.max()
+        # ── Short buffer (PER) ────────────────────────────────────────────
+        if n_short > 0:
+            (states_sh, actions_sh, rewards_sh, next_states_sh, dones_sh,
+             masks_sh, pf_sh, npf_sh, idx_sh, iw_sh) = self.short_buf.sample(n_short)
+            for k in parts_s: parts_s[k].append(states_sh[k]); parts_ns[k].append(next_states_sh[k])
+            parts_a.append(actions_sh); parts_r.append(rewards_sh); parts_d.append(dones_sh)
+            parts_mk.append(masks_sh); parts_pf.append(pf_sh); parts_npf.append(npf_sh)
+            parts_iw.append(iw_sh)
+            parts_idx.append(idx_sh + 3 * self.capacity)
 
-        # Enkoduj indeksy: main → idx_m (< capacity),
-        #                  positive → idx_p + capacity (do odróżnienia w update_priorities)
-        idx_p_offset = idx_p + self.capacity
-        indices = np.concatenate([idx_m, idx_p_offset])
+        # ── Scala ─────────────────────────────────────────────────────────
+        states      = {k: torch.cat(parts_s[k],   dim=0) for k in parts_s}
+        next_states = {k: torch.cat(parts_ns[k],  dim=0) for k in parts_ns}
+        actions      = torch.cat(parts_a,   dim=0)
+        rewards      = torch.cat(parts_r,   dim=0)
+        dones        = torch.cat(parts_d,   dim=0)
+        masks        = torch.cat(parts_mk,  dim=0)
+        pf           = torch.cat(parts_pf,  dim=0)
+        npf          = torch.cat(parts_npf, dim=0)
+        is_weights   = torch.cat(parts_iw,  dim=0)
+        is_weights   = is_weights / is_weights.max()
+        indices      = np.concatenate(parts_idx)
 
         return (states, actions, rewards, next_states, dones,
                 masks, pf, npf, indices, is_weights)
 
     # ── Priority updates ──────────────────────────────────────────────────────
     def update_priorities(self, indices, td_errors):
-        """Aktualizuje priorytety wyłącznie w main buffer.
-        Indeksy z positive buffer (>= capacity) są pomijane."""
+        """Aktualizuje priorytety we wszystkich aktywnych buforach PER.
+        Enkodowanie: main < capacity, positive [capacity, 2*cap),
+                     long [2*cap, 3*cap), short [3*cap, 4*cap)."""
         main_mask = indices < self.capacity
-        main_indices = indices[main_mask]
-        main_td = td_errors[main_mask]
-        if len(main_indices) > 0:
-            self.main.update_priorities(main_indices, main_td)
+        if main_mask.any():
+            self.main.update_priorities(indices[main_mask], td_errors[main_mask])
+        if self.long_buf is not None:
+            long_mask  = (indices >= 2 * self.capacity) & (indices < 3 * self.capacity)
+            short_mask = (indices >= 3 * self.capacity)
+            if long_mask.any():
+                self.long_buf.update_priorities(indices[long_mask] - 2 * self.capacity, td_errors[long_mask])
+            if short_mask.any():
+                self.short_buf.update_priorities(indices[short_mask] - 3 * self.capacity, td_errors[short_mask])
 
     # ── Checkpoint ───────────────────────────────────────────────────────────
     def get_state(self):
-        return {
+        state = {
             'main':     self.main.get_state(),
             'positive': self.positive.get_state(),
         }
+        if self.long_buf is not None:
+            state['long']  = self.long_buf.get_state()
+            state['short'] = self.short_buf.get_state()
+        return state
 
     def load_state(self, state):
         if 'main' in state:
@@ -595,3 +664,6 @@ class DualPrioritizedBuffer:
         # Backwards-compat: old checkpoint jest stanem main (bez zagnieżdżenia)
         elif 'size' in state:
             self.main.load_state(state)
+        if self.long_buf is not None and 'long' in state:
+            self.long_buf.load_state(state['long'])
+            self.short_buf.load_state(state['short'])

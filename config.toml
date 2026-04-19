@@ -36,7 +36,7 @@ dashboard_poll_interval_sec = 60
 
 [training]
 gamma = 0.97
-lr = 0.001
+lr = 2.5e-5
 batch_size = 256
 buffer_capacity = 500000
 min_buffer_size = 100000
@@ -64,9 +64,6 @@ lr_scheduler = "none"
 lr_min = 1e-5
 hold_bias_min = 0.3
 hold_bias_max = 0.7
-epsilon_reset_target   = 0.80
-epsilon_reset_duration = 5000
-episode_mirror         = false
 
 [per]
 alpha = 0.6
@@ -74,6 +71,7 @@ beta_start = 0.4
 beta_end = 1.0
 epsilon = 0.0001
 positive_ratio = 0.4
+long_short_balance = 0.0
 
 [model]
 num_actions = 4
