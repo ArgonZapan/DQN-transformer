@@ -1,4 +1,5 @@
-const { calculateRSI, calculateMACD, calculateSMA, rollingMean, rollingStd } = require('../data/indicators');
+const { calculateRSI, calculateMACD, calculateSMA, rollingMean, rollingStd,
+        calculateATR, calculateBollingerWidth, calculateStochasticK } = require('../data/indicators');
 
 const TIMEFRAME_KEYS = ['1m', '15m', '1h', '1d', '1w'];
 const TIMEFRAME_CONFIG_KEYS = {
@@ -201,6 +202,101 @@ function buildStateFromPrecomputed(precomputed, tfAlignments, stepIndex, config)
     return state;
 }
 
+// ── Wskaźniki v2 (niezaktywowane) ─────────────────────────────────────────────
+//
+// 8 cech (zgodność z num_features = 8 bez zmian modelu):
+//   0: normalizedClose        — z-score z oknem 60 (bez zmian)
+//   1: relativeRange          — (H-L)/close (bez zmian)
+//   2: candleDirection        — (close-open)/close (bez zmian)
+//   3: volumeClipped          — min(vol/meanVol, 3.0) — clip na 3x mean zamiast surowego ratio
+//   4: stochasticK            — (close-min14)/(max14-min14) — pozycja w zakresie H-L
+//   5: macdHistNorm           — (macdLine-signalLine)/close — histogram zamiast samej linii
+//   6: bollingerWidth         — 4*std20/sma20 — sygnał przed wybiciem
+//   7: smaDistance            — (close-sma20)/close — ciągła odległość zamiast binarnego 0/1
+//
+// Dodatkowe (wymagają num_features = 9, nieaktywowane):
+//   8: atrNorm                — ATR(14)/close — realne ryzyko/krok
+
+/**
+ * Wersja v2 pre-obliczania wskaźników (niezaktywowana).
+ * Interfejs identyczny z precomputeIndicators() — drop-in replacement gdy gotowe.
+ */
+function precomputeIndicatorsV2(candles, normWindow) {
+    const n = candles.length;
+    if (n === 0) return null;
+
+    const closes  = new Float64Array(n);
+    const opens   = new Float64Array(n);
+    const highs   = new Float64Array(n);
+    const lows    = new Float64Array(n);
+    const volumes = new Float64Array(n);
+
+    for (let i = 0; i < n; i++) {
+        closes[i]  = candles[i].close;
+        opens[i]   = candles[i].open;
+        highs[i]   = candles[i].high;
+        lows[i]    = candles[i].low;
+        volumes[i] = candles[i].volume;
+    }
+
+    const closesArr  = Array.from(closes);
+    const highsArr   = Array.from(highs);
+    const lowsArr    = Array.from(lows);
+    const volumesArr = Array.from(volumes);
+
+    const mean       = rollingMean(closesArr, normWindow);
+    const std        = rollingStd(closesArr, normWindow);
+    const { macdLine, signalLine } = calculateMACD(closesArr);
+    const sma20      = calculateSMA(closesArr, 20);
+    const std20      = rollingStd(closesArr, 20);
+    const meanVolume = rollingMean(volumesArr, normWindow);
+    const stochK     = calculateStochasticK(highsArr, lowsArr, closesArr);
+
+    const f = [
+        new Float64Array(n), // 0: normalizedClose
+        new Float64Array(n), // 1: relativeRange
+        new Float64Array(n), // 2: candleDirection
+        new Float64Array(n), // 3: volumeClipped
+        new Float64Array(n), // 4: stochasticK
+        new Float64Array(n), // 5: macdHistNorm
+        new Float64Array(n), // 6: bollingerWidth
+        new Float64Array(n), // 7: smaDistance
+    ];
+
+    for (let i = 0; i < n; i++) {
+        const c = closes[i], o = opens[i], h = highs[i], l = lows[i], v = volumes[i];
+        f[0][i] = std[i]        !== 0 ? (c - mean[i]) / std[i]                : 0;
+        f[1][i] = c             !== 0 ? (h - l) / c                           : 0;
+        f[2][i] = c             !== 0 ? (c - o) / c                           : 0;
+        f[3][i] = meanVolume[i] !== 0 ? Math.min(v / meanVolume[i], 3.0)      : 0;
+        f[4][i] = stochK[i];
+        f[5][i] = c             !== 0 ? (macdLine[i] - signalLine[i]) / c     : 0;
+        f[6][i] = sma20[i]      !== 0 ? (4 * std20[i]) / sma20[i]            : 0;
+        f[7][i] = c             !== 0 ? (c - sma20[i]) / c                   : 0;
+    }
+
+    return f;
+}
+
+/**
+ * Składa macierz cech v2 [numCandles × 8] z pre-obliczonych tablic v2.
+ */
+function assembleFeaturesFromPrecomputedV2(f, startIdx, endIdx, numCandles) {
+    const actualLen = endIdx - startIdx;
+    const padding   = numCandles - actualLen;
+    const result    = new Array(numCandles);
+
+    for (let i = 0; i < padding; i++) {
+        result[i] = [0, 0, 0, 0, 0, 0, 0, 0];
+    }
+    for (let i = 0; i < actualLen; i++) {
+        const si = startIdx + i;
+        result[padding + i] = [f[0][si], f[1][si], f[2][si], f[3][si], f[4][si], f[5][si], f[6][si], f[7][si]];
+    }
+
+    return result;
+}
+
 function getActionMask(position) {
     if (!position || position.side === null) {
         return [1, 1, 1, 0];
@@ -218,4 +314,7 @@ module.exports = {
     TIMEFRAME_KEYS,
     TIMEFRAME_CONFIG_KEYS,
     NUM_FEATURES,
+    // v2 (niezaktywowane)
+    precomputeIndicatorsV2,
+    assembleFeaturesFromPrecomputedV2,
 };

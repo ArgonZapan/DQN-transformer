@@ -114,11 +114,70 @@ function rollingStd(values, window) {
     return std;
 }
 
+// ── Wskaźniki v2 (niezaktywowane) ─────────────────────────────────────────────
+
+/**
+ * ATR (Average True Range) — volatility unormowana ceną.
+ * TR = max(high-low, |high-prevClose|, |low-prevClose|)
+ * ATR = EMA(TR, period)
+ */
+function calculateATR(highs, lows, closes, period = 14) {
+    const n = closes.length;
+    const tr = new Array(n).fill(0);
+    tr[0] = highs[0] - lows[0];
+    for (let i = 1; i < n; i++) {
+        const hl = highs[i] - lows[i];
+        const hc = Math.abs(highs[i] - closes[i - 1]);
+        const lc = Math.abs(lows[i] - closes[i - 1]);
+        tr[i] = Math.max(hl, hc, lc);
+    }
+    return calculateEMA(tr, period);
+}
+
+/**
+ * Bollinger Band Width = (upper - lower) / sma = 4 * std20 / sma20.
+ * Mierzy "ściskanie" pasma — spike poprzedza wybicie.
+ * Zwraca tablicę bbWidth[i].
+ */
+function calculateBollingerWidth(closes, period = 20) {
+    const sma = calculateSMA(closes, period);
+    const std = rollingStd(closes, period);
+    const bbw = new Array(closes.length).fill(0);
+    for (let i = 0; i < closes.length; i++) {
+        bbw[i] = sma[i] !== 0 ? (4 * std[i]) / sma[i] : 0;
+    }
+    return bbw;
+}
+
+/**
+ * Stochastic %K = (close - min14) / (max14 - min14).
+ * Mierzy pozycję ceny w 14-barowym zakresie H-L.
+ */
+function calculateStochasticK(highs, lows, closes, period = 14) {
+    const n = closes.length;
+    const stoch = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) {
+        const start = Math.max(0, i - period + 1);
+        let minL = lows[start], maxH = highs[start];
+        for (let j = start + 1; j <= i; j++) {
+            if (lows[j] < minL) minL = lows[j];
+            if (highs[j] > maxH) maxH = highs[j];
+        }
+        const range = maxH - minL;
+        stoch[i] = range !== 0 ? (closes[i] - minL) / range : 0.5;
+    }
+    return stoch;
+}
+
 module.exports = {
     calculateRSI,
     calculateEMA,
     calculateMACD,
     calculateSMA,
     rollingMean,
-    rollingStd
+    rollingStd,
+    // v2
+    calculateATR,
+    calculateBollingerWidth,
+    calculateStochasticK,
 };

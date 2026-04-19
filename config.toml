@@ -47,7 +47,7 @@ dashboard_poll_interval_sec = 60 # jak często monitor odpytuje aktorów
 gamma = 0.97                    # współczynnik dyskontowania nagród
 lr = 2.5e-5                     # learning rate (nadpisuje checkpoint przy resume)
 batch_size = 256
-buffer_capacity = 2000000       # maksymalna pojemność bufora PER
+buffer_capacity = 1000000       # maksymalna pojemność bufora PER
 min_buffer_size = 50000         # minimalna liczba doświadczeń przed startem treningu
 target_update_interval = 1000   # co ile kroków synchronizować sieć docelową
 
@@ -58,7 +58,7 @@ epsilon_decay_fraction = 0.5    # po jakim ułamku łącznych kroków epsilon os
 dropout = 0.2
 seed = 42
 
-resume_from_checkpoint = ""     # ścieżka do checkpointu lub "" dla treningu od zera
+resume_from_checkpoint = ""     # ścieżka do checkpointu lub "" dl`a treningu od zera
 keep_last_n_checkpoints = 24    # liczba zachowanych checkpointów krokowych
 checkpoint_interval = 20000     # co ile kroków zapis checkpointu
 evaluation_interval = 5000      # co ile kroków ewaluacja / raport
@@ -115,6 +115,23 @@ use_ohlcv = true
 use_rsi   = true
 use_macd  = true
 use_sma20 = true
+
+# ── Cechy wejściowe v2 (niezaktywowane) ────────────────────────────────────────
+# Aby aktywować: zastąp precomputeIndicators → precomputeIndicatorsV2 w node/env/environment.js
+#                oraz precompute_features → precompute_features_v2 w python/backtest.py.
+# num_features pozostaje 8 — brak zmian architektury modelu.
+#
+# Zmiany względem v1:
+#   f[3]: volumeClipped  — min(vol/meanVol, 3.0)        zamiast surowego vol/meanVol
+#   f[4]: stochasticK    — (close-min14)/(max14-min14)  zamiast RSI/100
+#   f[5]: macdHistNorm   — (macdLine-signalLine)/close  zamiast macdLine/close
+#   f[6]: bollingerWidth — 4*std20/sma20                zamiast pctChange
+#   f[7]: smaDistance    — (close-sma20)/close          zamiast binarnego aboveSma
+#
+# Opcjonalne rozszerzenie do 9 cech (wymaga zmiany modelu, num_features = 9):
+#   f[8]: atrNorm        — ATR(14)/close
+#         Funkcja calculateATR() dostępna w node/data/indicators.js
+#         Funkcja _atr_np() dostępna w python/backtest.py
 
 # ── System nagród ──────────────────────────────────────────────────────────────
 [reward]

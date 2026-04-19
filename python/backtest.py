@@ -160,6 +160,81 @@ def precompute_features(candles: list, norm_window: int) -> np.ndarray:
     return out
 
 
+# ── Wskaźniki v2 (niezaktywowane) ────────────────────────────────────────────
+#
+# 8 cech (num_features = 8, bez zmian architektury):
+#   0: normalizedClose   — z-score, okno 60 (bez zmian)
+#   1: relativeRange     — (H-L)/close (bez zmian)
+#   2: candleDirection   — (close-open)/close (bez zmian)
+#   3: volumeClipped     — min(vol/meanVol, 3.0) — clip na 3x mean
+#   4: stochasticK       — (close-min14)/(max14-min14)
+#   5: macdHistNorm      — (macdLine-signalLine)/close
+#   6: bollingerWidth    — 4*std20/sma20
+#   7: smaDistance       — (close-sma20)/close
+#
+# Opcjonalne (num_features = 9):
+#   8: atrNorm           — ATR(14)/close
+
+
+def _atr_np(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
+    n = len(closes)
+    tr = np.empty(n, dtype=np.float64)
+    tr[0] = highs[0] - lows[0]
+    prev = closes[:-1]
+    tr[1:] = np.maximum(highs[1:] - lows[1:],
+              np.maximum(np.abs(highs[1:] - prev), np.abs(lows[1:] - prev)))
+    return _ema_np(tr, period)
+
+
+def _stochastic_k_np(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
+    n = len(closes)
+    out = np.full(n, 0.5, dtype=np.float64)
+    for i in range(n):
+        s = max(0, i - period + 1)
+        lo = lows[s:i + 1].min()
+        hi = highs[s:i + 1].max()
+        rng = hi - lo
+        out[i] = (closes[i] - lo) / rng if rng != 0 else 0.5
+    return out
+
+
+def precompute_features_v2(candles: list, norm_window: int) -> np.ndarray:
+    """
+    Pre-compute all 8 v2 features. Returns float32 array of shape [N, 8].
+    Drop-in replacement for precompute_features() — matches precomputeIndicatorsV2() in state.js.
+    NIEZAKTYWOWANE — użyj zamiast precompute_features() gdy gotowe do testu.
+    """
+    n = len(candles)
+    closes  = np.array([c['close']  for c in candles], dtype=np.float64)
+    opens   = np.array([c['open']   for c in candles], dtype=np.float64)
+    highs   = np.array([c['high']   for c in candles], dtype=np.float64)
+    lows    = np.array([c['low']    for c in candles], dtype=np.float64)
+    volumes = np.array([c['volume'] for c in candles], dtype=np.float64)
+
+    mean_c   = _rolling_mean_np(closes, norm_window)
+    std_c    = _rolling_std_np(closes, norm_window)
+    ema12    = _ema_np(closes, 12)
+    ema26    = _ema_np(closes, 26)
+    macd_line = ema12 - ema26
+    signal   = _ema_np(macd_line, 9)
+    sma20    = _rolling_mean_np(closes, 20)
+    std20    = _rolling_std_np(closes, 20)
+    mean_vol = _rolling_mean_np(volumes, norm_window)
+    stoch_k  = _stochastic_k_np(highs, lows, closes)
+
+    out = np.zeros((n, 8), dtype=np.float32)
+    out[:, 0] = np.where(std_c != 0,    (closes - mean_c) / np.where(std_c != 0,    std_c,   1.0), 0.0)
+    out[:, 1] = np.where(closes != 0,   (highs - lows)    / np.where(closes != 0,   closes,  1.0), 0.0)
+    out[:, 2] = np.where(closes != 0,   (closes - opens)  / np.where(closes != 0,   closes,  1.0), 0.0)
+    out[:, 3] = np.where(mean_vol != 0, np.minimum(volumes / np.where(mean_vol != 0, mean_vol, 1.0), 3.0), 0.0)
+    out[:, 4] = stoch_k.astype(np.float32)
+    out[:, 5] = np.where(closes != 0,   (macd_line - signal) / np.where(closes != 0, closes, 1.0), 0.0)
+    out[:, 6] = np.where(sma20 != 0,    (4 * std20) / np.where(sma20 != 0, sma20, 1.0), 0.0)
+    out[:, 7] = np.where(closes != 0,   (closes - sma20) / np.where(closes != 0, closes, 1.0), 0.0)
+
+    return out
+
+
 def build_alignment_map(candles_1m: list, candles_tf: list) -> np.ndarray:
     """
     For each 1m candle index, find how many TF candles have close_time <= that 1m close_time.
