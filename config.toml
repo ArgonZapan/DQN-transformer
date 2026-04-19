@@ -120,7 +120,7 @@ use_sma20 = true
 [reward]
 commission_open  = 0.00075   # prowizja Binance za otwarcie (taker)
 commission_close = 0.00075   # prowizja Binance za zamknięcie (taker)
-trade_penalty    = 0.0005    # dodatkowa kara za każde otwarcie pozycji
+trade_penalty    = 0.00025    # dodatkowa kara za każde otwarcie pozycji
 close_penalty    = 0.0       # dodatkowa kara za zamknięcie (0 = brak)
 
 post_close_cooldown_steps = 12  # trade_penalty x2 gdy nowe otwarcie < N kroków po zamknięciu
@@ -138,7 +138,7 @@ clip_min = -1.0   # dolny clip całkowitej nagrody per krok (przed reward_scale)
 clip_max =  1.0   # górny clip całkowitej nagrody per krok
 
 reward_scale          = 10.0  # globalny mnożnik wszystkich nagród (wzmacnia sygnał)
-unrealized_reward_scale = 0.1 # mnożnik absolutnego uPnL dodawanego per krok z pozycją
+unrealized_reward_scale = 0.01 # mnożnik absolutnego uPnL dodawanego per krok z pozycją
 
 # ── Dane historyczne ────────────────────────────────────────────────────────────
 [data]

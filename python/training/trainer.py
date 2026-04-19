@@ -68,19 +68,26 @@ class Trainer:
         if self.use_amp:
             logger.info("[Trainer] Mixed precision (AMP) enabled")
 
-        # torch.compile — kompiluje graf, +20-40% speedup. UWAGA: koliduje z hookami
-        # z debuggera/attention_monitora. Domyślnie wyłączone, włącz przez config.
-        compile_enabled = config.get('training', {}).get('compile_model', False)
-        if compile_enabled and hasattr(torch, 'compile') and self.device != 'cpu':
-            try:
-                self.main_network = torch.compile(self.main_network, mode='default', dynamic=False)
-                self.target_network = torch.compile(self.target_network, mode='default', dynamic=False)
-                logger.info("[Trainer] torch.compile enabled (mode=default)")
-            except Exception as e:
-                logger.warning(f"[Trainer] torch.compile failed, falling back to eager: {e}")
+        # torch.compile — przeniesione na koniec __init__ (po załadowaniu checkpointu),
+        # bo OptimizedModule dodaje prefix `_orig_mod.` do state_dict i zrywa load.
+        self._compile_enabled = config.get('training', {}).get('compile_model', False)
 
         self.optimizer = torch.optim.Adam(self.main_network.parameters(), lr=self.lr)
         self.loss_fn = nn.MSELoss(reduction='none')
+
+        # CosineAnnealing LR scheduler zsynchronizowany z epsilon decay.
+        # T_max = liczba kroków treningu w fazie decay (epsilon_decay_fraction * buffer_capacity).
+        # Aktywny tylko gdy lr_scheduler = "cosine" w config.
+        lr_sched_cfg = training_cfg.get('lr_scheduler', 'none').lower()
+        if lr_sched_cfg == 'cosine':
+            total_decay_steps = int(training_cfg['epsilon_decay_fraction'] * training_cfg['buffer_capacity'])
+            lr_min = training_cfg.get('lr_min', self.lr * 0.1)
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=max(1, total_decay_steps), eta_min=lr_min
+            )
+            logger.info(f"[Trainer] LR scheduler: CosineAnnealing T_max={total_decay_steps}, lr {self.lr} → {lr_min}")
+        else:
+            self.lr_scheduler = None
 
         # Prealokowane stałe maski dla Double DQN (wcześniej tworzone co krok)
         self._mask_in_pos = torch.tensor([0, 0, 1, 1], dtype=torch.float32, device=self.device)
@@ -105,6 +112,9 @@ class Trainer:
         self.step_count = 0
         self.epsilon = self.epsilon_start
         self.last_loss = 0.0
+        self._paused = False
+        self._epsilon_reset_end_step: int | None = None
+        self._epsilon_reset_target:   float | None = None
         self._logged_training_start = False
         self._sps_step_anchor = 0
         self._sps_time_anchor = time_module.time()
@@ -188,6 +198,20 @@ class Trainer:
         self._action_counts = [0] * config['model']['num_actions']
 
         self._load_checkpoint_if_exists()
+
+        # torch.compile PO załadowaniu checkpointu — OptimizedModule dodaje `_orig_mod.`
+        # prefix do state_dict, więc kompilacja przed load_state_dict zrywa ładowanie.
+        if self._compile_enabled and hasattr(torch, 'compile') and self.device != 'cpu':
+            # Windows nie ma Tritona → inductor backend pada. aot_eager działa wszędzie
+            # (mniejszy zysk ~5-10% zamiast 20-40%, ale bez wymagań Triton).
+            compile_backend = config.get('training', {}).get('compile_backend', 'aot_eager')
+            try:
+                self.main_network = torch.compile(self.main_network, backend=compile_backend, dynamic=False)
+                self.target_network = torch.compile(self.target_network, backend=compile_backend, dynamic=False)
+                logger.info(f"[Trainer] torch.compile enabled (backend={compile_backend})")
+            except Exception as e:
+                logger.warning(f"[Trainer] torch.compile failed, falling back to eager: {e}")
+
         # Ustaw anchor SPS po załadowaniu checkpointu (step_count może być != 0 przy resume)
         self._sps_step_anchor = self.step_count
         self._sps_time_anchor = time_module.time()
@@ -256,6 +280,12 @@ class Trainer:
         self.step_count = checkpoint.get('step', 0)
         self.epsilon = checkpoint.get('epsilon', self.epsilon_start)
         self.last_loss = checkpoint.get('loss', 0.0)
+        self._epsilon_reset_end_step = checkpoint.get('epsilon_reset_end_step', None)
+        self._epsilon_reset_target   = checkpoint.get('epsilon_reset_target',   None)
+        if self.lr_scheduler is not None and 'lr_scheduler_state_dict' in checkpoint:
+            self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = self.lr
         if load_buffer and 'buffer' in checkpoint:
             buf_state = checkpoint['buffer']
             buf_size = buf_state.get('size', buf_state.get('main', {}).get('size', '?'))
@@ -280,13 +310,21 @@ class Trainer:
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
+        # Zapisuj zawsze stan eager modelu — torch.compile dodaje prefix `_orig_mod.`
+        # do state_dict, co zrywa load do eager modelu (compile dzieje się po load).
+        eager_model = getattr(self.main_network, '_orig_mod', self.main_network)
         payload = {
             'step': self.step_count,
-            'model_state_dict': self.main_network.state_dict(),
+            'model_state_dict': eager_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'loss': self.last_loss,
             'epsilon': self.epsilon,
         }
+        if self.lr_scheduler is not None:
+            payload['lr_scheduler_state_dict'] = self.lr_scheduler.state_dict()
+        if self._epsilon_reset_end_step is not None:
+            payload['epsilon_reset_end_step'] = self._epsilon_reset_end_step
+            payload['epsilon_reset_target']   = self._epsilon_reset_target
         if include_buffer:
             buf_size = len(self.buffer)
             logger.info(f"[Checkpoint] Serializing buffer ({buf_size} experiences)...")
@@ -483,10 +521,52 @@ class Trainer:
 
     def _update_epsilon(self):
         total_decay_steps = self.epsilon_decay_fraction * self.config['training']['buffer_capacity']
-        self.epsilon = max(
+        decay_epsilon = max(
             self.epsilon_end,
             self.epsilon_start - (self.epsilon_start - self.epsilon_end) * (self.step_count / max(total_decay_steps, 1))
         )
+
+        if self._epsilon_reset_end_step is not None:
+            if self.step_count < self._epsilon_reset_end_step:
+                # Aktywny reset — trzymaj podwyższone epsilon
+                self.epsilon = self._epsilon_reset_target
+            else:
+                # Reset wygasł — wróć do krzywej decay i wyczyść stan
+                logger.info(f'[Trainer] Epsilon reset ended at step {self.step_count}, resuming decay ε={decay_epsilon:.4f}')
+                self._epsilon_reset_end_step = None
+                self._epsilon_reset_target   = None
+                self.epsilon = decay_epsilon
+        else:
+            self.epsilon = decay_epsilon
+
+        if self.lr_scheduler is not None and decay_epsilon > self.epsilon_end:
+            self.lr_scheduler.step()
+
+    def trigger_epsilon_reset(self, target: float | None = None, duration: int | None = None) -> None:
+        """Tymczasowo podnieś epsilon do `target` na `duration` kroków treningowych.
+        Po zakończeniu epsilon wraca automatycznie do aktualnej wartości krzywej decay.
+        Parametry domyślne z config [training] epsilon_reset_target / epsilon_reset_duration.
+        """
+        cfg = self.config['training']
+        target   = target   if target   is not None else cfg.get('epsilon_reset_target',   0.8)
+        duration = duration if duration is not None else cfg.get('epsilon_reset_duration', 5000)
+
+        old_epsilon = self.epsilon
+        self._epsilon_reset_target   = float(target)
+        self._epsilon_reset_end_step = self.step_count + int(duration)
+        self.epsilon = self._epsilon_reset_target
+        logger.info(
+            f'[Trainer] Epsilon reset triggered: ε {old_epsilon:.4f} → {target:.4f} '
+            f'for {duration:,} steps (ends at step {self._epsilon_reset_end_step:,})'
+        )
+
+    @property
+    def dynamic_loss_scale(self) -> float:
+        """loss_scale sprzężony z epsilon: 1.0 przy epsilon_start → loss_scale_max przy epsilon_end."""
+        ls_max = self.config['reward'].get('loss_scale', 1.4)
+        progress = (self.epsilon_start - self.epsilon) / max(self.epsilon_start - self.epsilon_end, 1e-8)
+        progress = max(0.0, min(1.0, progress))
+        return 1.0 + (ls_max - 1.0) * progress
 
     def _log_tensorboard(self, force=False):
         """Loguje do TensorBoard jeśli minął interwał czasowy."""
@@ -644,8 +724,13 @@ class Trainer:
         logger.debug(f"[TensorBoard] Histograms logged at step {step}")
 
     def train_step(self):
+        # Faza zapełniania: drain przed sprawdzeniem rozmiaru (inaczej queue rośnie, buffer stoi).
+        # Faza treningu: drain po sprawdzeniu — wracamy do starej pozycji.
+        if not self._logged_training_start:
+            self._drain_experience_queue()
+
         buffer_size = len(self.buffer)
-        
+
         if buffer_size < self.min_buffer_size:
             if buffer_size >= self.min_buffer_size * 0.5 and not hasattr(self, '_logged_halfway'):
                 logger.info(f"[Trainer] Buffer at 50%: {buffer_size}/{self.min_buffer_size}")
@@ -656,7 +741,7 @@ class Trainer:
             logger.info(f"[Trainer] TRAINING STARTED - Buffer full at {buffer_size} experiences, resuming={self.step_count > 0}")
             self._logged_training_start = True
 
-        # Drain kolejki doświadczeń (ZMQ thread enqueue, tu robimy buffer.add)
+        # Faza treningu — drain tutaj (stara pozycja)
         self._drain_experience_queue()
 
         _t0 = time_module.perf_counter()
@@ -724,17 +809,21 @@ class Trainer:
         else:
             loss.backward()
 
-        if debug_now:
-            self.debugger.log_gradient_flow(self.main_network, self.step_count)
-
         # AMP: unscale przed obliczeniem normy gradientu i clippingiem
         if self.use_amp:
             self.scaler.unscale_(self.optimizer)
 
-        # Trzymaj normę jako tensor — sync CPU dopiero przy logowaniu (jeden batch sync)
         pre_clip_norm = torch.nn.utils.clip_grad_norm_(
             self.main_network.parameters(), 1.0
         )
+
+        _norm_val = pre_clip_norm.item()
+        if not torch.isfinite(pre_clip_norm):
+            logger.warning(f"[Trainer] Gradient explosion at step {self.step_count}: norm={_norm_val:.2f} — AMP scaler will skip update")
+
+        # Loguj gradient flow PO unscale i clippingu — wartości są rzeczywiste
+        if debug_now:
+            self.debugger.log_gradient_flow(self.main_network, self.step_count)
 
         if self.use_amp:
             self.scaler.step(self.optimizer)
@@ -796,12 +885,13 @@ class Trainer:
             q_min_row = q_det.min(dim=1).values
             acc['q_max_sum']   += q_max_row.mean()
             acc['q_min_sum']   += q_min_row.mean()
-            acc['grad_norm_sum'] += pre_clip_norm
+            if torch.isfinite(pre_clip_norm):
+                acc['grad_norm_sum'] += pre_clip_norm
             acc['q_spread_sum']  += (q_max_row - q_min_row).mean()
 
-            q_masked = q_det.masked_fill(action_masks == 0, float('-inf'))
-            probs = torch.softmax(q_masked, dim=1)
-            acc['action_entropy_sum'] += -(probs * torch.log2(probs + 1e-8)).sum(dim=1).mean()
+            probs = torch.softmax(q_det.float(), dim=1)
+            entropy = -(probs * torch.log2(probs.clamp(min=1e-8))).sum(dim=1).mean()
+            acc['action_entropy_sum'] += entropy
             acc['q_hold_sum'] += q_det[:, 2].mean()
 
             # Zamiast pętli Python nad actions.cpu().numpy() — bincount na GPU
@@ -833,7 +923,7 @@ class Trainer:
             self.save_checkpoint()
 
         now = time_module.time()
-        if now - self._last_hourly_ckpt_time >= 3600:
+        if now - self._last_hourly_ckpt_time >= 4 * 3600:
             hourly_path = os.path.join('python', 'checkpoints', 'hourly_checkpoint.pt')
             self.save_checkpoint(path=hourly_path, include_buffer=True)
             self._last_hourly_ckpt_time = now
@@ -870,11 +960,32 @@ class Trainer:
     @torch.no_grad()
     def predict_action(self, state, action_mask=None):
         if np.random.random() < self.epsilon:
-            if action_mask is not None:
-                valid_actions = [i for i, m in enumerate(action_mask) if m == 1]
-                if valid_actions:
-                    return np.random.choice(valid_actions)
-            return np.random.randint(0, self.config['model']['num_actions'])
+            valid_actions = (
+                [i for i, m in enumerate(action_mask) if m == 1]
+                if action_mask is not None
+                else list(range(self.config['model']['num_actions']))
+            )
+            if not valid_actions:
+                return np.random.randint(0, self.config['model']['num_actions'])
+
+            # Biased exploration: P(HOLD) = clamp(epsilon, hold_bias_min, hold_bias_max).
+            # Wczesny trening (wysoki epsilon) → dużo HOLD → dłuższe epizody.
+            # Późny trening (niski epsilon) → więcej LONG/SHORT/CLOSE → intensywna eksploracja.
+            training_cfg = self.config['training']
+            hold_bias_min = training_cfg.get('hold_bias_min', 0.3)
+            hold_bias_max = training_cfg.get('hold_bias_max', 0.7)
+            hold_prob = max(hold_bias_min, min(hold_bias_max, self.epsilon))
+
+            HOLD = 2
+            non_hold = [a for a in valid_actions if a != HOLD]
+            if HOLD not in valid_actions or not non_hold:
+                return int(np.random.choice(valid_actions))
+
+            other_prob = (1.0 - hold_prob) / len(non_hold)
+            weights = [hold_prob if a == HOLD else other_prob for a in valid_actions]
+            total = sum(weights)
+            weights = [w / total for w in weights]
+            return int(np.random.choice(valid_actions, p=weights))
 
         action, _ = self.predict(state, action_mask)
         return action
@@ -886,6 +997,8 @@ class Trainer:
         onnx_cfg = self.config.get('onnx', {})
         if not onnx_cfg.get('enabled', False):
             return
+
+        import warnings
 
         export_path = onnx_cfg.get('export_path', 'python/checkpoints/model.onnx')
         tmp_path = export_path + '.tmp'
@@ -965,7 +1078,9 @@ class Trainer:
 
                 torch.nn.MultiheadAttention.forward = _mha_slow_forward
                 try:
-                    torch.onnx.export(wrapper, tuple(dummy_inputs), tmp_path, **export_kwargs)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', message='Constant folding')
+                        torch.onnx.export(wrapper, tuple(dummy_inputs), tmp_path, **export_kwargs)
                 finally:
                     torch.nn.MultiheadAttention.forward = _orig_mha_forward
 
@@ -982,6 +1097,61 @@ class Trainer:
                     os.remove(tmp_path)
                 except OSError:
                     pass
+
+    def reset_training(self):
+        """Resetuje model, bufor i stan treningu do zera. Wywoływane przez /restart w Telegramie."""
+        import queue as _queue
+        logger.info('[Trainer] Resetting training — fresh weights, empty buffer, step=0')
+
+        # Świeże wagi sieci
+        from model.network import TradingDQN
+        self.main_network = TradingDQN(self.config).to(self.device)
+        self.target_network = TradingDQN(self.config).to(self.device)
+        self.target_network.load_state_dict(self.main_network.state_dict())
+        self.target_network.eval()
+
+        # Nowy optimizer
+        self.optimizer = torch.optim.Adam(self.main_network.parameters(), lr=self.lr)
+        if self.use_amp:
+            self.scaler = torch.amp.GradScaler('cuda')
+
+        # Wyczyść bufor
+        from training.prioritized_buffer import PrioritizedReplayBuffer, DualPrioritizedBuffer
+        from training.replay_buffer import ReplayBuffer
+        per_cfg = self.config.get('per', {})
+        if per_cfg.get('alpha', 0) > 0:
+            if per_cfg.get('positive_ratio', 0.0) > 0:
+                self.buffer = DualPrioritizedBuffer(self.config)
+            else:
+                self.buffer = PrioritizedReplayBuffer(self.config)
+        else:
+            self.buffer = ReplayBuffer(self.config)
+
+        # Wyczyść kolejkę doświadczeń
+        self._experience_queue = _queue.Queue(maxsize=50000)
+
+        # Reset stanu treningu
+        self.step_count   = 0
+        self.epsilon      = self.epsilon_start
+        self.last_loss    = 0.0
+        self._paused      = False
+        self._logged_training_start = False
+        self._logged_halfway = False if hasattr(self, '_logged_halfway') else False
+        self._sps_step_anchor = 0
+        self._sps_time_anchor = time_module.time()
+        self._timing_logged   = 0
+        self._last_debug_time = 0.0
+        self._last_tb_log_time = time_module.time()
+        self._last_histogram_log_time = time_module.time()
+        self._last_hourly_ckpt_time = time_module.time()
+        self._gpu_acc       = self._make_gpu_accumulator()
+        self._gpu_acc_steps = 0
+        self._q_values_ema  = None
+        self._last_advantage_std = None
+        self._last_health   = None
+        self._actor_metrics.clear()
+
+        logger.info('[Trainer] Reset complete — ready for fresh training')
 
     def finish_current_step(self):
         # Force final log before closing
@@ -1019,6 +1189,11 @@ class Trainer:
             'td_error_avg': avg_td,
         }
         
+        # Grad norm z ostatniego sync GPU acc
+        gpu = self._gpu_acc
+        gpu_n = self._gpu_acc_steps
+        metrics['grad_norm'] = float(gpu['grad_norm_sum'] / gpu_n) if gpu_n > 0 else 0.0
+
         # PER-specific metrics
         if self.use_per:
             metrics['per_alpha'] = self.config.get('per', {}).get('alpha', 0)
