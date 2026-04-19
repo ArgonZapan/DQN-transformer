@@ -493,7 +493,7 @@ class Actor {
                 posOpenPrice:    row.posOpenPrice,
                 action:          mirAction(row.action),
                 wasRandom:       row.wasRandom,
-                qValues:         null,
+                qValues:         row.qValues ? [row.qValues[1], row.qValues[0], row.qValues[2], row.qValues[3]] : null,
                 reward:          mirReward,
                 rewardBreakdown: mirRb,
                 mask:            this._mirrorActionMask(row.mask),
