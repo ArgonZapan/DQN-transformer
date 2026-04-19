@@ -86,7 +86,7 @@ hold_bias_max = 0.7             # maksymalna szansa na HOLD przy losowej eksplor
 
 epsilon_reset_target   = 0.80   # docelowy epsilon przy /ereset
 epsilon_reset_duration = 5000   # na ile kroków epsilon_reset_target jest utrzymywany
-episode_mirror         = false  # dublowanie epizodów LONG→SHORT, balansuje dane treningowe
+episode_mirror         = true   # dublowanie epizodów LONG→SHORT, balansuje dane treningowe
 
 # ── Prioritized Experience Replay ──────────────────────────────────────────────
 [per]
@@ -96,7 +96,7 @@ beta_end = 1.0          # docelowa waga IS (osiągana pod koniec treningu)
 epsilon = 0.0001        # małe ε dodawane do TD error (zapobiega zerowym priorytetom)
 
 positive_ratio = 0.4    # frakcja batcha z bufora pozytywnych nagród (reward > 0)
-long_short_balance = 0.0 # frakcja batcha z osobnych buforów LONG/SHORT (0 = wyłączone)
+long_short_balance = 0.3 # frakcja batcha z osobnych buforów LONG/SHORT (0 = wyłączone)
 
 # ── Architektura modelu ────────────────────────────────────────────────────────
 [model]
