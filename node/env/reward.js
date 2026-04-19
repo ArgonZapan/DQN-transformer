@@ -53,8 +53,17 @@ function calculateReward(position, rewardConfig) {
     return reward;
 }
 
+function calculatePnLDecayed(position, rewardConfig) {
+    if (!position || !position.closed) return 0;
+    const pnl = calculatePnL(position);
+    const holdingTimeHours = (position.closeTime - position.openTime) / 3_600_000;
+    const timeDecay = 1.0 / (1.0 + holdingTimeHours / rewardConfig.time_decay_hours);
+    return pnl * timeDecay;
+}
+
 module.exports = {
     calculatePnL,
+    calculatePnLDecayed,
     calculateOpenPenalty,
     calculateReward,
 };

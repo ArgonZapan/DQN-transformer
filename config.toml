@@ -1,158 +1,164 @@
-# =============================================================================
-# Konfiguracja DQN OPUS - Deep Q-Network for Optimal Persistent Unified System
-# =============================================================================
+[[actors]]
+symbol = "BTCUSDT"
+exchange = "binance"
+leverage = 1
+
+[[actors]]
+symbol = "ETHUSDT"
+exchange = "binance"
+leverage = 1
+
+[[actors]]
+symbol = "SOLUSDT"
+exchange = "binance"
+leverage = 1
 
 [learner]
-host         = "tcp://127.0.0.1"    # Adres IP/nazwa hosta dla komunikacji z aktorami
-port         = 5555                 # Port TCP do komunikacji z aktorami
-metrics_port = 5556                 # Port do zbierania metryk od aktorów
-device       = "auto"               # Urządzenie obliczeniowe: "auto" = automatycznie wykryj GPU, "cuda" = wymuś GPU, "cpu" = wymuś CPU
-
-[[actors]]
-symbol   = "BTCUSDT"                # Para handlowa (np. BTCUSDT, ETHUSDT, SOLUSDT)
-exchange = "binance"                # Giełda: "binance" = Binance, "simulation" = symulacja
-leverage = 1                        # Dźwignia finansowa (1 = bez dźwigni)
-
-[[actors]]
-symbol   = "ETHUSDT"
-exchange = "binance"
-leverage = 1
-
-[[actors]]
-symbol   = "SOLUSDT"
-exchange = "binance"
-leverage = 1
+host = "tcp://127.0.0.1"
+port = 5555
+metrics_port = 5556
+device = "cuda"
+num_threads = 4
 
 [timeframes]
-candles_1m  = 30                    # Liczba świec 1-minutowych (30 = ostatnie 30 minut)
-candles_15m = 24                    # Liczba świec 15-minutowych (24 = ostatnie 6 godzin)
-candles_1h  = 48                    # Liczba świec 1-godzinnych (48 = ostatnie 2 dni)
-candles_1d  = 30                    # Liczba świec dziennych (30 = ostatni miesiąc)
-candles_1w  = 0                     # Liczba świec tygodniowych (0 = wyłączone)
+candles_1m = 30
+candles_15m = 24
+candles_1h = 48
+candles_1d = 30
+candles_1w = 0
 
 [monitoring]
-host                        = "tcp://127.0.0.1"  # Host dla dashboardu
-port                        = 3001               # Port dashboardu HTTP
-metrics_pull_port           = 3002               # Port do pobierania metryk od agenta
-metrics_push_interval_sec   = 5                  # Interwał wysyłania metryk (w sekundach)
-dashboard_poll_interval_sec = 60                 # Interwał odświeżania dashboardu (w sekundach)
+host = "tcp://127.0.0.1"
+port = 3001
+metrics_pull_port = 3002
+metrics_push_interval_sec = 5
+dashboard_poll_interval_sec = 60
 
 [training]
-gamma                   = 0.97              # Współczynnik dyskontowania nagród (gamma) - im bliższy 1, tym dalej widzi w przyszłość
-lr                      = 0.0003            # Learning rate - szybkość uczenia (zbyt wysoki = niestabilność, zbyt niski = wolne uczenie)
-batch_size              = 256               # Rozmiar batcha - ile próbek na jedną aktualizację sieci
-buffer_capacity         = 1000000           # Pojemność replay buffer - max liczba doświadczeń do przechowania
-min_buffer_size         = 50000             # Minymalny rozmiar bufferu przed rozpoczęciem treningu
-target_update_interval  = 1000              # Co ile kroków aktualizować sieć docelową (target network)
-epsilon_start           = 0.96              # Początkowy epsilon (Exploration Rate) - start z pełną eksploracją
-epsilon_end             = 0.05              # Końcowy epsilon - minimalna eksploracja po długim treningu
-epsilon_decay_fraction  = 0.2               # Frakcja treningu przeznaczona na decay epsilon (0.5 = 50% treningu)
-dropout                 = 0.10              # Dropout rate - regularization (0.1 = 10% neuronów losowo wyłączanych)
-seed                    = 42                # Seed losowy dla powtarzalności eksperymentów
-resume_from_checkpoint  = ""                # Ścieżka do checkpointu do wznowienia treningu (puste = od zera)
-keep_last_n_checkpoints = 24                # Ile ostatnich checkpointów trzymać na dysku
-checkpoint_interval     = 20000             # Co ile kroków zapisywać checkpoint
-evaluation_interval     = 5000              # Co ile kroków uruchamiać ewaluację
-validation_days         = 60                # Ile ostatnich dni zarezerwowanych do walidacji (reszta = trening); używane tylko gdy validation_weeks = 0
-validation_weeks        = 0                 # Ile ostatnich TYGODNI zarezerwować na walidację (0 = użyj validation_days)
-training_months         = 24                # Ile miesięcy danych przed walidacją używać do treningu (0 = wszystkie dostępne)
-episode_length          = 3000              # Długość epizodu w decyzjach (nie świecach); start losowany z całej dostępnej historii
-step_interval           = 5                 # Co ile świec 1m podejmować decyzję (1 = co minutę, 10 = co 10 minut, 60 = co godzinę)
-max_trades_per_episode  = 0                 # Ile pełnych transakcji kończy epizod przedwcześnie (1 = po każdej transakcji, 0 = nigdy)
-return_mode             = "nstep"           # Tryb zwrotów: "mc" = Monte Carlo (done=True wszędzie), "nstep" = n-krokowe TD, "td" = 1-krokowe TD
-n_step                  = 5                 # Liczba kroków do przodu dla return_mode="nstep" (ignorowane w trybie mc/td)
-compile_model           = false             # torch.compile dla sieci (+20-40% speed, ale może kolidować z hookami debuggera)
+gamma = 0.97
+lr = 0.001
+batch_size = 256
+buffer_capacity = 500000
+min_buffer_size = 100000
+target_update_interval = 1000
+epsilon_start = 1.0
+epsilon_end = 0.1
+epsilon_decay_fraction = 0.5
+dropout = 0.2
+seed = 42
+resume_from_checkpoint = ""
+keep_last_n_checkpoints = 24
+checkpoint_interval = 20000
+evaluation_interval = 5000
+validation_days = 7
+validation_weeks = 0
+training_months = 48
+episode_length = 960
+step_interval = 15
+max_trades_per_episode = 1
+return_mode = "nstep"
+n_step = 5
+compile_model = false
+min_hold_steps = 5
+lr_scheduler = "none"
+lr_min = 1e-5
+hold_bias_min = 0.3
+hold_bias_max = 0.7
+epsilon_reset_target   = 0.80
+epsilon_reset_duration = 5000
+episode_mirror         = false
 
 [per]
-alpha          = 0.6           # Priorytet α - jak bardzo priorytetyzować ważne próbki (0 = brak priorytetów, 1 = tylko priorytety)
-beta_start     = 0.4           # Początkowy beta - kompensacja priorytetów (zaczyna od 40% importance sampling)
-beta_end       = 1.0           # Końcowy beta - pełne importance sampling na końcu treningu
-epsilon        = 0.0001        # Mała wartość dodawana do priorytetów (zapewnia że każda próbka ma szansę być wybrana)
-positive_ratio = 0.2           # Frakcja batcha gwarantowana z zyskownych próbek (0.0 = wyłączone, używa zwykłego PER)
+alpha = 0.6
+beta_start = 0.4
+beta_end = 1.0
+epsilon = 0.0001
+positive_ratio = 0.4
 
 [model]
-num_actions          = 4            # Liczba akcji: 4 (HOLD, LONG, SHORT, CLOSE)
-n_transformer_blocks = 3            # Liczba bloków Transformer
-n_attention_heads    = 4            # Liczba głów attention
-key_dim              = 32           # Wymiar klucza i query w attention (= conv1d_filters / n_attention_heads; nieużywany, PyTorch oblicza automatycznie)
-ff_dim               = 256          # Wymiar warstwy Feed-Forward
-conv_kernel_size     = 3            # Rozmiar jądra konwolucji 1D
-conv1d_filters       = 128          # Liczba filtrów w konwolucji 1D
+num_actions = 4
+n_transformer_blocks = 3
+n_attention_heads = 4
+key_dim = 32
+ff_dim = 256
+conv_kernel_size = 3
+conv1d_filters = 128
 
 [features]
-num_features = 8          # Całkowita liczba cech wejściowych
-use_ohlcv    = true       # Ceny OHLCV (Open, High, Low, Close, Volume)
-use_rsi      = true       # RSI - Relative Strength Index (momentum)
-use_macd     = true       # MACD - Moving Average Convergence Divergence
-use_sma20    = true       # SMA20 - Simple Moving Average 20 okresów
+num_features = 8
+use_ohlcv = true
+use_rsi = true
+use_macd = true
+use_sma20 = true
 
 [reward]
-commission_open         = 0.00075          # Prowizja za otwarcie pozycji 
-commission_close       = 0.00075           # Prowizja za zamknięcie pozycji 
-trade_penalty          = 0.00050           # Kara za otwarcie pozycji (zachęca do rzadszego wchodzenia)
-close_penalty          = 0.00000           # Kara za zamknięcie pozycji (zachęca do dłuższego trzymania)
-post_close_cooldown_steps = 12             # Po zamknięciu: ile kroków trade_penalty jest x2 (0 = wyłączone)
-clip_min               = -1.0              # Minimalna nagroda/kara (clamping)
-clip_max               = 1.0               # Maksymalna nagroda/kara (clamping)
-intermediate_reward_max = 0.1              # Max nagroda pośrednia (za małe zyski)
-loss_scale            = 1.4               # Mnożnik ujemnych delt uPnL (>1 = boki/spadki bolą bardziej; 1.0 = symetrycznie)
-hold_penalty_per_bar  = 0.00002           # Stały koszt trzymania pozycji per krok (0 = wyłączone)
-drawdown_penalty      = 0.2               # Współczynnik kary za drawdown: reward -= maxDrawdown * drawdown_penalty (0 = wyłączone)
-time_decay_hours      = 4.0               # Half-life time decay (h): PnL spada o połowę po tym czasie trzymania pozycji (większa = łagodniejsza kara)
+commission_open = 0.00075
+commission_close = 0.00075
+trade_penalty = 0.0005
+close_penalty = 0.0
+post_close_cooldown_steps = 12
+intermediate_reward_max = 0.1
+loss_scale = 1.4
+hold_penalty_per_bar = 0.0002
+time_decay_hours = 4.0
+drawdown_penalty = 0.0
+idle_penalty_per_bar = 0.0001
+clip_min = -1.0
+clip_max = 1.0
+reward_scale = 10.0
+unrealized_reward_scale = 0.1
 
 [data]
-source               = "file"                           # Źródło danych: "file" = pliki CSV, "binance" = API Binance
-path                 = "node/data/historical/"          # Ścieżka do danych historycznych (pliki CSV)
-cache_path           = "node/data/cache/"               # Ścieżka do cache danych
-binance_rate_limit   = 1000                             # Limit zapytań do Binance API (na minutę)
-normalization_window = 60                               # Okno normalizacji danych (średnia krocząca)
-allow_partial_history = false                           # Pozwól na dane z brakami (niepełny zakres czasowy)
-api_retry_interval_sec = 60                             # Interwał ponownej próby przy błędach API (w sekundach)
+source = "file"
+path = "node/data/historical/"
+cache_path = "node/data/cache/"
+binance_rate_limit = 1000
+normalization_window = 60
+allow_partial_history = false
+api_retry_interval_sec = 60
 
 [logging]
-level            = "INFO"                           # Poziom logowania: DEBUG, INFO, WARNING, ERROR
-max_file_size_mb = 10                               # Max rozmiar pliku logów (w MB)
-max_files        = 5                                # Max liczba plików logów do rotacji
-log_dir          = "logs"                           # Katalog na pliki logów
+level = "INFO"
+max_file_size_mb = 10
+max_files = 5
+log_dir = "logs"
 
 [backtesting]
-enabled       = false                                  # Włączony/wyłączony backtesting
-model_path    = "python/checkpoints/best_model.pt"     # Ścieżka do modelu do backtestingu
-start_date    = "2023-01-01"                           # Data startu backtestu
-end_date      = "2023-12-31"                           # Data końca backtestu
-results_dir   = "results"                              # Katalog na wyniki backtestu
-step_interval = 5                                      # Co ile świec 1m podejmować decyzję podczas backtestu (powinno być = training.step_interval)
-max_oos_days  = 30                                      # Ile ostatnich dni OOS używać do backtestu (60 = 2 miesiące = 86 400 świec 1m)
-fee           = 0.00075                                # Prowizja za jedną stronę transakcji (open lub close); łączny koszt = fee * 2
+enabled = false
+model_path = "python/checkpoints/best_model.pt"
+start_date = "2023-01-01"
+end_date = "2023-12-31"
+results_dir = "results"
+step_interval = 5
+max_oos_days = 30
+fee = 0.00075
 
 [report]
-enabled          = true             # Włącz raporty Telegram po każdym update sieci docelowej
-mode             = "full"           # "compact" = skrócony (1 ekran), "full" = pełny raport
-every_n_updates  = 10               # Co ile target network updates wysyłać raport (1 = każdy, 5 = co 5.)
-min_interval_sec = 0               # Minimalny czas między raportami w sekundach (0 = bez limitu, 3600 = max 1/h)
-# telegram_token   = ""            # Opcjonalnie: własny token; domyślnie używa [alerts].telegram_token
-# telegram_chat_id = ""            # Opcjonalnie: własny chat_id; domyślnie używa [alerts].telegram_chat_id
+enabled = true
+mode = "full"
+every_n_updates = 5
+min_interval_sec = 0
 
 [alerts]
-enabled                    = true                                                   # Włącz alerty Telegram
-telegram_token             = "8692060831:AAFkyj2rRsAnv5AKwzn_KefjJblUO-3tF68"
-telegram_chat_id           = "8624710090"                                           # Uzupełnij: wyślij /start do bota i wklej chat_id
-cooldown_sec               = 300                                                    # Min 5 minut między alertami tego samego typu
-grad_explode_threshold     = 5.0                                                    # grad_norm > próg → alert
-action_collapse_threshold  = 0.95                                                   # dominant_ratio > próg → alert
-loss_plateau_steps         = 2000                                                   # Brak poprawy loss przez N kroków → alert
+enabled = true
+telegram_token = "8692060831:AAFkyj2rRsAnv5AKwzn_KefjJblUO-3tF68"
+telegram_chat_id = "8624710090"
+cooldown_sec = 300
+grad_explode_threshold = 5.0
+action_collapse_threshold = 0.95
+loss_plateau_steps = 2000
 
 [onnx]
-enabled     = true                                      # Włącz lokalny ONNX inference w aktorach
-export_path = "python/checkpoints/model.onnx"           # Ścieżka do eksportowanego pliku ONNX
-device      = "cpu"                                     # Urządzenie wnioskowania w aktorach: "cpu" lub "cuda"
+enabled = true
+export_path = "python/checkpoints/model.onnx"
+device = "cpu"
 
 [api]
-simulation_mode = true       # Tryb symulacji (true) lub realny handel (false)
+simulation_mode = true
 
 [tensorboard]
-log_dir              = "runs"              # Katalog na logi TensorBoard
-log_interval_sec     = 10                  # Interwał logowania scalar metrics (w sekundach)
-histogram_interval_sec = 60                # Interwał logowania histogramów (w sekundach)
-enable_actor_metrics = true                # Czy logować metryki od actorów
-debug_interval_sec   = 30                  # Interwał debuggera v2 (gradient flow, dead neurons, update ratio)
+log_dir = "runs"
+log_interval_sec = 300
+histogram_interval_sec = 60
+enable_actor_metrics = true
+debug_interval_sec = 300

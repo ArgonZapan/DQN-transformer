@@ -31,6 +31,8 @@ class Actor {
         this.running = false;
         this.episodeEquity = 0;
         this.cumulativePnl = 0;
+        this._lastEpisodeLogTime = 0;
+        this.episodeMirror = globalConfig.training.episode_mirror ?? false;
 
         // ONNX local inference state
         this._onnxSession = null;
@@ -127,7 +129,11 @@ class Actor {
                 const episodeSteps = this.totalSteps - stepsBefore;
                 const episodeSps = episodeTime > 0 ? (episodeSteps / (episodeTime / 1000)).toFixed(0) : '?';
                 const totalSps = this._startTime ? (this.totalSteps / ((Date.now() - this._startTime) / 1000)).toFixed(1) : '?';
-                console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes} | ${episodeTime}ms | steps=${this.totalSteps} | sps=${episodeSps} (avg ${totalSps}) | trades=${this.env.getTrades().length}`);
+                const _now = Date.now();
+                if (_now - this._lastEpisodeLogTime >= 10000) {
+                    this._lastEpisodeLogTime = _now;
+                    console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes} | ${episodeTime}ms | steps=${this.totalSteps} | sps=${episodeSps} (avg ${totalSps}) | trades=${this.env.getTrades().length}`);
+                }
             } catch (err) {
                 console.error(`[Actor:${this.symbol}] Episode error: ${err.message}`);
                 await new Promise(r => setTimeout(r, 1000));
@@ -205,16 +211,17 @@ class Actor {
             this.totalSteps++;
 
             episodeLog.push({
-                price:        stepPrice,
-                timestamp:    stepTimestamp,
-                posBefore:    positionBefore,
-                posAfter:     this.env.position ? this.env.position.side : null,
-                posOpenPrice: this.env.position ? this.env.position.openPrice : null,
+                price:          stepPrice,
+                timestamp:      stepTimestamp,
+                posBefore:      positionBefore,
+                posAfter:       this.env.position ? this.env.position.side : null,
+                posOpenPrice:   this.env.position ? this.env.position.openPrice : null,
                 action,
                 wasRandom,
                 qValues,
-                reward:       result.reward,
-                mask:         maskBeforeStep,
+                reward:         result.reward,
+                rewardBreakdown: result.rewardBreakdown,
+                mask:           maskBeforeStep,
             });
         }
 
@@ -237,25 +244,33 @@ class Actor {
             modeLabel   = 'MC';
         }
 
-        this._printEpisodeLog(episodeLog, experiences);
+        const mirrorEnabled = this.episodeMirror;
+        let mirrorExperiences = null;
+        let mirrorEpisodeLog = null;
+        if (mirrorEnabled) {
+            mirrorExperiences = this._buildMirrorExperiences(episodeLog, returnMode, nStep);
+            mirrorEpisodeLog  = this._buildMirrorEpisodeLog(episodeLog, mirrorExperiences);
+        }
+
+        this._printEpisodeLog(episodeLog, experiences, 'ORYGINAŁ', false);
+        if (mirrorEnabled && mirrorExperiences) {
+            this._printEpisodeLog(mirrorEpisodeLog, mirrorExperiences, 'MIRROR', true);
+        }
 
         try {
             if (experiences.length > 0) {
-                const batch = experiences.map(step => {
+                const _toEntry = (step) => {
                     const entry = {
                         actorId:    this.symbol,
                         state:      step.state,
                         action:     step.action,
                         actionMask: step.actionMask,
                     };
-
                     if (returnMode === 'mc') {
-                        // Oryginalny tryb: returnG jako reward, done=True wszędzie
                         entry.reward    = step.returnG;
                         entry.nextState = step.nextState;
                         entry.done      = true;
                     } else {
-                        // nstep / td: prawdziwe done i nextState, gamma^n w polu gammaToN
                         entry.reward    = step.reward;
                         entry.nextState = step.nextState;
                         entry.done      = step.done;
@@ -265,7 +280,9 @@ class Actor {
                         }
                     }
                     return entry;
-                });
+                };
+
+                const batch = experiences.map(step => _toEntry(step));
 
                 // Dodaj metryki epizodu do ostatniego wpisu — learner zbiera je osobno
                 const epMetrics = this.env.getMetrics();
@@ -293,9 +310,15 @@ class Actor {
                     episode_action_close:      ac[3] || 0,
                 };
 
+                if (mirrorEnabled && mirrorExperiences) {
+                    for (const step of mirrorExperiences) {
+                        batch.push(_toEntry(step));
+                    }
+                }
+
                 const batchResp = await this.pythonClient.sendBatch(batch);
                 if (batchResp && batchResp.epsilon != null) this.epsilon = batchResp.epsilon;
-                console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes + 1}: sent ${batch.length} ${modeLabel} experiences, ε=${this.epsilon.toFixed(3)}`);
+                if (batchResp && batchResp.loss_scale != null) this.env.rewardConfig.loss_scale = batchResp.loss_scale;
             }
         } catch (err) {
             console.warn(`[Actor:${this.symbol}] Batch send failed: ${err.message}`);
@@ -334,7 +357,152 @@ class Actor {
         }
     }
 
-    _printEpisodeLog(episodeLog, mcExperiences) {
+    // ── Episode mirroring helpers ──────────────────────────────────────────
+
+    _mirrorActionMask(mask) {
+        // Swap LONG(0) ↔ SHORT(1), keep HOLD(2) and CLOSE(3)
+        return [mask[1], mask[0], mask[2], mask[3]];
+    }
+
+    _mirrorStateFeatures(state) {
+        if (!state) return null;
+        const mirrored = {};
+        for (const [tf, rows] of Object.entries(state)) {
+            if (tf === 'position') continue;
+            mirrored[tf] = rows.map(row => {
+                const r = [...row];
+                // [0]=normalizedClose negate, [1]=relativeRange unchanged,
+                // [2]=candleDirection negate, [3]=normalizedVolume unchanged,
+                // [4]=rsiNorm → 1-v, [5]=macdNorm negate,
+                // [6]=pctChange negate, [7]=aboveSma → 1-v
+                r[0] = -r[0];
+                r[2] = -r[2];
+                r[4] = 1 - r[4];
+                r[5] = -r[5];
+                r[6] = -r[6];
+                r[7] = 1 - r[7];
+                return r;
+            });
+        }
+        if (state.position) {
+            const [isLong, isShort, upnl, barsNorm] = state.position;
+            mirrored.position = [isShort, isLong, -upnl, barsNorm];
+        }
+        return mirrored;
+    }
+
+    _buildMirrorExperiences(episodeLog, returnMode, nStep) {
+        const steps = this.env.episode.steps;
+        const T = steps.length;
+        const gamma = this.config.training.gamma;
+        const gammaN = Math.pow(gamma, nStep);
+
+        // Mirrored immediate rewards: flip pnl direction via close_pnl, negate delta/unreal
+        const mirRew = episodeLog.map(row => {
+            const rb = row.rewardBreakdown || {};
+            const closeMirror = (rb.close || 0) - 2 * (rb.close_pnl || 0);
+            return (rb.open || 0) + closeMirror + (rb.idle || 0)
+                 - (rb.delta || 0) - (rb.unreal || 0) + (rb.hold || 0);
+        });
+
+        // MC returns from mirrored rewards (for display)
+        let G = 0;
+        const mcReturns = new Array(T);
+        for (let t = T - 1; t >= 0; t--) {
+            G = mirRew[t] + gamma * G;
+            mcReturns[t] = G;
+        }
+
+        const mirAction = a => (a === 0 ? 1 : (a === 1 ? 0 : a));
+
+        if (returnMode === 'mc') {
+            return steps.map((step, t) => ({
+                state:      this._mirrorStateFeatures(step.state),
+                action:     mirAction(step.action),
+                reward:     mcReturns[t],
+                nextState:  step.nextState ? this._mirrorStateFeatures(step.nextState) : null,
+                done:       true,
+                actionMask: this._mirrorActionMask(step.actionMask),
+                returnG:    mcReturns[t],
+                gammaToN:   gamma,
+            }));
+        } else if (returnMode === 'td') {
+            return steps.map((step, t) => ({
+                state:      this._mirrorStateFeatures(step.state),
+                action:     mirAction(step.action),
+                reward:     mirRew[t],
+                nextState:  step.nextState ? this._mirrorStateFeatures(step.nextState) : null,
+                done:       step.done,
+                actionMask: this._mirrorActionMask(step.actionMask),
+                returnG:    mcReturns[t],
+                gammaToN:   gamma,
+            }));
+        } else {
+            // nstep
+            const result = [];
+            for (let t = 0; t < T; t++) {
+                let reward = 0;
+                for (let k = 0; k < nStep && (t + k) < T; k++) {
+                    reward += Math.pow(gamma, k) * mirRew[t + k];
+                }
+                const endIdx = t + nStep;
+                const done = endIdx >= T;
+                const nextStep = done ? null : steps[endIdx];
+                result.push({
+                    state:          this._mirrorStateFeatures(steps[t].state),
+                    action:         mirAction(steps[t].action),
+                    reward,
+                    nextState:      nextStep ? this._mirrorStateFeatures(nextStep.state) : null,
+                    done,
+                    actionMask:     this._mirrorActionMask(steps[t].actionMask),
+                    nextActionMask: nextStep ? this._mirrorActionMask(nextStep.actionMask) : null,
+                    gammaToN:       gammaN,
+                    returnG:        mcReturns[t],
+                });
+            }
+            return result;
+        }
+    }
+
+    _buildMirrorEpisodeLog(episodeLog, mirrorExperiences) {
+        const mirPos = p => (p === 'LONG' ? 'SHORT' : (p === 'SHORT' ? 'LONG' : p));
+        const mirAction = a => (a === 0 ? 1 : (a === 1 ? 0 : a));
+        return episodeLog.map((row, i) => {
+            const rb = row.rewardBreakdown || {};
+            const closePnl = rb.close_pnl || 0;
+            const mirRb = {
+                open:      rb.open   || 0,
+                close:     (rb.close || 0) - 2 * closePnl,
+                close_pnl: -closePnl,
+                idle:      rb.idle   || 0,
+                delta:     -(rb.delta  || 0),
+                unreal:    -(rb.unreal || 0),
+                hold:      rb.hold   || 0,
+            };
+            const mirReward = mirRb.open + mirRb.close + mirRb.idle + mirRb.delta + mirRb.unreal + mirRb.hold;
+            return {
+                price:           row.price,
+                timestamp:       row.timestamp,
+                posBefore:       mirPos(row.posBefore),
+                posAfter:        mirPos(row.posAfter),
+                posOpenPrice:    row.posOpenPrice,
+                action:          mirAction(row.action),
+                wasRandom:       row.wasRandom,
+                qValues:         null,
+                reward:          mirReward,
+                rewardBreakdown: mirRb,
+                mask:            this._mirrorActionMask(row.mask),
+            };
+        });
+    }
+
+    _printEpisodeLog(episodeLog, mcExperiences, label = '', skipThrottle = false) {
+        const _now = Date.now();
+        if (!skipThrottle) {
+            if (_now - this._lastEpisodeLogTime < 10000) return;
+            this._lastEpisodeLogTime = _now;
+        }
+
         const A = ['LONG', 'SHORT', 'HOLD', 'CLOSE'];
         const metrics = this.env.getMetrics();
         const trades  = this.env.getTrades();
@@ -352,6 +520,7 @@ class Actor {
         const ACTION_COLORS = [c.green, c.red, c.gray, c.yellow];
 
         const ep = this.totalEpisodes + 1;
+        const labelStr = label ? ` ── ${label}` : '';
         const rc = this.config.reward;
         let totalNetPnl = 0;
         for (const t of trades) {
@@ -364,12 +533,18 @@ class Actor {
         const pnlStr = totalNetPnl >= 0
             ? c.green(`+${(totalNetPnl * 100).toFixed(3)}%`)
             : c.red(`${(totalNetPnl * 100).toFixed(3)}%`);
-        console.log(`\n[${this.symbol}] Episode ${ep} | Steps: ${episodeLog.length} | Trades: ${trades.length} | W:${c.green(metrics.wins)} L:${c.red(metrics.losses)} | PnL: ${pnlStr} | ε=${this.epsilon.toFixed(3)}`);
+        console.log(`\n[${this.symbol}] Episode ${ep}${labelStr} | Steps: ${episodeLog.length} | Trades: ${trades.length} | W:${c.green(metrics.wins)} L:${c.red(metrics.losses)} | PnL: ${pnlStr} | ε=${this.epsilon.toFixed(3)}`);
 
         const table = new Table({
-            head: ['#', 'Timestamp', 'Price', 'uPNL%', 'Pos', 'Src', 'Action', 'LONG', 'SHORT', 'HOLD', 'CLOSE', 'returnG'],
-            colWidths: [5, 17, 11, 8, 5, 6, 21, 10, 10, 10, 10, 11],
-            colAligns: ['right', 'left', 'right', 'right', 'middle', 'middle', 'left', 'right', 'right', 'right', 'right', 'right'],
+            head: ['#', 'Timestamp', 'Price', 'uPNL%', 'Pos', 'Src', 'Action',
+                   'LONG', 'SHORT', 'HOLD', 'CLOSE',
+                   'rOpen', 'rClose', 'rIdle', 'rΔuPnL', 'ruPnL', 'rHold', 'rΣ',
+                   'returnG'],
+            colWidths: [5, 17, 11, 8, 5, 6, 12, 10, 10, 10, 10, 9, 9, 9, 9, 9, 9, 10, 11],
+            colAligns: ['right', 'left', 'right', 'right', 'middle', 'middle', 'left',
+                        'right', 'right', 'right', 'right',
+                        'right', 'right', 'right', 'right', 'right', 'right', 'right',
+                        'right'],
             style: { head: [], border: [] },
         });
 
@@ -381,6 +556,13 @@ class Actor {
             return chosen
                 ? c.bold(ACTION_COLORS[actionIdx](str))
                 : ACTION_COLORS[actionIdx](str);
+        };
+
+        // Formatuj składową nagrody: puste gdy zero, kolorowe gdy niezerowe
+        const fmtR = v => {
+            if (v === 0 || v == null) return '';
+            const s = v >= 0 ? `+${v.toFixed(4)}` : v.toFixed(4);
+            return v >= 0 ? c.green(s) : c.red(s);
         };
 
         for (let i = 0; i < episodeLog.length; i++) {
@@ -407,22 +589,27 @@ class Actor {
             const posAfter  = row.posAfter  ? row.posAfter[0]  : '─';
 
             const src = row.wasRandom ? c.gray('rnd') : c.cyan('model');
-
-            const rewardStr = row.reward !== 0
-                ? ` r=${row.reward >= 0 ? c.green(`+${row.reward.toFixed(4)}`) : c.red(row.reward.toFixed(4))}`
-                : '';
-            const actionStr = `${ACTION_COLORS[row.action](A[row.action])}${rewardStr}`;
+            const actionStr = ACTION_COLORS[row.action](A[row.action]);
 
             const qCells = row.qValues
                 ? row.qValues.map((q, ai) => fmtQ(q, row.mask[ai] === 0, ai === row.action, ai))
                 : A.map((_, ai) => (row.mask[ai] === 0 ? '' : (ai === row.action ? c.bold('►') : '')));
+
+            const rb = row.rewardBreakdown || {};
+            const rTotal = fmtR(row.reward);
 
             const returnGVal = mc ? mc.returnG : null;
             const returnG = returnGVal != null
                 ? (returnGVal >= 0 ? c.green(`+${returnGVal.toFixed(5)}`) : c.red(returnGVal.toFixed(5)))
                 : '';
 
-            table.push([i + 1, ts, price, uPnl, `${posBefore}→${posAfter}`, src, actionStr, ...qCells, returnG]);
+            table.push([
+                i + 1, ts, price, uPnl, `${posBefore}→${posAfter}`, src, actionStr,
+                ...qCells,
+                fmtR(rb.open), fmtR(rb.close), fmtR(rb.idle),
+                fmtR(rb.delta), fmtR(rb.unreal), fmtR(rb.hold), rTotal,
+                returnG,
+            ]);
         }
 
         console.log(table.toString());

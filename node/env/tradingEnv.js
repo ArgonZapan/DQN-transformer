@@ -1,5 +1,5 @@
 const { buildState, getActionMask, precomputeIndicators, buildStateFromPrecomputed, TIMEFRAME_KEYS, TIMEFRAME_CONFIG_KEYS } = require('./state');
-const { calculateOpenPenalty, calculateReward } = require('./reward');
+const { calculateOpenPenalty, calculateReward, calculatePnLDecayed } = require('./reward');
 const { Episode } = require('./episode');
 
 const ACTIONS = { LONG: 0, SHORT: 1, HOLD: 2, CLOSE: 3 };
@@ -55,6 +55,8 @@ class TradingEnv {
         this.prevUnrealizedPnl = 0;     // poprzednie uPnL — do obliczania delty krok-po-kroku
         this._barsInTrade = 0;          // liczba kroków od otwarcia aktualnej pozycji
         this._actionCounts = [0, 0, 0, 0]; // [LONG, SHORT, HOLD, CLOSE] — zliczane co krok epizodu
+        this._gapSteps = [];            // kroki od CLOSE do następnego OPEN (między transakcjami)
+        this.minHoldSteps = config.training.min_hold_steps ?? 0;
     }
 
     setData(candlesPerTimeframe) {
@@ -111,6 +113,7 @@ class TradingEnv {
         this.prevUnrealizedPnl = 0;
         this._barsInTrade = 0;
         this._actionCounts = [0, 0, 0, 0];
+        this._gapSteps = [];
         const dataLen = this.getDataLength();
         this.currentStepIndex = this.episode.start(dataLen);
         return this._getState();
@@ -168,23 +171,33 @@ class TradingEnv {
         let reward = 0;
         let tradeClosed = false;
 
+        // Rozbicie nagrody na składowe — do wyświetlania w tabeli aktora.
+        // Wszystkie wartości są PRE-scale; reward_scale aplikowany na końcu do reward i rb łącznie.
+        const rb = { open: 0, close: 0, close_pnl: 0, idle: 0, unreal: 0, delta: 0, hold: 0 };
+
         // Zlicz każdą akcję podjętą w epizodzie (używane przez getMetrics → statystyki)
         if (action >= 0 && action < 4) this._actionCounts[action]++;
 
         if (action === ACTIONS.LONG && this.position === null) {
             this.position = new Position('LONG', currentPrice, currentTime);
             this._barsInTrade = 0;
-            reward = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
+            if (this.stepsSinceClose !== Infinity) this._gapSteps.push(this.stepsSinceClose);
+            rb.open = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
+            reward += rb.open;
             this.stepsSinceClose = Infinity;
         } else if (action === ACTIONS.SHORT && this.position === null) {
             this.position = new Position('SHORT', currentPrice, currentTime);
             this._barsInTrade = 0;
-            reward = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
+            if (this.stepsSinceClose !== Infinity) this._gapSteps.push(this.stepsSinceClose);
+            rb.open = calculateOpenPenalty(this.rewardConfig, this.stepsSinceClose);
+            reward += rb.open;
             this.stepsSinceClose = Infinity;
         } else if (action === ACTIONS.CLOSE && this.position !== null) {
             this.position.holdSteps = this._barsInTrade;
             this.position.close(currentPrice, currentTime);
-            reward = calculateReward(this.position, this.rewardConfig);
+            rb.close = calculateReward(this.position, this.rewardConfig);
+            rb.close_pnl = calculatePnLDecayed(this.position, this.rewardConfig);
+            reward += rb.close;
             this.trades.push({ ...this.position });
             this.position = null;
             this.prevUnrealizedPnl = 0;
@@ -200,6 +213,16 @@ class TradingEnv {
             this.stepsSinceClose++;
         }
 
+        // Kara za bezczynność (HOLD bez otwartej pozycji) — zwalcza action collapse.
+        // Odejmowana przy każdym kroku bez pozycji, niezależnie od akcji.
+        if (this.position === null) {
+            const idlePenalty = this.rewardConfig.idle_penalty_per_bar ?? 0;
+            if (idlePenalty > 0) {
+                rb.idle = -idlePenalty;
+                reward += rb.idle;
+            }
+        }
+
         // Intermediate reward: delta unrealized PnL w każdym kroku z otwartą pozycją.
         // Daje sygnał uczący przy HOLD zamiast reward=0 przez całe trzymanie pozycji.
         // Przy LONG/SHORT open: delta = 0 (openPrice = currentPrice → uPnl = 0 = prevUnrealizedPnl).
@@ -210,21 +233,36 @@ class TradingEnv {
                 : (this.position.openPrice - currentPrice) / this.position.openPrice;
             const delta = uPnl - this.prevUnrealizedPnl;
 
+            // Nagroda absolutna za unrealized PnL — daje kierunkowy sygnał per krok.
+            const unrealizedScale = this.rewardConfig.unrealized_reward_scale ?? 0;
+            if (unrealizedScale > 0) {
+                rb.unreal = unrealizedScale * uPnl;
+                reward += rb.unreal;
+            }
+
             // Asymetryczne skalowanie: ujemne delty (spadki/boki) mnożone przez loss_scale.
             // Pozycja idąca bokiem kumuluje ujemne netto nawet jeśli PnL ≈ 0.
             const lossScale = this.rewardConfig.loss_scale ?? 1.0;
             const scaledDelta = delta < 0 ? delta * lossScale : delta;
-
             const cap = this.rewardConfig.intermediate_reward_max;
-            reward += Math.max(-cap, Math.min(cap, scaledDelta));
+            rb.delta = Math.max(-cap, Math.min(cap, scaledDelta));
+            reward += rb.delta;
 
             // Stały koszt trzymania pozycji — penalizuje długie trzymanie nawet przy flat PnL.
             const holdPenalty = this.rewardConfig.hold_penalty_per_bar ?? 0;
-            if (holdPenalty > 0) reward -= holdPenalty;
+            if (holdPenalty > 0) {
+                rb.hold = -holdPenalty;
+                reward += rb.hold;
+            }
 
             this.prevUnrealizedPnl = uPnl;
             this.position.updateDrawdown(currentPrice);
         }
+
+        // Skalowanie całej nagrody — wzmacnia sygnał uczący (domyślnie 1.0 = brak zmiany).
+        const rewardScale = this.rewardConfig.reward_scale ?? 1.0;
+        reward *= rewardScale;
+        for (const k of Object.keys(rb)) rb[k] *= rewardScale;
 
         // Capture state BEFORE incrementing index (Bug 6: addStep used wrong state)
         const currentState = this._getState();
@@ -241,7 +279,11 @@ class TradingEnv {
         if (done && this.position !== null) {
             this.position.holdSteps = this._barsInTrade;
             this.position.close(currentPrice, currentTime);
-            reward = calculateReward(this.position, this.rewardConfig);
+            // Wymuś zamknięcie — nadpisz całą nagrodę i rb
+            for (const k of Object.keys(rb)) rb[k] = 0;
+            rb.close = calculateReward(this.position, this.rewardConfig) * rewardScale;
+            rb.close_pnl = calculatePnLDecayed(this.position, this.rewardConfig) * rewardScale;
+            reward = rb.close;
             this.trades.push({ ...this.position });
             this.position = null;
             this.prevUnrealizedPnl = 0;
@@ -249,7 +291,7 @@ class TradingEnv {
         }
 
         const nextState = done ? null : this._getState();
-        const actionMask = getActionMask(this.position);
+        const actionMask = this.getActionMask();
 
         this.episode.addStep(
             currentState,
@@ -260,11 +302,16 @@ class TradingEnv {
             actionMask
         );
 
-        return { nextState, reward, done, actionMask };
+        return { nextState, reward, done, actionMask, rewardBreakdown: rb };
     }
 
     getActionMask() {
-        return getActionMask(this.position);
+        const mask = getActionMask(this.position);
+        // Blokuj CLOSE przez pierwsze minHoldSteps kroków od otwarcia pozycji.
+        if (this.position !== null && this.minHoldSteps > 0 && this._barsInTrade < this.minHoldSteps) {
+            mask[3] = 0;
+        }
+        return mask;
     }
 
     getCurrentPrice() {
@@ -294,6 +341,7 @@ class TradingEnv {
                 profit_sum: 0, loss_sum: 0,
                 win_hold_steps: 0, loss_hold_steps: 0,
                 mfe_sum: 0,
+                gap_steps: [],
                 long_opens:    ac[0], short_opens: ac[1],
                 action_counts: [ac[0], ac[1], ac[2], ac[3]],
             };
@@ -346,6 +394,7 @@ class TradingEnv {
             win_hold_steps:         winHoldSteps,
             loss_hold_steps:        lossHoldSteps,
             mfe_sum:                mfeSum,
+            gap_steps:              this._gapSteps.slice(),
             long_opens:             ac[0],
             short_opens:            ac[1],
             action_counts:          [ac[0], ac[1], ac[2], ac[3]],
