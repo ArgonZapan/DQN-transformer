@@ -533,7 +533,10 @@ class Actor {
         const pnlStr = totalNetPnl >= 0
             ? c.green(`+${(totalNetPnl * 100).toFixed(3)}%`)
             : c.red(`${(totalNetPnl * 100).toFixed(3)}%`);
-        console.log(`\n[${this.symbol}] Episode ${ep}${labelStr} | Steps: ${episodeLog.length} | Trades: ${trades.length} | W:${c.green(metrics.wins)} L:${c.red(metrics.losses)} | PnL: ${pnlStr} | ε=${this.epsilon.toFixed(3)}`);
+        const avgSps = this._startTime && this.totalSteps > 0
+            ? (this.totalSteps / ((Date.now() - this._startTime) / 1000)).toFixed(1)
+            : '?';
+        console.log(`\n[${this.symbol}] Episode ${ep}${labelStr} | Steps: ${episodeLog.length} | Trades: ${trades.length} | W:${c.green(metrics.wins)} L:${c.red(metrics.losses)} | PnL: ${pnlStr} | ε=${this.epsilon.toFixed(3)} | sps=${avgSps}`);
 
         const table = new Table({
             head: ['#', 'Timestamp', 'Price', 'uPNL%', 'Pos', 'Src', 'Action',
