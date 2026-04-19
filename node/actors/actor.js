@@ -130,7 +130,7 @@ class Actor {
                 const episodeSps = episodeTime > 0 ? (episodeSteps / (episodeTime / 1000)).toFixed(0) : '?';
                 const totalSps = this._startTime ? (this.totalSteps / ((Date.now() - this._startTime) / 1000)).toFixed(1) : '?';
                 const _now = Date.now();
-                if (_now - this._lastEpisodeLogTime >= 10000) {
+                if (_now - this._lastEpisodeLogTime >= 5000) {
                     this._lastEpisodeLogTime = _now;
                     console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes} | ${episodeTime}ms | steps=${this.totalSteps} | sps=${episodeSps} (avg ${totalSps}) | trades=${this.env.getTrades().length}`);
                 }
@@ -252,9 +252,13 @@ class Actor {
             mirrorEpisodeLog  = this._buildMirrorEpisodeLog(episodeLog, mirrorExperiences);
         }
 
-        this._printEpisodeLog(episodeLog, experiences, 'ORYGINAŁ', false);
-        if (mirrorEnabled && mirrorExperiences) {
-            this._printEpisodeLog(mirrorEpisodeLog, mirrorExperiences, 'MIRROR', true);
+        const _now = Date.now();
+        if (_now - this._lastEpisodeLogTime >= 5000) {
+            this._lastEpisodeLogTime = _now;
+            this._printEpisodeLog(episodeLog, experiences, mirrorEnabled ? 'ORYGINAŁ' : '');
+            if (mirrorEnabled && mirrorExperiences) {
+                this._printEpisodeLog(mirrorEpisodeLog, mirrorExperiences, 'MIRROR');
+            }
         }
 
         try {
@@ -496,12 +500,7 @@ class Actor {
         });
     }
 
-    _printEpisodeLog(episodeLog, mcExperiences, label = '', skipThrottle = false) {
-        const _now = Date.now();
-        if (!skipThrottle) {
-            if (_now - this._lastEpisodeLogTime < 10000) return;
-            this._lastEpisodeLogTime = _now;
-        }
+    _printEpisodeLog(episodeLog, mcExperiences, label = '') {
 
         const A = ['LONG', 'SHORT', 'HOLD', 'CLOSE'];
         const metrics = this.env.getMetrics();
