@@ -28,10 +28,10 @@ num_threads = 4         # wątki CPU dla torch (operacje poza GPU)
 # ── Okna czasowe ───────────────────────────────────────────────────────────────
 # Liczba świec na każdy timeframe w stanie sieci. 0 = wyłączony TF.
 [timeframes]
-candles_1m  = 30
-candles_15m = 24
+candles_1m  = 60
+candles_15m = 32
 candles_1h  = 48
-candles_1d  = 30
+candles_1d  = 14
 candles_1w  = 0
 
 # ── Monitor (dashboard) ────────────────────────────────────────────────────────
@@ -76,17 +76,17 @@ n_step = 5                      # horyzont n-krokowy (tylko przy return_mode = "
 
 compile_model = false           # torch.compile — przyspiesza trening, wymaga PyTorch 2+
 
-min_hold_steps = 5              # minimalna liczba kroków od otwarcia przed możliwością zamknięcia
+min_hold_steps = 4              # minimalna liczba kroków od otwarcia przed możliwością zamknięcia
 
 lr_scheduler = "none"           # "none" | "cosine" — scheduler LR zsynchronizowany z epsilon
 lr_min = 1e-5                   # dolna granica LR dla schedulera cosine
 
-hold_bias_min = 0.3             # minimalna szansa na HOLD przy losowej eksploracji
-hold_bias_max = 0.7             # maksymalna szansa na HOLD przy losowej eksploracji
+hold_bias_min = 0.15             # minimalna szansa na HOLD przy losowej eksploracji
+hold_bias_max = 0.8             # maksymalna szansa na HOLD przy losowej eksploracji
 
-epsilon_reset_target   = 0.80   # docelowy epsilon przy /ereset
-epsilon_reset_duration = 5000   # na ile kroków epsilon_reset_target jest utrzymywany
-episode_mirror         = true   # dublowanie epizodów LONG→SHORT, balansuje dane treningowe
+epsilon_reset_target   = 0.50   # docelowy epsilon przy /ereset
+epsilon_reset_duration = 10000   # na ile kroków epsilon_reset_target jest utrzymywany
+episode_mirror         = false   # dublowanie epizodów LONG→SHORT, balansuje dane treningowe
 
 # ── Prioritized Experience Replay ──────────────────────────────────────────────
 [per]
@@ -104,9 +104,9 @@ num_actions = 4              # LONG, SHORT, HOLD, CLOSE
 n_transformer_blocks = 3     # liczba bloków Transformer encoder
 n_attention_heads = 4        # głowice uwagi per blok
 key_dim = 32                 # wymiar klucza/zapytania per głowicę
-ff_dim = 256                 # wymiar warstwy feed-forward w bloku
+ff_dim = 512                 # wymiar warstwy feed-forward w bloku
 conv_kernel_size = 3         # kernel Conv1D (ekstrakcja lokalnych wzorców)
-conv1d_filters = 128         # liczba filtrów Conv1D
+conv1d_filters = 256         # liczba filtrów Conv1D
 
 # ── Cechy wejściowe ────────────────────────────────────────────────────────────
 [features]
