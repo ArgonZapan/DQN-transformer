@@ -45,7 +45,7 @@ dashboard_poll_interval_sec = 60 # jak często monitor odpytuje aktorów
 # ── Trening ────────────────────────────────────────────────────────────────────
 [training]
 gamma = 0.97                    # współczynnik dyskontowania nagród
-lr = 2.5e-5                     # learning rate (nadpisuje checkpoint przy resume)
+lr = 5.0e-5                     # learning rate (nadpisuje checkpoint przy resume)
 batch_size = 256
 buffer_capacity = 1000000       # maksymalna pojemność bufora PER
 min_buffer_size = 50000         # minimalna liczba doświadczeń przed startem treningu
@@ -53,7 +53,7 @@ target_update_interval = 1000   # co ile kroków synchronizować sieć docelową
 
 epsilon_start = 1.0             # eksploracja na początku treningu
 epsilon_end = 0.1               # minimalna eksploracja
-epsilon_decay_fraction = 0.5    # po jakim ułamku łącznych kroków epsilon osiąga minimum
+epsilon_decay_fraction = 0.15    # po jakim ułamku łącznych kroków epsilon osiąga minimum
 
 dropout = 0.2
 seed = 42
@@ -110,7 +110,7 @@ conv1d_filters = 256         # liczba filtrów Conv1D
 
 # ── Cechy wejściowe ────────────────────────────────────────────────────────────
 [features]
-num_features = 8   # musi zgadzać się z liczbą cech w state.js (buildFeatures)
+num_features = 11  # musi zgadzać się z liczbą cech w state.js (buildFeatures)
 use_ohlcv = true
 use_rsi   = true
 use_macd  = true
@@ -137,7 +137,7 @@ use_sma20 = true
 [reward]
 commission_open  = 0.00075   # prowizja Binance za otwarcie (taker)
 commission_close = 0.00075   # prowizja Binance za zamknięcie (taker)
-trade_penalty    = 0.00025    # dodatkowa kara za każde otwarcie pozycji
+trade_penalty    = 0.00000    # dodatkowa kara za każde otwarcie pozycji
 close_penalty    = 0.0       # dodatkowa kara za zamknięcie (0 = brak)
 
 post_close_cooldown_steps = 12  # trade_penalty x2 gdy nowe otwarcie < N kroków po zamknięciu
@@ -149,13 +149,13 @@ hold_penalty_per_bar = 0.0002  # kara per krok za trzymanie otwartej pozycji (an
 time_decay_hours     = 4.0     # half-life PnL: po N godzinach realizowany PnL * 0.5
 drawdown_penalty     = 0.0     # kara proporcjonalna do max drawdown podczas trzymania
 
-idle_penalty_per_bar = 0.0001  # kara per krok bez otwartej pozycji (anty-HOLD collapse)
+idle_penalty_per_bar = 0.0002  # kara per krok bez otwartej pozycji (anty-HOLD collapse)
 
 clip_min = -1.0   # dolny clip całkowitej nagrody per krok (przed reward_scale)
 clip_max =  1.0   # górny clip całkowitej nagrody per krok
 
 reward_scale          = 10.0  # globalny mnożnik wszystkich nagród (wzmacnia sygnał)
-unrealized_reward_scale = 0.01 # mnożnik absolutnego uPnL dodawanego per krok z pozycją
+unrealized_reward_scale = 0.02 # mnożnik absolutnego uPnL dodawanego per krok z pozycją
 
 # ── Dane historyczne ────────────────────────────────────────────────────────────
 [data]

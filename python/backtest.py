@@ -235,6 +235,53 @@ def precompute_features_v2(candles: list, norm_window: int) -> np.ndarray:
     return out
 
 
+def precompute_features_combined(candles: list, norm_window: int) -> np.ndarray:
+    """
+    11 cech (v1+v2 bez duplikatów). Zwraca float32 [N, 11].
+      0: normalizedClose, 1: relativeRange,  2: candleDirection,
+      3: volumeClipped,   4: rsiNorm,        5: stochasticK,
+      6: macdNorm,        7: macdHistNorm,   8: pctChange,
+      9: bollingerWidth, 10: smaDistance
+    """
+    n = len(candles)
+    closes  = np.array([c['close']  for c in candles], dtype=np.float64)
+    opens   = np.array([c['open']   for c in candles], dtype=np.float64)
+    highs   = np.array([c['high']   for c in candles], dtype=np.float64)
+    lows    = np.array([c['low']    for c in candles], dtype=np.float64)
+    volumes = np.array([c['volume'] for c in candles], dtype=np.float64)
+
+    mean_c    = _rolling_mean_np(closes, norm_window)
+    std_c     = _rolling_std_np(closes, norm_window)
+    rsi       = _rsi_np(closes)
+    ema12     = _ema_np(closes, 12)
+    ema26     = _ema_np(closes, 26)
+    macd_line = ema12 - ema26
+    signal    = _ema_np(macd_line, 9)
+    sma20     = _rolling_mean_np(closes, 20)
+    std20     = _rolling_std_np(closes, 20)
+    mean_vol  = _rolling_mean_np(volumes, norm_window)
+    stoch_k   = _stochastic_k_np(highs, lows, closes)
+
+    prev_closes = np.empty(n, dtype=np.float64)
+    prev_closes[0] = closes[0]
+    prev_closes[1:] = closes[:-1]
+
+    out = np.zeros((n, 11), dtype=np.float32)
+    out[:, 0]  = np.where(std_c != 0,      (closes - mean_c) / np.where(std_c != 0,      std_c,    1.0), 0.0)
+    out[:, 1]  = np.where(closes != 0,     (highs - lows)    / np.where(closes != 0,     closes,   1.0), 0.0)
+    out[:, 2]  = np.where(closes != 0,     (closes - opens)  / np.where(closes != 0,     closes,   1.0), 0.0)
+    out[:, 3]  = np.where(mean_vol != 0,   np.minimum(volumes / np.where(mean_vol != 0,  mean_vol, 1.0), 3.0), 0.0)
+    out[:, 4]  = rsi / 100.0
+    out[:, 5]  = stoch_k.astype(np.float32)
+    out[:, 6]  = np.where(closes != 0,     macd_line / np.where(closes != 0,             closes,   1.0), 0.0)
+    out[:, 7]  = np.where(closes != 0,     (macd_line - signal) / np.where(closes != 0,  closes,   1.0), 0.0)
+    out[:, 8]  = np.where(prev_closes != 0, (closes - prev_closes) / np.where(prev_closes != 0, prev_closes, 1.0), 0.0)
+    out[:, 9]  = np.where(sma20 != 0,      (4 * std20) / np.where(sma20 != 0,            sma20,    1.0), 0.0)
+    out[:, 10] = np.where(closes != 0,     (closes - sma20)  / np.where(closes != 0,     closes,   1.0), 0.0)
+
+    return out
+
+
 def build_alignment_map(candles_1m: list, candles_tf: list) -> np.ndarray:
     """
     For each 1m candle index, find how many TF candles have close_time <= that 1m close_time.
@@ -315,7 +362,7 @@ def precompute_all(all_candles: dict, config: dict) -> dict:
         if not candles:
             continue
         print(f"[Backtest] Pre-computing features for {tf_name} ({len(candles)} candles)...")
-        result['features'][tf_name] = precompute_features(candles, norm_w)
+        result['features'][tf_name] = precompute_features_combined(candles, norm_w)
         if tf_name != '1m':
             result['alignment'][tf_name] = build_alignment_map(candles_1m, candles)
 
@@ -541,15 +588,30 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
         t_ms = candle['close_time']
         price = candle['close']
 
-        # Cechy pozycji: [is_long, is_short, unrealized_pnl, bars_norm]
+        # Cechy czasu: sin/cos godziny (24h) + sin/cos dnia tygodnia (168h) + is_weekend
+        import math as _math
+        _dt = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc)
+        _hour_frac = (_dt.hour + _dt.minute / 60) / 24
+        _week_frac = (_dt.weekday() * 24 + _dt.hour + _dt.minute / 60) / 168
+        _sin_hour  = _math.sin(2 * _math.pi * _hour_frac)
+        _cos_hour  = _math.cos(2 * _math.pi * _hour_frac)
+        _sin_week  = _math.sin(2 * _math.pi * _week_frac)
+        _cos_week  = _math.cos(2 * _math.pi * _week_frac)
+        _is_weekend = 1.0 if _dt.weekday() >= 5 else 0.0
+
+        # Cechy pozycji: [is_long, is_short, unrealized_pnl, hold_6h, hold_48h, sin_hour, cos_hour, sin_week, cos_week, is_weekend]
+        _step_interval = config.get('training', {}).get('step_interval', 15)
         if position is not None:
             is_long  = 1 if position.side == 'LONG'  else 0
             is_short = 1 if position.side == 'SHORT' else 0
             upnl = ((price - position.open_price) / position.open_price if is_long
                     else (position.open_price - price) / position.open_price)
-            pos_feat = [is_long, is_short, upnl, min(bars_in_trade / 200, 1.0)]
+            _minutes = bars_in_trade * _step_interval
+            pos_feat = [is_long, is_short, upnl,
+                        min(_minutes / 360, 1.0), min(_minutes / 2880, 1.0),
+                        _sin_hour, _cos_hour, _sin_week, _cos_week, _is_weekend]
         else:
-            pos_feat = [0, 0, 0, 0]
+            pos_feat = [0, 0, 0, 0, 0, _sin_hour, _cos_hour, _sin_week, _cos_week, _is_weekend]
 
         state = build_state_fast(precomp, abs_idx, config)
         mask = action_mask_for(position)

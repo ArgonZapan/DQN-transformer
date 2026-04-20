@@ -9,7 +9,20 @@ const TIMEFRAME_CONFIG_KEYS = {
     '1d': 'candles_1d',
     '1w': 'candles_1w'
 };
-const NUM_FEATURES = 8;
+const NUM_FEATURES = 11;
+
+// 11 cech (v1+v2 bez duplikatów):
+//   0: normalizedClose   — z-score close (okno normWindow)
+//   1: relativeRange     — (H-L)/close
+//   2: candleDirection   — (close-open)/close
+//   3: volumeClipped     — min(vol/meanVol, 3.0)
+//   4: rsiNorm           — RSI(14)/100
+//   5: stochasticK       — (close-min14)/(max14-min14)
+//   6: macdNorm          — macdLine/close
+//   7: macdHistNorm      — (macdLine-signal)/close
+//   8: pctChange         — (close-prevClose)/prevClose
+//   9: bollingerWidth    — 4*std20/sma20
+//  10: smaDistance       — (close-sma20)/close
 
 function buildFeatures(candles, normWindow) {
     if (candles.length === 0) return [];
@@ -23,9 +36,11 @@ function buildFeatures(candles, normWindow) {
     const mean = rollingMean(closes, normWindow);
     const std = rollingStd(closes, normWindow);
     const rsi = calculateRSI(closes);
-    const { macdLine } = calculateMACD(closes);
+    const { macdLine, signalLine } = calculateMACD(closes);
     const sma20 = calculateSMA(closes, 20);
+    const std20 = rollingStd(closes, 20);
     const meanVolume = rollingMean(volumes, normWindow);
+    const stochK = calculateStochasticK(Array.from(highs), Array.from(lows), Array.from(closes));
 
     const features = [];
 
@@ -35,26 +50,20 @@ function buildFeatures(candles, normWindow) {
         const h = highs[i];
         const l = lows[i];
         const v = volumes[i];
-
-        const normalizedClose = std[i] !== 0 ? (c - mean[i]) / std[i] : 0;
-        const relativeRange = c !== 0 ? (h - l) / c : 0;
-        const candleDirection = c !== 0 ? (c - o) / c : 0;
-        const normalizedVolume = meanVolume[i] !== 0 ? v / meanVolume[i] : 0;
-        const rsiNorm = rsi[i] / 100;
-        const macdNorm = c !== 0 ? macdLine[i] / c : 0;
         const prevClose = i > 0 ? closes[i - 1] : c;
-        const pctChange = prevClose !== 0 ? (c - prevClose) / prevClose : 0;
-        const aboveSma = c > sma20[i] ? 1.0 : 0.0;
 
         features.push([
-            normalizedClose,
-            relativeRange,
-            candleDirection,
-            normalizedVolume,
-            rsiNorm,
-            macdNorm,
-            pctChange,
-            aboveSma
+            std[i]        !== 0 ? (c - mean[i]) / std[i]                    : 0, // 0 normalizedClose
+            c             !== 0 ? (h - l) / c                               : 0, // 1 relativeRange
+            c             !== 0 ? (c - o) / c                               : 0, // 2 candleDirection
+            meanVolume[i] !== 0 ? Math.min(v / meanVolume[i], 3.0)          : 0, // 3 volumeClipped
+            rsi[i] / 100,                                                         // 4 rsiNorm
+            stochK[i],                                                            // 5 stochasticK
+            c             !== 0 ? macdLine[i] / c                           : 0, // 6 macdNorm
+            c             !== 0 ? (macdLine[i] - signalLine[i]) / c         : 0, // 7 macdHistNorm
+            prevClose     !== 0 ? (c - prevClose) / prevClose               : 0, // 8 pctChange
+            sma20[i]      !== 0 ? (4 * std20[i]) / sma20[i]                : 0, // 9 bollingerWidth
+            c             !== 0 ? (c - sma20[i]) / c                        : 0, // 10 smaDistance
         ]);
     }
 
@@ -94,7 +103,7 @@ function buildState(allCandlesPerTf, currentTime, config) {
             const features = buildFeatures(aligned, normWindow);
             const padding = numCandles - aligned.length;
             const paddedFeatures = [];
-            for (let i = 0; i < padding; i++) paddedFeatures.push([0, 0, 0, 0, 0, 0, 0, 0]);
+            for (let i = 0; i < padding; i++) paddedFeatures.push([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
             state[tf] = paddedFeatures.concat(features);
         } else {
             state[tf] = buildFeatures(aligned, normWindow);
@@ -130,31 +139,39 @@ function precomputeIndicators(candles, normWindow) {
     const mean       = rollingMean(Array.from(closes), normWindow);
     const std        = rollingStd(Array.from(closes), normWindow);
     const rsi        = calculateRSI(Array.from(closes));
-    const { macdLine } = calculateMACD(Array.from(closes));
+    const { macdLine, signalLine } = calculateMACD(Array.from(closes));
     const sma20      = calculateSMA(Array.from(closes), 20);
+    const std20      = rollingStd(Array.from(closes), 20);
     const meanVolume = rollingMean(Array.from(volumes), normWindow);
+    const stochK     = calculateStochasticK(Array.from(highs), Array.from(lows), Array.from(closes));
 
     const f = [
-        new Float64Array(n), // 0: normalizedClose
-        new Float64Array(n), // 1: relativeRange
-        new Float64Array(n), // 2: candleDirection
-        new Float64Array(n), // 3: normalizedVolume
-        new Float64Array(n), // 4: rsiNorm
-        new Float64Array(n), // 5: macdNorm
-        new Float64Array(n), // 6: pctChange
-        new Float64Array(n), // 7: aboveSma
+        new Float64Array(n), //  0: normalizedClose
+        new Float64Array(n), //  1: relativeRange
+        new Float64Array(n), //  2: candleDirection
+        new Float64Array(n), //  3: volumeClipped
+        new Float64Array(n), //  4: rsiNorm
+        new Float64Array(n), //  5: stochasticK
+        new Float64Array(n), //  6: macdNorm
+        new Float64Array(n), //  7: macdHistNorm
+        new Float64Array(n), //  8: pctChange
+        new Float64Array(n), //  9: bollingerWidth
+        new Float64Array(n), // 10: smaDistance
     ];
 
     for (let i = 0; i < n; i++) {
         const c = closes[i], o = opens[i], h = highs[i], l = lows[i], v = volumes[i];
-        f[0][i] = std[i]        !== 0 ? (c - mean[i]) / std[i]        : 0;
-        f[1][i] = c             !== 0 ? (h - l) / c                   : 0;
-        f[2][i] = c             !== 0 ? (c - o) / c                   : 0;
-        f[3][i] = meanVolume[i] !== 0 ? v / meanVolume[i]             : 0;
-        f[4][i] = rsi[i] / 100;
-        f[5][i] = c             !== 0 ? macdLine[i] / c               : 0;
-        f[6][i] = i > 0 && closes[i - 1] !== 0 ? (c - closes[i - 1]) / closes[i - 1] : 0;
-        f[7][i] = c > sma20[i] ? 1.0 : 0.0;
+        f[0][i]  = std[i]        !== 0 ? (c - mean[i]) / std[i]                : 0;
+        f[1][i]  = c             !== 0 ? (h - l) / c                           : 0;
+        f[2][i]  = c             !== 0 ? (c - o) / c                           : 0;
+        f[3][i]  = meanVolume[i] !== 0 ? Math.min(v / meanVolume[i], 3.0)      : 0;
+        f[4][i]  = rsi[i] / 100;
+        f[5][i]  = stochK[i];
+        f[6][i]  = c             !== 0 ? macdLine[i] / c                       : 0;
+        f[7][i]  = c             !== 0 ? (macdLine[i] - signalLine[i]) / c     : 0;
+        f[8][i]  = i > 0 && closes[i - 1] !== 0 ? (c - closes[i - 1]) / closes[i - 1] : 0;
+        f[9][i]  = sma20[i]      !== 0 ? (4 * std20[i]) / sma20[i]            : 0;
+        f[10][i] = c             !== 0 ? (c - sma20[i]) / c                    : 0;
     }
 
     return f;
@@ -170,11 +187,12 @@ function assembleFeaturesFromPrecomputed(f, startIdx, endIdx, numCandles) {
     const result    = new Array(numCandles);
 
     for (let i = 0; i < padding; i++) {
-        result[i] = [0, 0, 0, 0, 0, 0, 0, 0];
+        result[i] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     }
     for (let i = 0; i < actualLen; i++) {
         const si = startIdx + i;
-        result[padding + i] = [f[0][si], f[1][si], f[2][si], f[3][si], f[4][si], f[5][si], f[6][si], f[7][si]];
+        result[padding + i] = [f[0][si], f[1][si], f[2][si], f[3][si], f[4][si], f[5][si],
+                               f[6][si], f[7][si], f[8][si], f[9][si], f[10][si]];
     }
 
     return result;
@@ -287,7 +305,7 @@ function assembleFeaturesFromPrecomputedV2(f, startIdx, endIdx, numCandles) {
     const result    = new Array(numCandles);
 
     for (let i = 0; i < padding; i++) {
-        result[i] = [0, 0, 0, 0, 0, 0, 0, 0];
+        result[i] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     }
     for (let i = 0; i < actualLen; i++) {
         const si = startIdx + i;
