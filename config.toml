@@ -47,7 +47,7 @@ dashboard_poll_interval_sec = 60 # jak często monitor odpytuje aktorów
 gamma = 0.97                    # współczynnik dyskontowania nagród
 lr = 5.0e-5                     # learning rate (nadpisuje checkpoint przy resume)
 batch_size = 256
-buffer_capacity = 1000000       # maksymalna pojemność bufora PER
+buffer_capacity = 500000        # maksymalna pojemność bufora PER
 min_buffer_size = 50000         # minimalna liczba doświadczeń przed startem treningu
 target_update_interval = 1000   # co ile kroków synchronizować sieć docelową
 
