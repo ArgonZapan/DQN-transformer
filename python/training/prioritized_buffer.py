@@ -131,8 +131,8 @@ class PrioritizedReplayBuffer:
         r = torch.zeros(self.capacity, dtype=torch.float32)
         d = torch.zeros(self.capacity, dtype=torch.float32)
         m = torch.zeros(self.capacity, self.num_actions, dtype=torch.float32)
-        pf  = torch.zeros(self.capacity, 4, dtype=torch.float32)
-        npf = torch.zeros(self.capacity, 4, dtype=torch.float32)
+        pf  = torch.zeros(self.capacity, 10, dtype=torch.float32)
+        npf = torch.zeros(self.capacity, 10, dtype=torch.float32)
         self.actions = a.pin_memory() if self.use_pin else a
         self.rewards = r.pin_memory() if self.use_pin else r
         self.dones = d.pin_memory() if self.use_pin else d
@@ -214,10 +214,10 @@ class PrioritizedReplayBuffer:
             self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
 
         pf = state.get('position') if isinstance(state, dict) else None
-        self.pos_features[idx] = torch.tensor(pf[:4], dtype=torch.float32) if pf is not None else torch.zeros(4)
+        self.pos_features[idx] = torch.tensor(pf[:10], dtype=torch.float32) if pf is not None else torch.zeros(10)
 
         npf = next_state.get('position') if isinstance(next_state, dict) else None
-        self.next_pos_features[idx] = torch.tensor(npf[:4], dtype=torch.float32) if npf is not None else torch.zeros(4)
+        self.next_pos_features[idx] = torch.tensor(npf[:10], dtype=torch.float32) if npf is not None else torch.zeros(10)
 
         if td_error is not None:
             td_val = abs(td_error) if np.isfinite(td_error) else self.max_priority
@@ -272,15 +272,15 @@ class PrioritizedReplayBuffer:
                     masks[i] = arr
         self.action_masks[positions] = torch.from_numpy(masks)
 
-        pf = np.zeros((n, 4), dtype=np.float32)
-        npf = np.zeros((n, 4), dtype=np.float32)
+        pf = np.zeros((n, 10), dtype=np.float32)
+        npf = np.zeros((n, 10), dtype=np.float32)
         for i, (state, _, _, next_state, _, _) in enumerate(experiences):
             p = state.get('position') if isinstance(state, dict) else None
             if p is not None:
-                pf[i] = np.asarray(p[:4], dtype=np.float32)
+                pf[i] = np.asarray(p[:10], dtype=np.float32)
             np_ = next_state.get('position') if isinstance(next_state, dict) else None
             if np_ is not None:
-                npf[i] = np.asarray(np_[:4], dtype=np.float32)
+                npf[i] = np.asarray(np_[:10], dtype=np.float32)
         self.pos_features[positions] = torch.from_numpy(pf)
         self.next_pos_features[positions] = torch.from_numpy(npf)
 
