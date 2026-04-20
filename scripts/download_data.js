@@ -132,46 +132,57 @@ function klineToCsvRow(kline) {
     ].join(',');
 }
 
-async function downloadData(symbol, interval, days, outputDir) {
+async function downloadData(symbol, interval, days, outputDir, concurrency = 50) {
     const intervalMs = INTERVAL_MS[interval];
     if (!intervalMs) {
         throw new Error(`Unsupported interval: ${interval}. Supported: ${Object.keys(INTERVAL_MS).join(', ')}`);
     }
 
+    const resolvedOutput = path.resolve(path.join(__dirname, '..'), outputDir);
+    const filepath = path.join(resolvedOutput, `${symbol}_${interval}.csv`);
+    if (fs.existsSync(filepath)) {
+        console.log(`  SKIP: ${symbol} ${interval} — plik już istnieje (${filepath})`);
+        return filepath;
+    }
+
     const endTime = Date.now();
     const startTime = endTime - (days * 24 * 60 * 60 * 1000);
+    const chunkMs = MAX_LIMIT * intervalMs;
+
+    // Wygeneruj wszystkie chunki z góry
+    const chunks = [];
+    for (let t = startTime; t < endTime; t += chunkMs) {
+        chunks.push({ start: t, end: Math.min(t + chunkMs, endTime) });
+    }
 
     const totalCandles = Math.ceil((endTime - startTime) / intervalMs);
-    console.log(`Downloading ${symbol} ${interval} data: ~${totalCandles} candles (${days} days)`);
+    console.log(`Downloading ${symbol} ${interval} data: ~${totalCandles} candles (${days} days), ${chunks.length} requests, concurrency=${concurrency}`);
 
-    const resolvedOutput = path.resolve(path.join(__dirname, '..'), outputDir);
     if (!fs.existsSync(resolvedOutput)) {
         fs.mkdirSync(resolvedOutput, { recursive: true });
     }
 
-    const allKlines = [];
-    let currentStart = startTime;
-    let requestCount = 0;
+    // Pula: zawsze `concurrency` żądań aktywnych jednocześnie
+    const results = new Array(chunks.length);
+    let dispatched = 0;
+    let completed = 0;
 
-    while (currentStart < endTime) {
-        const currentEnd = Math.min(currentStart + MAX_LIMIT * intervalMs, endTime);
-        const klines = await fetchWithRetry(symbol, interval, currentStart, currentEnd, MAX_LIMIT);
-
-        if (klines.length === 0) break;
-
-        allKlines.push(...klines);
-        requestCount++;
-
-        const lastTimestamp = klines[klines.length - 1][0];
-        currentStart = lastTimestamp + intervalMs;
-
-        if (requestCount % 10 === 0) {
-            const progress = ((currentStart - startTime) / (endTime - startTime) * 100).toFixed(1);
-            console.log(`  Progress: ${progress}% (${allKlines.length} candles, ${requestCount} requests)`);
+    async function worker() {
+        while (dispatched < chunks.length) {
+            const idx = dispatched++;
+            const { start, end } = chunks[idx];
+            results[idx] = await fetchWithRetry(symbol, interval, start, end, MAX_LIMIT);
+            completed++;
+            if (completed % concurrency === 0 || completed === chunks.length) {
+                const pct = (completed / chunks.length * 100).toFixed(1);
+                console.log(`  Progress: ${pct}% (${completed}/${chunks.length} requests done)`);
+            }
         }
-
-        await sleep(100);
     }
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, worker));
+
+    const allKlines = results.flat();
 
     const deduplicated = [];
     const seen = new Set();
@@ -188,12 +199,10 @@ async function downloadData(symbol, interval, days, outputDir) {
     const csvRows = [header, ...deduplicated.map(klineToCsvRow)];
     const csvContent = csvRows.join('\n') + '\n';
 
-    const filename = `${symbol}_${interval}.csv`;
-    const filepath = path.join(resolvedOutput, filename);
     fs.writeFileSync(filepath, csvContent, 'utf-8');
 
     console.log(`\nDone! Saved ${deduplicated.length} candles to ${filepath}`);
-    console.log(`  Requests: ${requestCount}`);
+    console.log(`  Requests: ${chunks.length}`);
     console.log(`  Period: ${new Date(deduplicated[0][0]).toISOString()} — ${new Date(deduplicated[deduplicated.length - 1][0]).toISOString()}`);
 
     return filepath;

@@ -52,7 +52,7 @@ class HealthRunner:
         sample = self.trainer.buffer.sample(n)
         states       = sample[0]
         action_masks = sample[5]
-        pos_features = sample[6]   # [n, 4] — kontekst pozycji (is_long, is_short, pnl, bars)
+        pos_features = sample[6]   # [n, 10] — kontekst pozycji + czas
 
         network = self.trainer.main_network
         device = self.trainer.device

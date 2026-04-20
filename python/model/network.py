@@ -125,24 +125,28 @@ class TradingDQN(nn.Module):
             self.transformer_blocks = nn.ModuleList()
             trunk_dim = concat_dim
 
+        trunk_h1 = self.conv_filters * 4  # np. 64→256, 256→1024
+        trunk_h2 = self.conv_filters * 2  # np. 64→128, 256→512
         self.trunk = nn.Sequential(
-            nn.Linear(trunk_dim, 512),
+            nn.Linear(trunk_dim, trunk_h1),
             nn.GELU(),
             nn.Dropout(self.dropout),
-            nn.Linear(512, 256),
+            nn.Linear(trunk_h1, trunk_h2),
             nn.GELU(),
             nn.Dropout(self.dropout)
         )
 
-        # Gałąź pozycji: [is_long, is_short, unrealized_pnl, bars_in_trade] → 32
+        # Gałąź pozycji: [is_long, is_short, unrealized_pnl, hold_6h, hold_48h,
+        #                  sin_hour, cos_hour, sin_week, cos_week, is_weekend] → 32
         self.pos_fc = nn.Sequential(
-            nn.Linear(4, 32),
+            nn.Linear(10, 32),
             nn.GELU(),
         )
 
-        # Dueling Architecture: trunk(256) + pos(32) = 288
-        self.value_stream = nn.Linear(288, 1)
-        self.advantage_stream = nn.Linear(288, self.num_actions)
+        # Dueling Architecture: trunk(trunk_h2) + pos(32)
+        dueling_dim = trunk_h2 + 32
+        self.value_stream = nn.Linear(dueling_dim, 1)
+        self.advantage_stream = nn.Linear(dueling_dim, self.num_actions)
 
         # Inicjalizacja głowic do bliskich zera — zapobiega wczesnemu action collapse
         nn.init.uniform_(self.advantage_stream.weight, -0.01, 0.01)
@@ -155,7 +159,8 @@ class TradingDQN(nn.Module):
         states: dict z kluczami timeframe'ów, każdy [batch, seq_len, num_features]
                 lub lista tensorów w kolejności timeframe_keys
         action_mask: [batch, num_actions] binary mask (1=dozwolone, 0=zablokowane)
-        position_features: [batch, 4] — [is_long, is_short, unrealized_pnl, bars_in_trade]
+        position_features: [batch, 10] — [is_long, is_short, unrealized_pnl, hold_6h, hold_48h,
+                                          sin_hour, cos_hour, sin_week, cos_week, is_weekend]
                            None → zerowy wektor (brak kontekstu pozycji)
         """
         if isinstance(states, dict):
@@ -185,7 +190,7 @@ class TradingDQN(nn.Module):
 
         # Konkatencja z cechami pozycji
         if position_features is not None:
-            pos = self.pos_fc(position_features)   # [batch, 32]
+            pos = self.pos_fc(position_features)
         else:
             pos = torch.zeros(x.shape[0], 32, device=x.device, dtype=x.dtype)
         x = torch.cat([x, pos], dim=1)            # [batch, 288]

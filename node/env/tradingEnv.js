@@ -119,9 +119,19 @@ class TradingEnv {
         return this._getState();
     }
 
-    _getPositionFeatures() {
+    _getPositionFeatures(timestampMs) {
+        // Cechy czasu: sin/cos godziny (okres 24h) + sin/cos dnia tygodnia (okres 7d) + is_weekend
+        const t = new Date(timestampMs);
+        const hourFrac   = (t.getUTCHours() + t.getUTCMinutes() / 60) / 24;
+        const weekFrac   = (t.getUTCDay() * 24 + t.getUTCHours() + t.getUTCMinutes() / 60) / 168;
+        const sinHour    = Math.sin(2 * Math.PI * hourFrac);
+        const cosHour    = Math.cos(2 * Math.PI * hourFrac);
+        const sinWeek    = Math.sin(2 * Math.PI * weekFrac);
+        const cosWeek    = Math.cos(2 * Math.PI * weekFrac);
+        const isWeekend  = (t.getUTCDay() === 0 || t.getUTCDay() === 6) ? 1.0 : 0.0;
+
         if (this.position === null) {
-            return [0, 0, 0, 0];
+            return [0, 0, 0, 0, 0, sinHour, cosHour, sinWeek, cosWeek, isWeekend];
         }
         const currentPrice = this._getCurrentPrice();
         const isLong  = this.position.side === 'LONG'  ? 1 : 0;
@@ -129,14 +139,18 @@ class TradingEnv {
         const unrealizedPnl = isLong
             ? (currentPrice - this.position.openPrice) / this.position.openPrice
             : (this.position.openPrice - currentPrice) / this.position.openPrice;
-        const barsNorm = Math.min(this._barsInTrade / 200, 1.0);
-        return [isLong, isShort, unrealizedPnl, barsNorm];
+        const stepInterval = this.config.training.step_interval || 15;
+        const minutesHeld  = this._barsInTrade * stepInterval;
+        const hold6h  = Math.min(minutesHeld / 360,  1.0);
+        const hold48h = Math.min(minutesHeld / 2880, 1.0);
+        return [isLong, isShort, unrealizedPnl, hold6h, hold48h, sinHour, cosHour, sinWeek, cosWeek, isWeekend];
     }
 
     _getState() {
         const candle1m = this.allCandles['1m'];
         if (!candle1m || this.currentStepIndex >= candle1m.length) return null;
 
+        const currentTime = candle1m[this.currentStepIndex].close_time || Date.now();
         let state;
         if (this.precomputed) {
             state = buildStateFromPrecomputed(
@@ -144,12 +158,10 @@ class TradingEnv {
                 this.currentStepIndex, this.config
             );
         } else {
-            // fallback (brak pre-kompilacji)
-            const currentTime = candle1m[this.currentStepIndex].close_time || Date.now();
             state = buildState(this.allCandles, currentTime, this.config);
         }
 
-        if (state) state.position = this._getPositionFeatures();
+        if (state) state.position = this._getPositionFeatures(currentTime);
         return state;
     }
 

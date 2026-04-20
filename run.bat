@@ -55,13 +55,19 @@ wt -w 0 new-tab --title "Monitoring" cmd /k "cd /d "%ROOT%\monitoring" && node s
 timeout /t 1 /nobreak >nul
 
 :: Aktorzy uruchamiani z ROOT (config.toml używa ścieżek relatywnych od roota)
-wt -w 0 new-tab --title "BTC" cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=BTCUSDT"
+wt -w 0 new-tab --title "BTC"  cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=BTCUSDT"
 timeout /t 1 /nobreak >nul
 
-wt -w 0 new-tab --title "ETH" cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=ETHUSDT"
+wt -w 0 new-tab --title "ETH"  cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=ETHUSDT"
 timeout /t 1 /nobreak >nul
 
-wt -w 0 new-tab --title "SOL" cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=SOLUSDT"
+wt -w 0 new-tab --title "SOL"  cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=SOLUSDT"
+timeout /t 1 /nobreak >nul
+
+wt -w 0 new-tab --title "BNB"  cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=BNBUSDT"
+timeout /t 1 /nobreak >nul
+
+wt -w 0 new-tab --title "XRP"  cmd /k "timeout /t 8 /nobreak >nul && cd /d "%ROOT%" && node node\index.js --actor=XRPUSDT"
 timeout /t 1 /nobreak >nul
 
 wt -w 0 new-tab --title "Dashboard" cmd /k "cd /d "%ROOT%\dashboard" && npx vite"
@@ -70,7 +76,7 @@ timeout /t 1 /nobreak >nul
 wt -w 0 new-tab --title "TensorBoard" cmd /k "cd /d "%ROOT%" && call "%VENV%" && tensorboard --logdir=runs --port=6006 --bind_all"
 
 echo.
-echo System uruchomiony w Windows Terminal (7 zakladek).
+echo System uruchomiony w Windows Terminal (9 zakladek).
 echo TensorBoard: http://localhost:6006
 echo Aby zatrzymac: stop.bat
 

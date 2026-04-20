@@ -17,13 +17,23 @@ symbol = "SOLUSDT"
 exchange = "binance"
 leverage = 1
 
+[[actors]]
+symbol = "BNBUSDT"
+exchange = "binance"
+leverage = 1
+
+[[actors]]
+symbol = "XRPUSDT"
+exchange = "binance"
+leverage = 1
+
 # ── Learner (Python / GPU) ─────────────────────────────────────────────────────
 [learner]
 host = "tcp://127.0.0.1"
 port = 5555             # ZMQ PULL — odbiera batche od aktorów
 metrics_port = 5556     # ZMQ PUB — wysyła epsilon, loss_scale do aktorów
 device = "cuda"         # "cuda" | "cpu" | "auto"
-num_threads = 4         # wątki CPU dla torch (operacje poza GPU)
+num_threads = 16        # wątki CPU dla torch (operacje poza GPU)
 
 # ── Okna czasowe ───────────────────────────────────────────────────────────────
 # Liczba świec na każdy timeframe w stanie sieci. 0 = wyłączony TF.
@@ -55,7 +65,7 @@ epsilon_start = 1.0             # eksploracja na początku treningu
 epsilon_end = 0.1               # minimalna eksploracja
 epsilon_decay_fraction = 0.15    # po jakim ułamku łącznych kroków epsilon osiąga minimum
 
-dropout = 0.2
+dropout = 0.1
 seed = 42
 
 resume_from_checkpoint = ""     # ścieżka do checkpointu lub "" dl`a treningu od zera
@@ -63,7 +73,7 @@ keep_last_n_checkpoints = 24    # liczba zachowanych checkpointów krokowych
 checkpoint_interval = 20000     # co ile kroków zapis checkpointu
 evaluation_interval = 5000      # co ile kroków ewaluacja / raport
 
-validation_days = 7             # ostatnie N dni danych zarezerwowane jako OOS
+validation_days = 30            # ostatnie N dni danych zarezerwowane jako OOS
 validation_weeks = 0            # alternatywa: tygodnie (nadpisuje validation_days gdy > 0)
 training_months = 48            # liczba miesięcy danych treningowych (0 = cała historia)
 
@@ -72,7 +82,7 @@ step_interval = 15              # co ile świec 1m wykonywany jest krok (1 = ka�
 max_trades_per_episode = 1      # limit transakcji per epizod (1 = zamknięcie kończy epizod)
 
 return_mode = "nstep"           # "mc" | "nstep" | "td"
-n_step = 5                      # horyzont n-krokowy (tylko przy return_mode = "nstep")
+n_step = 25                     # horyzont n-krokowy (tylko przy return_mode = "nstep")
 
 compile_model = false           # torch.compile — przyspiesza trening, wymaga PyTorch 2+
 
@@ -81,8 +91,8 @@ min_hold_steps = 4              # minimalna liczba kroków od otwarcia przed mo�
 lr_scheduler = "none"           # "none" | "cosine" — scheduler LR zsynchronizowany z epsilon
 lr_min = 1e-5                   # dolna granica LR dla schedulera cosine
 
-hold_bias_min = 0.15             # minimalna szansa na HOLD przy losowej eksploracji
-hold_bias_max = 0.8             # maksymalna szansa na HOLD przy losowej eksploracji
+hold_bias_min = 0.5             # minimalna szansa na HOLD przy losowej eksploracji
+hold_bias_max = 0.5             # maksymalna szansa na HOLD przy losowej eksploracji
 
 epsilon_reset_target   = 0.50   # docelowy epsilon przy /ereset
 epsilon_reset_duration = 10000   # na ile kroków epsilon_reset_target jest utrzymywany
@@ -101,12 +111,12 @@ long_short_balance = 0.3 # frakcja batcha z osobnych buforów LONG/SHORT (0 = wy
 # ── Architektura modelu ────────────────────────────────────────────────────────
 [model]
 num_actions = 4              # LONG, SHORT, HOLD, CLOSE
-n_transformer_blocks = 3     # liczba bloków Transformer encoder
+n_transformer_blocks = 1     # liczba bloków Transformer encoder
 n_attention_heads = 4        # głowice uwagi per blok
-key_dim = 32                 # wymiar klucza/zapytania per głowicę
-ff_dim = 512                 # wymiar warstwy feed-forward w bloku
+key_dim = 16                 # wymiar klucza/zapytania per głowicę (d_model/n_heads = 64/4)
+ff_dim = 128                 # wymiar warstwy feed-forward w bloku
 conv_kernel_size = 3         # kernel Conv1D (ekstrakcja lokalnych wzorców)
-conv1d_filters = 256         # liczba filtrów Conv1D
+conv1d_filters = 64          # liczba filtrów Conv1D
 
 # ── Cechy wejściowe ────────────────────────────────────────────────────────────
 [features]

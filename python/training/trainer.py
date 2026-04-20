@@ -950,7 +950,7 @@ class Trainer:
             mask_tensor = torch.tensor([action_mask], dtype=torch.float32).to(self.device)
 
         pos_data = state.get('position') if isinstance(state, dict) else None
-        pos_tensor = torch.tensor([pos_data[:4]], dtype=torch.float32).to(self.device) if pos_data is not None else None
+        pos_tensor = torch.tensor([pos_data], dtype=torch.float32).to(self.device) if pos_data is not None else None
 
         q_values = self.main_network(state_tensors, action_mask=mask_tensor, position_features=pos_tensor)
         action = q_values.argmax(dim=1).item()
@@ -1033,7 +1033,7 @@ class Trainer:
             for key in tf_keys:
                 seq_len = self.config['timeframes'][key]
                 dummy_inputs.append(torch.zeros(1, seq_len, num_features, device=self.device))
-            dummy_inputs.append(torch.zeros(1, 4, device=self.device))   # pos_features
+            dummy_inputs.append(torch.zeros(1, 10, device=self.device))  # pos_features
             dummy_inputs.append(torch.ones(1, 4, device=self.device))    # action_mask
 
             input_names  = [f'tf_{i}' for i in range(len(tf_keys))] + ['pos_features', 'action_mask']
