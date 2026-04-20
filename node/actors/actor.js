@@ -390,8 +390,8 @@ class Actor {
             });
         }
         if (state.position) {
-            const [isLong, isShort, upnl, barsNorm] = state.position;
-            mirrored.position = [isShort, isLong, -upnl, barsNorm];
+            const [isLong, isShort, upnl, hold6h, hold48h, sinHour, cosHour, sinWeek, cosWeek, isWeekend] = state.position;
+            mirrored.position = [isShort, isLong, -upnl, hold6h, hold48h, sinHour, cosHour, sinWeek, cosWeek, isWeekend];
         }
         return mirrored;
     }
@@ -539,12 +539,12 @@ class Actor {
         console.log(`\n[${this.symbol}] Episode ${ep}${labelStr} | Steps: ${episodeLog.length} | Trades: ${trades.length} | W:${c.green(metrics.wins)} L:${c.red(metrics.losses)} | PnL: ${pnlStr} | ε=${this.epsilon.toFixed(3)} | sps=${avgSps}`);
 
         const table = new Table({
-            head: ['#', 'Timestamp', 'Price', 'uPNL%', 'Pos', 'Src', 'Action',
+            head: ['#', 'Timestamp', 'Price', 'uPNL%', 'Pos', 'Src', 'Adv', 'Action',
                    'LONG', 'SHORT', 'HOLD', 'CLOSE',
                    'rOpen', 'rClose', 'rIdle', 'rΔuPnL', 'ruPnL', 'rHold', 'rΣ',
                    'r5step'],
-            colWidths: [5, 17, 11, 8, 5, 6, 12, 10, 10, 10, 10, 9, 9, 9, 9, 9, 9, 10, 11],
-            colAligns: ['right', 'left', 'right', 'right', 'middle', 'middle', 'left',
+            colWidths: [5, 17, 11, 8, 5, 6, 9, 12, 10, 10, 10, 10, 9, 9, 9, 9, 9, 9, 10, 11],
+            colAligns: ['right', 'left', 'right', 'right', 'middle', 'middle', 'right', 'left',
                         'right', 'right', 'right', 'right',
                         'right', 'right', 'right', 'right', 'right', 'right', 'right',
                         'right'],
@@ -592,6 +592,18 @@ class Actor {
             const posAfter  = row.posAfter  ? row.posAfter[0]  : '─';
 
             const src = row.wasRandom ? c.gray('rnd') : c.cyan('model');
+
+            let advStr = '';
+            if (!row.wasRandom && row.qValues && row.mask) {
+                const validQs = row.qValues.filter((_, ai) => row.mask[ai] === 1);
+                if (validQs.length > 0) {
+                    const meanQ = validQs.reduce((a, b) => a + b, 0) / validQs.length;
+                    const adv = row.qValues[row.action] - meanQ;
+                    const advFmt = `${adv >= 0 ? '+' : ''}${adv.toFixed(3)}`;
+                    advStr = adv >= 0 ? c.green(advFmt) : c.red(advFmt);
+                }
+            }
+
             const actionStr = ACTION_COLORS[row.action](A[row.action]);
 
             const qCells = row.qValues
@@ -607,7 +619,7 @@ class Actor {
                 : '';
 
             table.push([
-                i + 1, ts, price, uPnl, `${posBefore}→${posAfter}`, src, actionStr,
+                i + 1, ts, price, uPnl, `${posBefore}→${posAfter}`, src, advStr, actionStr,
                 ...qCells,
                 fmtR(rb.open), fmtR(rb.close), fmtR(rb.idle),
                 fmtR(rb.delta), fmtR(rb.unreal), fmtR(rb.hold), rTotal,
@@ -686,7 +698,7 @@ class Actor {
             }
 
             const posData = (state && state.position) || [0, 0, 0, 0];
-            feeds['pos_features'] = new ort.Tensor('float32', new Float32Array(posData.slice(0, 4)), [1, 4]);
+            feeds['pos_features'] = new ort.Tensor('float32', new Float32Array(posData.slice(0, 10)), [1, 10]);
             feeds['action_mask']  = new ort.Tensor('float32', new Float32Array(actionMask), [1, 4]);
 
             const results = await session.run(feeds);
