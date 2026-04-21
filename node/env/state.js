@@ -11,8 +11,8 @@ const TIMEFRAME_CONFIG_KEYS = {
 };
 const NUM_FEATURES = 11;
 
-// 11 cech (v1+v2 bez duplikatów):
-//   0: normalizedClose   — z-score close (okno normWindow)
+// 11 features (v1+v2 merged, no duplicates):
+//   0: normalizedClose   — z-score close (normWindow rolling window)
 //   1: relativeRange     — (H-L)/close
 //   2: candleDirection   — (close-open)/close
 //   3: volumeClipped     — min(vol/meanVol, 3.0)
@@ -71,9 +71,8 @@ function buildFeatures(candles, normWindow) {
 }
 
 /**
- * Synchronizacja czasowa — użyj tylko zamkniętych świec
- * aby uniknąć look-ahead bias.
- * Binary search O(log N) zamiast filter O(N).
+ * Time alignment — use only closed candles to avoid look-ahead bias.
+ * Binary search O(log N) instead of filter O(N).
  */
 function getAlignedCandles(allCandles, currentTime, numCandles) {
     let lo = 0, hi = allCandles.length;
@@ -114,9 +113,9 @@ function buildState(allCandlesPerTf, currentTime, config) {
 }
 
 /**
- * Pre-oblicza wszystkie wskaźniki dla pełnej tablicy świec danego TF.
- * Wynik: 8 tablic Float64Array indeksowanych pozycją świecy.
- * Wykonywane raz po załadowaniu danych — O(N) zamiast O(N) na każdym kroku.
+ * Pre-computes all indicators for the full candle array of a given timeframe.
+ * Result: 11 Float64Arrays indexed by candle position.
+ * Executed once after data load — O(N) total instead of O(N) per step.
  */
 function precomputeIndicators(candles, normWindow) {
     const n = candles.length;
@@ -178,8 +177,8 @@ function precomputeIndicators(candles, normWindow) {
 }
 
 /**
- * Składa macierz cech [numCandles × NUM_FEATURES] z pre-obliczonych tablic.
- * startIdx..endIdx to zakres w oryginalnej tablicy świec TF.
+ * Assembles feature matrix [numCandles × NUM_FEATURES] from pre-computed arrays.
+ * startIdx..endIdx is the range within the original TF candle array.
  */
 function assembleFeaturesFromPrecomputed(f, startIdx, endIdx, numCandles) {
     const actualLen = endIdx - startIdx;
@@ -199,8 +198,8 @@ function assembleFeaturesFromPrecomputed(f, startIdx, endIdx, numCandles) {
 }
 
 /**
- * Szybki buildState korzystający z pre-obliczonych wskaźników.
- * O(numCandles) zamiast O(N_total) per krok.
+ * Fast buildState using pre-computed indicators.
+ * O(numCandles) instead of O(N_total) per step.
  */
 function buildStateFromPrecomputed(precomputed, tfAlignments, stepIndex, config) {
     const state = {};
@@ -211,7 +210,7 @@ function buildStateFromPrecomputed(precomputed, tfAlignments, stepIndex, config)
         if (!numCandles || numCandles <= 0) continue;
         if (!precomputed[tf]) continue;
 
-        // Dla 1m endIdx = stepIndex + 1 (bieżąca świeca już zamknięta)
+        // For 1m endIdx = stepIndex + 1 (current candle is already closed)
         const endIdx   = tf === '1m' ? stepIndex + 1 : tfAlignments[tf][stepIndex];
         const startIdx = Math.max(0, endIdx - numCandles);
         state[tf] = assembleFeaturesFromPrecomputed(precomputed[tf], startIdx, endIdx, numCandles);
@@ -220,24 +219,24 @@ function buildStateFromPrecomputed(precomputed, tfAlignments, stepIndex, config)
     return state;
 }
 
-// ── Wskaźniki v2 (niezaktywowane) ─────────────────────────────────────────────
+// ── Indicators v2 (inactive) ──────────────────────────────────────────────────
 //
-// 8 cech (zgodność z num_features = 8 bez zmian modelu):
-//   0: normalizedClose        — z-score z oknem 60 (bez zmian)
-//   1: relativeRange          — (H-L)/close (bez zmian)
-//   2: candleDirection        — (close-open)/close (bez zmian)
-//   3: volumeClipped          — min(vol/meanVol, 3.0) — clip na 3x mean zamiast surowego ratio
-//   4: stochasticK            — (close-min14)/(max14-min14) — pozycja w zakresie H-L
-//   5: macdHistNorm           — (macdLine-signalLine)/close — histogram zamiast samej linii
-//   6: bollingerWidth         — 4*std20/sma20 — sygnał przed wybiciem
-//   7: smaDistance            — (close-sma20)/close — ciągła odległość zamiast binarnego 0/1
+// 8 features (compatible with num_features = 8, no model changes needed):
+//   0: normalizedClose        — z-score with window 60 (unchanged)
+//   1: relativeRange          — (H-L)/close (unchanged)
+//   2: candleDirection        — (close-open)/close (unchanged)
+//   3: volumeClipped          — min(vol/meanVol, 3.0) — capped at 3x mean instead of raw ratio
+//   4: stochasticK            — (close-min14)/(max14-min14) — position within H-L range
+//   5: macdHistNorm           — (macdLine-signalLine)/close — histogram instead of line only
+//   6: bollingerWidth         — 4*std20/sma20 — breakout signal
+//   7: smaDistance            — (close-sma20)/close — continuous distance instead of binary 0/1
 //
-// Dodatkowe (wymagają num_features = 9, nieaktywowane):
-//   8: atrNorm                — ATR(14)/close — realne ryzyko/krok
+// Optional extension (requires num_features = 9, inactive):
+//   8: atrNorm                — ATR(14)/close — real risk per step
 
 /**
- * Wersja v2 pre-obliczania wskaźników (niezaktywowana).
- * Interfejs identyczny z precomputeIndicators() — drop-in replacement gdy gotowe.
+ * V2 indicator pre-computation (inactive).
+ * Same interface as precomputeIndicators() — drop-in replacement when ready.
  */
 function precomputeIndicatorsV2(candles, normWindow) {
     const n = candles.length;
@@ -297,7 +296,7 @@ function precomputeIndicatorsV2(candles, normWindow) {
 }
 
 /**
- * Składa macierz cech v2 [numCandles × 8] z pre-obliczonych tablic v2.
+ * Assembles v2 feature matrix [numCandles × 8] from pre-computed v2 arrays.
  */
 function assembleFeaturesFromPrecomputedV2(f, startIdx, endIdx, numCandles) {
     const actualLen = endIdx - startIdx;
@@ -332,7 +331,7 @@ module.exports = {
     TIMEFRAME_KEYS,
     TIMEFRAME_CONFIG_KEYS,
     NUM_FEATURES,
-    // v2 (niezaktywowane)
+    // v2 (inactive)
     precomputeIndicatorsV2,
     assembleFeaturesFromPrecomputedV2,
 };

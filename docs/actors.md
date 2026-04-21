@@ -4,9 +4,7 @@
 
 Aktorzy to instancje **środowiska tradingowego** — każdy Actor symuluje handel dla jednej pary kryptowalutowej. Wszyscy aktorzy wysyłają doświadczenia do jednego Python Learnera.
 
-## Konfiguracja aktorów
-
-Aktorzy są zdefiniowani jako **lista obiektów** w pliku TOML. Każdy wpis zawiera symbol, exchange i indywidualne parametry.
+## Aktualna konfiguracja (5 par)
 
 ```toml
 [[actors]]
@@ -23,320 +21,206 @@ leverage = 1
 symbol = "SOLUSDT"
 exchange = "binance"
 leverage = 1
-```
 
-### Dodawanie nowej pary
-
-Dodanie nowej pary to **jeden wpis w konfigu**, zero zmian w kodzie:
-
-```toml
 [[actors]]
-symbol = "ADAUSDT"
+symbol = "BNBUSDT"
+exchange = "binance"
+leverage = 1
+
+[[actors]]
+symbol = "XRPUSDT"
 exchange = "binance"
 leverage = 1
 ```
 
-## Globalne timeframe'y
-
-Timeframe'y są zdefiniowane **globalnie** — jeden zestaw dla wszystkich aktorów, jeden model.
-
-```toml
-[timeframes]
-candles_1m  = 15
-candles_15m = 15
-candles_1h  = 20
-candles_1d  = 30
-candles_1w  = 54
-```
-
-Wszyscy Actorzy używają:
-- Tej samej struktury stanu
-- Tego samego schematu nagród
-- Tych samych timeframe'ów
+Każdy `[[actors]]` uruchamia osobny wątek Node.js. Dodanie nowej pary = jeden wpis w TOML, zero zmian w kodzie.
 
 ## Dlaczego wielu aktorów?
 
-### Korzyści
-
 | Korzyść | Opis |
 |---|---|
-| **Generalizacja** | Sieć uczy się ogólnych wzorców niezależnych od pary |
-| **Różnorodność** | Replay buffer zawiera mix z różnych reżimów rynkowych |
-| **Dekorrelacja** | Naturalne rozwiązanie problemu korelacji doświadczeń |
-| **Skalowalność** | Dodaj kolejnego aktora przez wpis w TOML |
+| **Generalizacja** | Sieć uczy się wzorców niezależnych od konkretnej pary |
+| **Różnorodność** | Bufor zawiera mix: trend / bessa / konsolidacja |
+| **Dekorrelacja** | Naturalne rozwiązanie korelacji doświadczeń w DQN |
+| **Skalowalność** | Dodaj parę przez TOML |
 
-### Przykład
+## Inferencja — ONNX local vs RPC
 
-```
-BTC Actor ──► doświadczenia z trendu wzrostowego ──┐
-ETH Actor ──► doświadczenia z bessy ───────────────┼──► Python Learner
-SOL Actor ──► doświadczenia z konsolidacji ────────┘
-```
+Actor wybiera akcję w dwuetapowej hierarchii:
 
-Model uczy się że formacja X jest bullish niezależnie od tego czy występuje na BTC czy ETH.
-
-## Actor Manager
-
-`actorManager.js` zarządza wszystkimi aktorami:
-- Uruchamia instancje według konfiguracji
-- Zbiera requesty od aktorów
-- Batchuje requesty do Pythona
-- Rozdziela odpowiedzi do właściwych aktorów
-
-### Schemat działania
-
-```
-Actor 1 ──┐
-Actor 2 ──┼──► actorManager ──► batch ──► Python Learner
-Actor 3 ──┘
-               ◄───────────────────────── Q-values
-```
-
-## Batchowanie requestów
-
-### Opis
-
-`actorManager.js` zbiera requesty od wszystkich Actorów przez **kilka milisekund** i wysyła jeden zbiorczy batch do Pythona.
-
-### Korzyści
-
-- **Jedno wywołanie modelu** obsługuje wielu aktorów
-- **Lepszy utilisation GPU** — batche są bardziej efektywne
-- **Mniejszy narzut komunikacji** — mniej requestów ZMQ
-
-### Implementacja
+### 1. Lokalna inferencja ONNX (preferowana)
 
 ```javascript
-// Zbieraj requesty przez 10ms
-const BATCH_WINDOW_MS = 10;
-
-let pendingRequests = [];
-
-setTimeout(() => {
-    if (pendingRequests.length > 0) {
-        // Wyślej batch
-        const batch = pendingRequests.splice(0);
-        sendToPython(batch);
-    }
-}, BATCH_WINDOW_MS);
+const onnxResult = await this._inferOnnx(state, actionMask);
+if (onnxResult) {
+    action  = onnxResult.action;
+    qValues = onnxResult.qValues;
+}
 ```
 
-## Epsilon-greedy faza
+Gdy dostępny plik `model.onnx` — aktor ładuje go lokalnie przez `onnxruntime-node` i wykonuje inferencję **bez latencji TCP**. Plik jest monitorowany co 5 sekund — gdy Learner zapisze nową wersję, Actor ją automatycznie ładuje.
 
-### Opis
+### 2. Fallback: RPC do Python przez ZMQ
 
-Przy wysokim `epsilon` Actor wybiera **losową akcję** bez pytania modelu — znacząco przyspiesza zapełnienie bufora w początkowej fazie.
-
-### Parametry
-
-```
-epsilon start: 1.0    (pełna eksploracja)
-epsilon end:   0.05   (głównie eksploatacja)
-decay: liniowy przez pierwsze 30% kroków
+```javascript
+const response = await this.pythonClient.predict(state, actionMask);
+action  = response.action;
+qValues = response.qValues;
+if (response.epsilon != null) this.epsilon = response.epsilon;
 ```
 
-### Decyzja o akcji
+Używany gdy brak ONNX lub błąd onnxruntime. Learner zwraca też bieżące epsilon.
 
-```python
-if random() < epsilon:
-    action = random_action()  # bez pytania modelu
-else:
-    action = model.predict(state)  # pytanie Pythona
+### 3. Fallback po błędzie RPC
+
+```javascript
+// Silne faworyzowanie HOLD po błędzie sieci — bezpieczna domyślna akcja
+action = this._sampleWeightedAction(actionMask, [2, 2, 94, 2]);
 ```
 
-### Optymalizacja
+## Eksploracja Epsilon-Greedy
 
-Gdy `epsilon > 0.8`, Actorzy **nie pytają Pythona** o akcję — generują losowe działania lokalnie. Python dostaje tylko doświadczenia do bufora.
+```javascript
+if (Math.random() < this.epsilon) {
+    // Losowa akcja z wagami (nie uniform!)
+    action = this._sampleWeightedAction(actionMask, [13, 13, 60, 13]);
+} else {
+    // Model (ONNX lub RPC)
+    action = model.predict(state);
+}
+```
+
+Ważona losowość: `HOLD=60%`, `LONG=13%`, `SHORT=13%`, `CLOSE=13%`. Zapobiega dominacji OPEN akcji w early exploration (odpowiada za `hold_bias=0.5` w config).
 
 ## Cykl życia aktora
 
 ### 1. Inicjalizacja
-- Załaduj konfigurację (symbol, exchange, leverage)
-- Pobierz dane historyczne
-- Zainicjalizuj środowisko tradingowe
 
-### 2. Start epizodu
-- Losowy punkt startowy w danych historycznych
-- Reset stanu pozycji (brak otwartej pozycji)
-- Buduj pierwszy stan
+- Załaduj konfigurację (symbol, timeframes, reward)
+- Załaduj dane historyczne ze wszystkich TF
+- Obetnij dane do okna: warmup + training_months + validation_days
 
-### 3. Krok
-- Pobierz aktualny stan
-- Wybierz akcję (epsilon-greedy lub model)
-- Wykonaj akcję w środowisku
-- Oblicz nagrodę
-- Wyślij doświadczenie do Learnera
-
-### 4. Koniec epizodu
-- Zamknij otwartą pozycję (jeśli istnieje)
-- Oblicz Monte Carlo Returns
-- Wyślij doświadczenia z return_G
-- Reset środowiska
-
-## Stan środowiska
-
-Actor buduje stan z 5 timeframe'ów:
+### 2. Pętla epizodów
 
 ```javascript
-state = {
-    '1m':  candles_1m,   // [15, 8]
-    '15m': candles_15m,  // [15, 8]
-    '1h':  candles_1h,   // [20, 8]
-    '1d':  candles_1d,   // [30, 8]
-    '1w':  candles_1w,   // [54, 8]
+while (this.running) {
+    await this.runEpisode();
+    this.totalEpisodes++;
 }
 ```
 
-## Dostępne akcje
+### 3. Krok epizodu
 
-System używa **4 akcji** — HOLD służy do trzymania pozycji lub czekania, a CLOSE wyłącznie do jej zamknięcia.
+```javascript
+// Epsilon-greedy: ONNX → RPC → fallback
+action = await this.selectAction(state, actionMask);
+
+// Krok w środowisku
+const result = this.env.step(action);
+done = result.done;
+state = result.nextState;
+actionMask = result.actionMask;
+
+// Throttle jeśli Learner sygnalizuje pełny bufor
+if (this.throttleMs > 0) await sleep(this.throttleMs);
+```
+
+### 4. Koniec epizodu — wysłanie doświadczeń
+
+```javascript
+// Oblicz zwroty zgodnie z return_mode
+const experiences = getExperiences(returnMode, nStep);
+
+// Episode mirror — zdubluj odwrócony LONG↔SHORT
+if (episodeMirror) mirrorExperiences = buildMirror(experiences);
+
+// Wyślij do Python Learnera przez PythonClient (ZMQ)
+await pythonClient.sendBatch(experiences);
+```
+
+## Okno danych treningowych
+
+```toml
+[training]
+training_months  = 48   # ostatnie 48 miesięcy danych
+validation_days  = 30   # ostatnie 30 dni = OOS (nigdy nie trenujesz na nich)
+```
+
+```
+|← warmup (14 dni) →|← trening (48 mies.) →|← OOS (30 dni) →|
+       bufor sieci          losowe starty         nigdy tutaj
+```
+
+## Dostępne akcje
 
 | Akcja | ID | Opis |
 |---|---|---|
 | LONG | 0 | Otwórz pozycję LONG |
 | SHORT | 1 | Otwórz pozycję SHORT |
-| HOLD | 2 | Trzymaj pozycję / Czekaj (bez pozycji) |
+| HOLD | 2 | Trzymaj / czekaj |
 | CLOSE | 3 | Zamknij otwartą pozycję |
 
-> **Uwaga:** Może istnieć tylko **jedna pozycja jednocześnie** — albo LONG, albo SHORT. Nie można mieć obu na raz.
+Zawsze **jedna pozycja jednocześnie**. Flip LONG→SHORT wymaga CLOSE + LONG.
 
-## Logika pozycji
+## Logika pozycji (action masking)
 
-### Pozycja LONG otwarta
-- `LONG` → ignoruj (pozycja już otwarta)
-- `SHORT` → ignoruj (nie można flip pozycji)
-- `HOLD` → trzymaj pozycję
-- `CLOSE` → **zamknij pozycję**
+| Stan | LONG | SHORT | HOLD | CLOSE |
+|---|---|---|---|---|
+| Brak pozycji | ✓ | ✓ | ✓ | ✗ |
+| Otwarta LONG | ✗ | ✗ | ✓ | ✓ |
+| Otwarta SHORT | ✗ | ✗ | ✓ | ✓ |
+| < min_hold_steps | ✗ | ✗ | ✓ | ✗ |
 
-### Pozycja SHORT otwarta
-- `LONG` → ignoruj (nie można flip pozycji)
-- `SHORT` → ignoruj (pozycja już otwarta)
-- `HOLD` → trzymaj pozycję
-- `CLOSE` → **zamknij pozycję**
+`min_hold_steps = 4` — CLOSE jest blokowane przez pierwsze 4 kroki od otwarcia.
 
-### Brak pozycji
-- `LONG` → otwórz pozycję LONG
-- `SHORT` → otwórz pozycję SHORT
-- `HOLD` → czekaj (nic nie rób)
-- `CLOSE` → ignoruj (brak pozycji do zamknięcia)
+## Stan środowiska
 
-## Config
+```javascript
+state = {
+    candles_1m:  Float32Array([60, 11]),
+    candles_15m: Float32Array([32, 11]),
+    candles_1h:  Float32Array([48, 11]),
+    candles_1d:  Float32Array([14, 11]),
+    // candles_1w = 0 → pominięty
+}
 
-```toml
-[[actors]]
-symbol = "BTCUSDT"
-exchange = "binance"
-leverage = 1
+positionFeatures = Float32Array([10])  // is_long, is_short, uPnL, hold_6h, ...
+```
 
-[training]
-epsilon_start = 1.0
-epsilon_end = 0.05
-epsilon_decay_fraction = 0.3
+## Actor Manager
+
+`actorManager.js` zarządza wszystkimi aktorami:
+
+```
+Actor BTC ──┐
+Actor ETH ──┼──► actorManager ──► batch ──► Python Learner
+Actor SOL ──┤
+Actor BNB ──┤
+Actor XRP ──┘
+               ◄─────────── Q-values + epsilon ──────────────
+```
+
+Batchuje requesty od wszystkich aktorów w jednym oknie czasowym, wysyła jeden zbiorczy request do Pythona.
+
 ## Normalizacja per para
 
-Każda para ma inną skalę cen i wolumenu — BTC kosztuje kilkadziesiąt tysięcy, SOL kilkaset. Normalizacja jest liczona **osobno dla każdej pary**.
-
-### Zasada
-
-Każdy Actor utrzymuje własne statystyki rolling (mean, std) dla swojej pary. Dzięki temu sieć widzi te same wzorce niezależnie od bezwzględnej ceny.
-
-### Konfiguracja
+Każda para ma inną skalę cen — BTC ~60k, XRP ~0.5. Normalizacja jest liczona przez **rolling window per para**:
 
 ```toml
 [data]
-normalization_window = 20   # Okno rolling dla mean/std
+normalization_window = 60   # okno rolling mean/std
 ```
 
-### Implementacja
+Każdy Actor utrzymuje własne `PerPairNormalizer` — sieć widzi te same wzorce niezależnie od bezwzględnej ceny.
 
-```javascript
-class PerPairNormalizer {
-    constructor(window = 20) {
-        this.window = window;
-        this.history = [];  // ostatnie N wartości close
-    }
-
-    update(close) {
-        this.history.push(close);
-        if (this.history.length > this.window) {
-            this.history.shift();
-        }
-    }
-
-    normalize(value) {
-        if (this.history.length < 2) return 0;  // cold start — zwróć 0
-
-        const mean = this.history.reduce((a, b) => a + b) / this.history.length;
-        const std = Math.sqrt(
-            this.history.map(x => (x - mean) ** 2).reduce((a, b) => a + b) / this.history.length
-        );
-
-        if (std === 0) return 0;
-        return (value - mean) / std;
-    }
-}
-```
-
-### Cold start
-
-Przy zimnym starcie (pierwsze N świec) historia jest niekompletna. Actor wypełnia brakujące wartości zerem — sieć traktuje to jako brak sygnału.
-
-### Zapis stanu normalizatora
-
-Stan normalizatora (historia rolling) jest zapisywany razem z checkpointem żeby uniknąć ponownego cold startu po restarcie.
-
-## Obsługa końca danych historycznych
-
-Podczas treningu Actor dojdzie do końca danych historycznych. Musi wtedy zresetować epizod bez nakładania się na dane out-of-sample.
-
-### Zasada podziału danych
-
-```
-|←────── 80% dane treningowe ──────→|←── 20% OOS ──→|
-         Actor trenuje tutaj              NIGDY tutaj
-```
-
-### Zachowanie przy końcu danych
-
-Gdy Actor dojdzie do końca danych treningowych (80%):
-
-1. Zamknij otwartą pozycję (jeśli istnieje) — oblicz nagrodę
-2. Oblicz Monte Carlo Returns dla epizodu
-3. Wyślij doświadczenia do Learnera
-4. **Reset do losowego punktu startowego** w przedziale treningowym (0-80%)
-
-### Losowy punkt startowy
-
-```javascript
-function getRandomStartIndex(data, trainFraction = 0.8) {
-    const trainEnd = Math.floor(data.length * trainFraction);
-    // Zostaw miejsce na minimalną długość epizodu (np. 100 kroków)
-    const maxStart = trainEnd - config.training.min_episode_length;
-    return Math.floor(Math.random() * maxStart);
-}
-```
-
-### Konfiguracja
+## Episode Mirror
 
 ```toml
 [training]
-train_data_fraction = 0.8    # 80% danych na trening, 20% OOS
-min_episode_length = 100     # Minimalna długość epizodu w krokach
+episode_mirror = false   # true = generuj lustrzany epizod po każdym
 ```
 
-### Obsługa brakującej historii
-
-Gdy para nie ma wystarczającej historii dla danego timeframe'a (np. nowa para bez roku świec tygodniowych):
-
-```toml
-[data]
-allow_partial_history = true   # false = odrzuć parę jeśli brakuje historii
-```
-
-Gdy `allow_partial_history = true`, brakujące świece są wypełniane zerami od lewej (zero-padding). Actor loguje ostrzeżenie przy starcie:
-
-```
-[WARNING] [actor:SOLUSDT] Niekompletna historia dla 1w: 30/54 świec. Zero-padding zastosowany.
-```
-
-Gdy `allow_partial_history = false`, Actor odrzuca parę i loguje błąd — system nie startuje dla tej pary.
+Gdy `true`, po każdym epizodzie Actor generuje "lustrzany":
+- Wszystkie LONG → SHORT i odwrotnie
+- P&L odwrócony: zysk LONG = strata odpowiadającego SHORT
+- Balansuje bufor 50/50 między kierunkami pozycji

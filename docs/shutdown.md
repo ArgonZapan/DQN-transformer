@@ -83,9 +83,10 @@ def graceful_shutdown(signum, frame):
     # Zakończ bieżący krok treningowy
     trainer.finish_current_step()
 
-    # Zapisz checkpoint
+    # Zapisz checkpoint i eksportuj ONNX
     trainer.save_checkpoint(f"checkpoints/shutdown_checkpoint.pt")
-    logger.info("Checkpoint zapisany. Zamykam.")
+    trainer.export_onnx()   # checkpoints/model.onnx — używany przez Aktorów do lokalnej inferencji
+    logger.info("Checkpoint i ONNX zapisane. Zamykam.")
 
     # Zamknij sockety ZMQ
     zmq_server.close()

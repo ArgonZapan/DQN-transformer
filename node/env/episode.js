@@ -1,12 +1,12 @@
 /**
- * Zarządzanie epizodami tradingowymi.
- * Epizod to sekwencja kroków od losowego punktu startowego
- * do końca danych treningowych lub wymuszonego zakończenia.
+ * Trading episode management.
+ * An episode is a sequence of steps from a random start index
+ * to the end of training data or a forced termination.
  */
 
 class Episode {
     constructor(config) {
-        // validation_weeks ma pierwszeństwo nad validation_days
+        // validation_weeks takes priority over validation_days
         this.validationDays   = config.training.validation_weeks
             ? config.training.validation_weeks * 7
             : config.training.validation_days;
@@ -14,8 +14,8 @@ class Episode {
         this.stepInterval     = config.training.step_interval || 1;
         this.gamma = config.training.gamma;
 
-        // Minimalna pozycja startowa epizodu: sieć potrzebuje candles_1d pełnych świec dziennych
-        // jako kontekst. Przy training_months > 0 dane są obcinane od właśnie tego punktu.
+        // Minimum episode start position: network needs candles_1d full daily candles
+        // as context. With training_months > 0, data is trimmed from this point onward.
         this.warmupCandles = (config.timeframes.candles_1d || 0) * 24 * 60;
 
         this.steps = [];
@@ -25,14 +25,14 @@ class Episode {
     }
 
     _trainEnd(dataLength) {
-        // dataLength = liczba świec 1m; ostatnie validationDays * 1440 to walidacja
+        // dataLength = number of 1m candles; last validationDays * 1440 are reserved for validation
         return Math.max(0, dataLength - this.validationDays * 24 * 60);
     }
 
     getRandomStartIndex(dataLength) {
         const trainEnd = this._trainEnd(dataLength);
-        // Epizod nie może startować wcześniej niż po warmup — sieć nie miałaby
-        // pełnego okna 1d. Przy training_months=0 warmup pochodzi z początku pełnej historii.
+        // Episode cannot start before warmup — network wouldn't have a full 1d window.
+        // With training_months=0, warmup comes from the beginning of the full history.
         const minStart = this.warmupCandles;
         const maxStart = trainEnd - this.maxEpisodeLength * this.stepInterval;
         if (maxStart <= minStart) return minStart;
@@ -64,7 +64,7 @@ class Episode {
     }
 
     /**
-     * Oblicz Monte Carlo Returns idąc od tyłu.
+     * Compute Monte Carlo returns backwards.
      * G_t = r_t + gamma * G_{t+1}
      */
     calculateMonteCarloReturns() {
@@ -89,18 +89,18 @@ class Episode {
     }
 
     /**
-     * Zwraca doświadczenia z n-krokowym zwrotem.
+     * Returns experiences with n-step returns.
      *
-     * Dla każdego kroku t:
-     *   reward  = Σ_{k=0}^{min(n,T-t)-1} γ^k * r_{t+k}   (zdyskontowana suma n kroków)
-     *   nextState = steps[t+n].state  (jeśli t+n < T), inaczej null
-     *   done    = (t + n >= T)         (True gdy epizod kończy się w obrębie n kroków)
+     * For each step t:
+     *   reward    = Σ_{k=0}^{min(n,T-t)-1} γ^k * r_{t+k}   (discounted n-step sum)
+     *   nextState = steps[t+n].state  (if t+n < T), otherwise null
+     *   done      = (t + n >= T)      (true when episode ends within n steps)
      *
-     * Bellman target w trainerze:  reward + (1 - done) * γ^n * Q(nextState)
-     * γ^n jest przekazywane jako pole `gammaToN` — trainer mnoży przez nie next_q.
+     * Bellman target in trainer:  reward + (1 - done) * γ^n * Q(nextState)
+     * γ^n is passed as the `gammaToN` field — trainer multiplies next_q by it.
      */
     getExperiencesNStep(n) {
-        // Policz MC returns z góry — tylko do wyświetlania w tabeli epizodu
+        // Compute MC returns upfront — used only for episode table display
         this.calculateMonteCarloReturns();
 
         const T = this.steps.length;
@@ -109,7 +109,7 @@ class Episode {
         const result = [];
 
         for (let t = 0; t < T; t++) {
-            // Skumulowany n-krokowy zwrot
+            // Accumulated n-step discounted return
             let reward = 0;
             for (let k = 0; k < n && (t + k) < T; k++) {
                 reward += Math.pow(gamma, k) * this.steps[t + k].reward;
@@ -129,14 +129,14 @@ class Episode {
                 actionMask:     this.steps[t].actionMask,
                 nextActionMask,
                 gammaToN:       gammaN,
-                returnG:        this.steps[t].returnG,  // MC return — tylko do wyświetlania
+                returnG:        this.steps[t].returnG,  // MC return — display only
             });
         }
         return result;
     }
 
     /**
-     * Zwraca surowe doświadczenia (1-krokowe TD) bez żadnych transformacji.
+     * Returns raw 1-step TD experiences without any transformations.
      */
     getExperiencesTD() {
         this.calculateMonteCarloReturns();
@@ -148,7 +148,7 @@ class Episode {
             done:       step.done,
             actionMask: step.actionMask,
             gammaToN:   this.gamma,
-            returnG:    step.returnG,  // MC return — tylko do wyświetlania
+            returnG:    step.returnG,  // MC return — display only
         }));
     }
 

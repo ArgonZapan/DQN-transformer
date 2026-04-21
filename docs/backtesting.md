@@ -8,12 +8,12 @@ Backtesting to tryb **ewaluacji wytrenowanego modelu** na danych historycznych. 
 
 | Aspekt | Trening | Backtesting |
 |---|---|---|
-| Dane | Losowe starty epizodów (80% danych) | Sekwencyjnie od początku do końca |
+| Dane | Losowe starty (historia - validation_days) | Sekwencyjnie od początku do końca |
 | Model | Aktualizowany co krok | Zamrożony — tylko inference |
 | Replay Buffer | Aktywny | Nieużywany |
 | Nagrody | Do bufora i treningu | Tylko do metryk |
 | Epsilon | Maleje w czasie | 0 — zawsze najlepsza akcja |
-| Dane OOS | Niedostępne | 20% najnowszych danych |
+| Dane OOS | Niedostępne | Ostatnie `validation_days=30` dni |
 
 ## Konfiguracja
 
@@ -167,9 +167,15 @@ results/
 
 ```toml
 [backtesting]
-enabled = false
+enabled    = false
 model_path = "python/checkpoints/best_model.pt"
 start_date = "2023-01-01"
-end_date = "2023-12-31"
+end_date   = "2023-12-31"
 results_dir = "results"
+step_interval = 5     # co ile świec 1m krok backtestowy
+max_oos_days  = 30    # maksymalny horyzont OOS
+fee = 0.00075         # prowizja używana w backtestingu (= commission_open + close)
+
+[training]
+validation_days = 30  # ostatnie N dni zarezerwowane jako OOS (nigdy nie trenujesz na nich)
 ```

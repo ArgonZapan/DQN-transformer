@@ -6,12 +6,12 @@ const { PerPairNormalizer } = require('../data/normalizer');
 
 const TIMEFRAME_INTERVALS = ['1m', '15m', '1h', '1d', '1w'];
 
-// Lazy-load onnxruntime-node — brak pakietu nie blokuje startu aktora
+// Lazy-load onnxruntime-node — missing package does not block actor startup
 let ort = null;
 try {
     ort = require('onnxruntime-node');
 } catch (_) {
-    // onnxruntime-node niedostępny — aktor użyje RPC
+    // onnxruntime-node unavailable — actor will use RPC
 }
 
 class Actor {
@@ -31,13 +31,37 @@ class Actor {
         this.running = false;
         this.episodeEquity = 0;
         this.cumulativePnl = 0;
-        this._lastEpisodeLogTime = 0;  // throttle dla linii informacyjnej w start()
-        this._lastTableLogTime   = 0;  // throttle dla tabeli epizodu (niezależny)
+        this._lastEpisodeLogTime = 0;  // throttle for info line in start()
+        this._lastTableLogTime   = 0;  // throttle for episode table (independent)
         this.episodeMirror = globalConfig.training.episode_mirror ?? false;
+        this.throttleMs = 0;  // per-episode delay sent by learner when buffer is full
 
         // ONNX local inference state
         this._onnxSession = null;
         this._onnxMtime   = 0;
+        this._onnxStatCheckedAt = 0;  // throttle fs.statSync — check file at most once every 5s
+
+        // Pre-computed ONNX constants (instead of computing per-inference)
+        this._tfKeysSorted = Object.keys(globalConfig.timeframes)
+            .filter(k => globalConfig.timeframes[k] > 0)
+            .sort();
+        this._numFeatures = globalConfig.features.num_features;
+    }
+
+    /**
+     * Weighted action sample with mask — blocked actions (mask=0) get weight 0.
+     * Used in epsilon-greedy exploration and as fallback after RPC error.
+     */
+    _sampleWeightedAction(actionMask, weights) {
+        const w = actionMask.map((m, i) => m === 1 ? weights[i] : 0);
+        const total = w.reduce((a, b) => a + b, 0);
+        if (total === 0) return actionMask.indexOf(1);
+        let r = Math.random() * total;
+        for (let i = 0; i < w.length; i++) {
+            r -= w[i];
+            if (r <= 0) return i;
+        }
+        return w.length - 1;
     }
 
     async loadData() {
@@ -45,11 +69,11 @@ class Actor {
         for (const tf of TIMEFRAME_INTERVALS) {
             const configKey   = `candles_${tf}`;
             const stateWindow = this.config.timeframes[configKey] || 0;
-            if (stateWindow === 0) continue;  // TF wyłączony w konfiguracji
+            if (stateWindow === 0) continue;  // TF disabled in config
 
             try {
-                // W trybie file getData zwraca wszystkie dostępne świece (limit ignorowany).
-                // W trybie API stateWindow służy jako limit (tylko ostatnie N świec real-time).
+                // In file mode getData returns all available candles (limit ignored).
+                // In API mode stateWindow is used as limit (only the last N real-time candles).
                 const candles = await this.binanceClient.getData(this.symbol, tf, stateWindow);
                 candlesPerTf[tf] = candles;
                 console.log(`[Actor:${this.symbol}] Loaded ${candles.length} candles for ${tf}`);
@@ -68,10 +92,10 @@ class Actor {
     }
 
     /**
-     * Obcina dane do okna wyznaczonego przez training_months + validation_weeks/days.
-     * Zostawia też bufor rozgrzewki (candles_1d dni) przed treningiem — sieć potrzebuje
-     * pełnego okna 1d na początku danych treningowych.
-     * Tylko tryb file; w trybie API dane już są ograniczone do N ostatnich świec.
+     * Trims data to the window defined by training_months + validation_weeks/days.
+     * Also leaves a warmup buffer (candles_1d days) before training — the network needs
+     * a full 1d window at the start of training data.
+     * File mode only; in API mode data is already limited to the last N candles.
      */
     _applyDataWindow(candlesPerTf) {
         const trainingMonths  = this.config.training.training_months  || 0;
@@ -79,7 +103,7 @@ class Actor {
         const validationDays  = validationWeeks
             ? validationWeeks * 7
             : this.config.training.validation_days;
-        // Warmup = okno 1d-owe (największy TF) — tyle dni musi być przed pierwszym epizod
+        // Warmup = 1d window (largest TF) — this many days must precede the first episode
         const warmupDays = this.config.timeframes.candles_1d || 0;
 
         const candles1m = candlesPerTf['1m'];
@@ -102,17 +126,17 @@ class Actor {
             }
             const countAfter = (candlesPerTf['1m'] || []).length;
 
-            console.log(`[Actor:${this.symbol}] ── Okno danych (training_months=${trainingMonths}) ──`);
-            console.log(`  Rozgrzewka (buffor sieci):  ${warmupDays} dni`);
-            console.log(`  Trening:                    ${trainingMonths * 30} dni (~${trainingMonths} mies.)`);
-            console.log(`  Walidacja:                  ${validationDays} dni${validationWeeks ? ` (${validationWeeks} tyg.)` : ''}`);
-            console.log(`  Łącznie w oknie:            ${warmupDays + trainingMonths * 30 + validationDays} dni`);
-            console.log(`  Świece 1m: ${countBefore} → ${countAfter} (odcięto ${countBefore - countAfter})`);
+            console.log(`[Actor:${this.symbol}] ── Data window (training_months=${trainingMonths}) ──`);
+            console.log(`  Warmup (network buffer):    ${warmupDays} days`);
+            console.log(`  Training:                   ${trainingMonths * 30} days (~${trainingMonths} months)`);
+            console.log(`  Validation:                 ${validationDays} days${validationWeeks ? ` (${validationWeeks} weeks)` : ''}`);
+            console.log(`  Total in window:            ${warmupDays + trainingMonths * 30 + validationDays} days`);
+            console.log(`  1m candles: ${countBefore} → ${countAfter} (trimmed ${countBefore - countAfter})`);
         } else {
-            // Brak obcinania treningu — pokaż tylko statystyki
+            // No training trim — showing statistics only
             const trainDays = totalDaysRaw - validationDays;
-            console.log(`[Actor:${this.symbol}] Dane: ${totalDaysRaw} dni łącznie`);
-            console.log(`  Trening: ~${trainDays} dni | Walidacja: ${validationDays} dni${validationWeeks ? ` (${validationWeeks} tyg.)` : ''} | Rozgrzewka: ${warmupDays} dni (buffor sieci)`);
+            console.log(`[Actor:${this.symbol}] Data: ${totalDaysRaw} days total`);
+            console.log(`  Training: ~${trainDays} days | Validation: ${validationDays} days${validationWeeks ? ` (${validationWeeks} weeks)` : ''} | Warmup: ${warmupDays} days (network buffer)`);
         }
     }
 
@@ -133,7 +157,8 @@ class Actor {
                 const _now = Date.now();
                 if (_now - this._lastEpisodeLogTime >= 5000) {
                     this._lastEpisodeLogTime = _now;
-                    console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes} | ${episodeTime}ms | steps=${this.totalSteps} | sps=${episodeSps} (avg ${totalSps}) | trades=${this.env.getTrades().length}`);
+                    const throttleStr = this.throttleMs > 0 ? ` | throttle=${this.throttleMs}ms` : '';
+                    console.log(`[Actor:${this.symbol}] Episode ${this.totalEpisodes} | ${episodeTime}ms | steps=${this.totalSteps} | sps=${episodeSps} (avg ${totalSps}) | trades=${this.env.getTrades().length}${throttleStr}`);
                 }
             } catch (err) {
                 console.error(`[Actor:${this.symbol}] Episode error: ${err.message}`);
@@ -151,39 +176,30 @@ class Actor {
         let actionMask = this.env.getActionMask();
         const episodeLog = [];
 
-        // Rozgraj cały epizod zbierając kroki w env.episode
+        // Play the entire episode collecting steps in env.episode
         while (!done && this.running) {
             let action;
             let wasRandom = false;
             let qValues = null;
 
-            // Zapisz cenę i czas przed krokiem (po kroku indeks jest przesunięty)
+            // Record price and timestamp before step (index shifts after step)
             const stepPrice = this.env.getCurrentPrice();
             const stepTimestamp = this.env.getCurrentTimestamp();
             const positionBefore = this.env.position ? this.env.position.side : null;
-            const maskBeforeStep = [...actionMask];  // maska użyta do decyzji (przed step)
+            const maskBeforeStep = [...actionMask];  // mask used for decision (before step)
 
             if (Math.random() < this.epsilon) {
                 wasRandom = true;
-                // LONG=13%, SHORT=13%, HOLD=60%, CLOSE=13% — ważona losowość
-                // Zablokowane akcje (maska=0) dostają wagę 0, reszta renormalizowana
-                const WEIGHTS = [13, 13, 60, 13];
-                const weights = actionMask.map((m, i) => m === 1 ? WEIGHTS[i] : 0);
-                const total = weights.reduce((a, b) => a + b, 0);
-                let r = Math.random() * total;
-                action = 0;
-                for (let i = 0; i < weights.length; i++) {
-                    r -= weights[i];
-                    if (r <= 0) { action = i; break; }
-                }
+                // LONG=13%, SHORT=13%, HOLD=60%, CLOSE=13% — weighted random
+                action = this._sampleWeightedAction(actionMask, [13, 13, 60, 13]);
             } else {
-                // 1. Spróbuj lokalnego wnioskowania ONNX (brak latencji TCP)
+                // 1. Try local ONNX inference (no TCP latency)
                 const onnxResult = await this._inferOnnx(state, actionMask);
                 if (onnxResult) {
                     action  = onnxResult.action;
                     qValues = onnxResult.qValues;
                 } else {
-                    // 2. Fallback: RPC do Python
+                    // 2. Fallback: RPC to Python
                     try {
                         const response = await this.pythonClient.predict(state, actionMask);
                         action  = response.action;
@@ -192,15 +208,8 @@ class Actor {
                     } catch (err) {
                         wasRandom = true;
                         console.warn(`[Actor:${this.symbol}] Python error: ${err.message}, using random`);
-                        const WEIGHTS = [2, 2, 94, 2];
-                        const weights = actionMask.map((m, i) => m === 1 ? WEIGHTS[i] : 0);
-                        const total = weights.reduce((a, b) => a + b, 0);
-                        let r = Math.random() * total;
-                        action = 0;
-                        for (let i = 0; i < weights.length; i++) {
-                            r -= weights[i];
-                            if (r <= 0) { action = i; break; }
-                        }
+                        // After RPC error heavily favor HOLD — safe default action
+                        action = this._sampleWeightedAction(actionMask, [2, 2, 94, 2]);
                     }
                 }
             }
@@ -210,6 +219,9 @@ class Actor {
             state = result.nextState;
             actionMask = result.actionMask;
             this.totalSteps++;
+            if (this.throttleMs > 0) {
+                await new Promise(r => setTimeout(r, this.throttleMs));
+            }
 
             episodeLog.push({
                 price:          stepPrice,
@@ -226,7 +238,7 @@ class Actor {
             });
         }
 
-        // Pobierz doświadczenia zgodnie z return_mode
+        // Retrieve experiences according to return_mode
         const returnMode = (this.config.training.return_mode || 'mc').toLowerCase();
         const nStep      = this.config.training.n_step || 5;
 
@@ -240,7 +252,7 @@ class Actor {
             experiences = this.env.episode.getExperiencesTD();
             modeLabel   = 'TD';
         } else {
-            // "mc" — zachowanie oryginalne
+            // "mc" — original behavior
             experiences = this.env.getEpisodeExperiences();
             modeLabel   = 'MC';
         }
@@ -256,7 +268,7 @@ class Actor {
         const _now = Date.now();
         if (_now - this._lastTableLogTime >= 5000) {
             this._lastTableLogTime = _now;
-            this._printEpisodeLog(episodeLog, experiences, mirrorEnabled ? 'ORYGINAŁ' : '');
+            this._printEpisodeLog(episodeLog, experiences, mirrorEnabled ? 'ORIGINAL' : '');
             if (mirrorEnabled && mirrorExperiences) {
                 this._printEpisodeLog(mirrorEpisodeLog, mirrorExperiences, 'MIRROR');
             }
@@ -289,7 +301,7 @@ class Actor {
 
                 const batch = experiences.map(step => _toEntry(step));
 
-                // Dodaj metryki epizodu do ostatniego wpisu — learner zbiera je osobno
+                // Add episode metrics to last entry — learner collects them separately
                 const epMetrics = this.env.getMetrics();
                 const ac = epMetrics.action_counts || [0, 0, 0, 0];
                 batch[batch.length - 1].metrics = {
@@ -299,7 +311,7 @@ class Actor {
                     episode_losses:            epMetrics.losses            || 0,
                     episode_pnl:               epMetrics.net_pnl           || 0,
                     episode_max_consec_losses: epMetrics.max_consecutive_losses || 0,
-                    // Statystyki handlowe
+                    // Trade statistics
                     episode_profit_sum:        epMetrics.profit_sum        || 0,
                     episode_loss_sum:          epMetrics.loss_sum          || 0,
                     episode_win_hold_steps:    epMetrics.win_hold_steps    || 0,
@@ -308,7 +320,7 @@ class Actor {
                     episode_gap_steps:         epMetrics.gap_steps         || [],
                     episode_long_opens:        epMetrics.long_opens        || 0,
                     episode_short_opens:       epMetrics.short_opens       || 0,
-                    // Rozkład akcji
+                    // Action distribution
                     episode_action_long:       ac[0] || 0,
                     episode_action_short:      ac[1] || 0,
                     episode_action_hold:       ac[2] || 0,
@@ -324,6 +336,7 @@ class Actor {
                 const batchResp = await this.pythonClient.sendBatch(batch);
                 if (batchResp && batchResp.epsilon != null) this.epsilon = batchResp.epsilon;
                 if (batchResp && batchResp.loss_scale != null) this.env.rewardConfig.loss_scale = batchResp.loss_scale;
+                if (batchResp && batchResp.throttle_ms != null) this.throttleMs = batchResp.throttle_ms;
             }
         } catch (err) {
             console.warn(`[Actor:${this.symbol}] Batch send failed: ${err.message}`);
@@ -516,7 +529,7 @@ class Actor {
             gray:   s => `\x1b[2m${s}\x1b[0m`,
             bold:   s => `\x1b[1m${s}\x1b[0m`,
         };
-        // Kolor per akcja: LONG=zielony, SHORT=czerwony, HOLD=szary, CLOSE=żółty
+        // Action color: LONG=green, SHORT=red, HOLD=gray, CLOSE=yellow
         const ACTION_COLORS = [c.green, c.red, c.gray, c.yellow];
 
         const ep = this.totalEpisodes + 1;
@@ -561,7 +574,7 @@ class Actor {
                 : ACTION_COLORS[actionIdx](str);
         };
 
-        // Formatuj składową nagrody: puste gdy zero, kolorowe gdy niezerowe
+        // Format reward component: empty when zero, colored when non-zero
         const fmtR = v => {
             if (v === 0 || v == null) return '';
             const s = v >= 0 ? `+${v.toFixed(4)}` : v.toFixed(4);
@@ -578,7 +591,7 @@ class Actor {
 
             const price = row.price != null ? row.price.toFixed(2) : '';
 
-            // uPNL — niezrealizowany zysk otwartej pozycji
+            // uPNL — unrealized gain of open position
             let uPnl = '';
             if (row.posAfter && row.posOpenPrice && row.price != null) {
                 const raw = row.posAfter === 'SHORT'
@@ -634,13 +647,21 @@ class Actor {
     // ── ONNX local inference ────────────────────────────────────────────────
 
     /**
-     * Zwraca aktywną sesję ONNX (wczytuje lub przeładowuje gdy plik się zmienił).
-     * Zwraca null gdy ONNX wyłączony, pakiet niedostępny lub plik nie istnieje jeszcze.
+     * Returns the active ONNX session (loads or reloads when file changes).
+     * Returns null when ONNX is disabled, package unavailable, or file not yet exported.
      */
     async _getOnnxSession() {
         if (!ort) return null;
         const onnxCfg = this.config.onnx || {};
         if (!onnxCfg.enabled) return null;
+
+        // Throttle fs.statSync to 1×/5s — network updates after target_update_interval (order of seconds),
+        // so checking mtime every step would be blocking I/O with no benefit.
+        const now = Date.now();
+        if (this._onnxSession && (now - this._onnxStatCheckedAt) < 5000) {
+            return this._onnxSession;
+        }
+        this._onnxStatCheckedAt = now;
 
         const modelPath = onnxCfg.export_path || 'python/checkpoints/model.onnx';
         try {
@@ -660,23 +681,21 @@ class Actor {
             }
             return this._onnxSession;
         } catch (_) {
-            return null;  // model jeszcze nie wyeksportowany
+            return null;  // model not yet exported
         }
     }
 
     /**
-     * Lokalne wnioskowanie przez ONNX — O(0.1–0.5 ms) zamiast 1–5 ms TCP.
-     * Zwraca { action, qValues } lub null gdy ONNX niedostępny.
+     * Local ONNX inference — O(0.1–0.5 ms) instead of 1–5 ms TCP.
+     * Returns { action, qValues } or null when ONNX is unavailable.
      */
     async _inferOnnx(state, actionMask) {
         const session = await this._getOnnxSession();
         if (!session) return null;
 
         try {
-            const tfKeys      = Object.keys(this.config.timeframes)
-                .filter(k => this.config.timeframes[k] > 0)
-                .sort();
-            const numFeatures = this.config.features.num_features;
+            const tfKeys      = this._tfKeysSorted;
+            const numFeatures = this._numFeatures;
 
             const feeds = {};
 
@@ -697,14 +716,21 @@ class Actor {
                 feeds[`tf_${i}`] = new ort.Tensor('float32', arr, [1, seqLen, numFeatures]);
             }
 
-            const posData = (state && state.position) || [0, 0, 0, 0];
-            feeds['pos_features'] = new ort.Tensor('float32', new Float32Array(posData.slice(0, 10)), [1, 10]);
+            // pos_features has 10 dimensions (matching ONNX export in trainer.py);
+            // Float32Array(10) zeros by default — length mismatch with [1,10] tensor breaks ONNX.
+            const posArr = new Float32Array(10);
+            const posData = state && state.position;
+            if (posData) {
+                const n = Math.min(posData.length, 10);
+                for (let k = 0; k < n; k++) posArr[k] = posData[k];
+            }
+            feeds['pos_features'] = new ort.Tensor('float32', posArr, [1, 10]);
             feeds['action_mask']  = new ort.Tensor('float32', new Float32Array(actionMask), [1, 4]);
 
             const results = await session.run(feeds);
             const qRaw    = Array.from(results['q_values'].data);
 
-            // Wybierz najlepszą dozwoloną akcję
+            // Select best allowed action
             let bestAction = -1, bestQ = -Infinity;
             for (let a = 0; a < qRaw.length; a++) {
                 if (actionMask[a] === 1 && qRaw[a] > bestQ) {
@@ -712,13 +738,13 @@ class Actor {
                     bestAction = a;
                 }
             }
-            if (bestAction === -1) bestAction = actionMask.indexOf(1);  // fallback
+            if (bestAction === -1) bestAction = actionMask.indexOf(1);  // no valid action found
 
             return { action: bestAction, qValues: qRaw };
 
         } catch (err) {
             console.warn(`[Actor:${this.symbol}] ONNX inference error: ${err.message}`);
-            this._onnxSession = null;  // wymuś przeładowanie przy następnej próbie
+            this._onnxSession = null;  // force reload on next attempt
             return null;
         }
     }

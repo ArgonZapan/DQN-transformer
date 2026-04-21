@@ -45,74 +45,74 @@ Sender (PUSH) ──► message ──► Receiver (PULL)
 
 ## Typy wiadomości
 
-### Step (REQ/REP)
+### Batch Predict (REQ/REP) — główny kanał
 
-**Kierunek:** Actor → Learner → Actor
+**Kierunek:** ActorManager → Learner → ActorManager
 
-**Request:**
+ActorManager zbiera requesty od wszystkich aktorów i wysyła jeden **batch** do Learnera:
+
+**Request (lista, jeden element per aktor):**
 ```json
-{
-    "state": {
-        "1m": [[...], [...], ...],
-        "15m": [[...], [...], ...],
-        "1h": [[...], [...], ...],
-        "1d": [[...], [...], ...],
-        "1w": [[...], [...], ...]
+[
+    {
+        "actorId": "BTCUSDT",
+        "symbol": "BTCUSDT",
+        "state": {
+            "candles_1m":  [[...11 cech...], ...60 świec...],
+            "candles_15m": [[...], ...32 świece...],
+            "candles_1h":  [[...], ...48 świec...],
+            "candles_1d":  [[...], ...14 świec...]
+        },
+        "positionFeatures": [0, 1, -0.02, 0.12, 0.01, 0.5, 0.87, ...],
+        "actionMask": [0, 0, 1, 1],
+        "metrics": {
+            "transactions": 5,
+            "episode_pnl": 0.023,
+            "win": true
+        }
     },
-    "action": 0,
-    "reward": 0.05,
-    "next_state": {...},
-    "done": false
-}
-```
-
-**Response:**
-```json
-{
-    "nextAction": 2
-}
-```
-
-### Predict (REQ/REP)
-
-**Kierunek:** Actor → Learner → Actor
-
-**Request:**
-```json
-{
-    "state": {
-        "1m": [[...], ...],
-        "15m": [[...], ...],
-        "1h": [[...], ...],
-        "1d": [[...], ...],
-        "1w": [[...], ...]
+    {
+        "actorId": "ETHUSDT",
+        ...
     }
-}
+]
 ```
 
-**Response:**
+**Response (lista, jeden element per aktor):**
 ```json
-{
-    "action": 1,
-    "qValues": [0.1, 0.8, -0.2]
-}
+[
+    {
+        "action": 3,
+        "qValues": [−0.12, −0.08, 0.05, 0.21],
+        "epsilon": 0.72
+    },
+    {...}
+]
 ```
 
-### Step (z doświadczeniem) — REQ/REP
+### Wysyłanie doświadczeń — osobny batch
 
-**Kierunek:** Actor → Learner → Actor
-
-Doświadczenie jest **częścią requestu step** — Learner zapisuje je do replay buffer po odebraniu.
+Na końcu epizodu ActorManager wysyła **osobny batch doświadczeń** (nie w predict request):
 
 ```json
-{
-    "state": {...},
-    "action": 0,
-    "reward": 0.05,
-    "nextState": {...},
-    "done": false,
-    "actionMask": [1, 1, 1, 0]
-}
+[
+    {
+        "actorId": "BTCUSDT",
+        "experiences": [
+            {
+                "state": {...},
+                "action": 0,
+                "reward": −0.00075,
+                "nextState": {...},
+                "done": false,
+                "actionMask": [0, 0, 1, 1],
+                "returnG": −0.023,
+                "gammaToN": 0.489
+            },
+            ...
+        ]
+    }
+]
 ```
 
 ### Status (Monitoring Service HTTP GET)

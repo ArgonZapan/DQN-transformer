@@ -1,7 +1,7 @@
 /**
- * System nagradzania — realized P&L z karami za drawdown i zbyt długie trzymanie pozycji.
- * Nagroda końcowa dawana tylko przy zamknięciu pozycji.
- * Wszystkie wartości z config.toml [reward].
+ * Reward system — realized P&L with penalties for drawdown and holding too long.
+ * Final reward given only on position close.
+ * All values from config.toml [reward].
  */
 
 function calculatePnL(position) {
@@ -17,8 +17,8 @@ function calculatePnL(position) {
 }
 
 function calculateOpenPenalty(rewardConfig, stepsSinceClose = Infinity) {
-    // Natychmiastowy koszt wejścia w pozycję — model czuje go zaraz po otwarciu.
-    // Jeśli otwarcie następuje zbyt szybko po zamknięciu (cooldown), trade_penalty jest podwojona.
+    // Immediate cost of entering a position — model feels it right after opening.
+    // If opening occurs too soon after a close (cooldown), trade_penalty is doubled.
     const cooldown = rewardConfig.post_close_cooldown_steps ?? 0;
     const inCooldown = cooldown > 0 && stepsSinceClose < cooldown;
     const tradePenalty = inCooldown ? rewardConfig.trade_penalty * 2 : rewardConfig.trade_penalty;
@@ -26,24 +26,24 @@ function calculateOpenPenalty(rewardConfig, stepsSinceClose = Infinity) {
 }
 
 function calculateReward(position, rewardConfig) {
-    // Nagroda przy zamknięciu:
-    //   1. PnL zdyskontowany za zbyt długie trzymanie (time decay)
-    //   2. Minus prowizja zamknięcia i close_penalty
-    //   3. Minus kara za maksymalny drawdown podczas trzymania
-    // (prowizja za otwarcie i trade_penalty zostały już odliczone przy otwarciu)
+    // Reward on close:
+    //   1. PnL discounted for holding too long (time decay)
+    //   2. Minus close commission and close_penalty
+    //   3. Minus penalty for max drawdown during holding
+    // (open commission and trade_penalty were already deducted at open)
     if (!position || !position.closed) return 0;
 
     const pnl = calculatePnL(position);
 
-    // Time decay: PnL mnożony przez 1/(1 + t/half_life).
-    // Przy t=0 → decay=1.0 (brak kary). Przy t=time_decay_hours → decay=0.5 (połowa PnL).
-    // Zniechęca do przetrzymywania pozycji bez wyraźnego trendu.
+    // Time decay: PnL multiplied by 1/(1 + t/half_life).
+    // At t=0 → decay=1.0 (no penalty). At t=time_decay_hours → decay=0.5 (half PnL).
+    // Discourages holding positions without a clear trend.
     const holdingTimeHours = (position.closeTime - position.openTime) / 3_600_000;
     const timeDecay = 1.0 / (1.0 + holdingTimeHours / rewardConfig.time_decay_hours);
     const pnlDecayed = pnl * timeDecay;
 
-    // Kara za drawdown: im głębszy obsunięcie kapitału podczas trzymania, tym większa kara.
-    // maxDrawdown jest w [0, 1] (frakcja ceny), drawdown_penalty skaluje jej wpływ.
+    // Drawdown penalty: deeper drawdown during holding → larger penalty.
+    // maxDrawdown is in [0, 1] (price fraction), drawdown_penalty scales its impact.
     const drawdownPenalty = (position.maxDrawdown || 0) * rewardConfig.drawdown_penalty;
 
     const closePenalty = rewardConfig.close_penalty ?? 0;

@@ -1,9 +1,9 @@
 """
-BaselineComparator — porównuje wytrenowaną sieć z losową bazą.
+BaselineComparator — compares the trained network against a random baseline.
 
-Oblicza te same metryki co HealthRunner na losowej sieci (random weights)
-raz na początku treningu. Służy do oceny czy sieć faktycznie poprawia się
-ponad przypadkowy punkt startowy.
+Computes the same metrics as HealthRunner on a randomly-weighted network,
+once at the start of training. Used to assess whether the network actually
+improves above a random starting point.
 """
 
 import json
@@ -25,14 +25,15 @@ class BaselineComparator:
         self.baseline: dict | None = None
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        # Załaduj istniejący baseline jeśli jest (np. po restarcie)
-        if os.path.exists(output_path):
-            try:
-                with open(output_path, 'r', encoding='utf-8') as f:
-                    self.baseline = json.load(f)
-                logger.info(f'[Baseline] Loaded existing baseline from {output_path}')
-            except Exception:
-                pass
+        # Load existing baseline if available (e.g. after restart)
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                self.baseline = json.load(f)
+            logger.info(f'[Baseline] Loaded existing baseline from {output_path}')
+        except FileNotFoundError:
+            pass
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f'[Baseline] Failed to load {output_path}: {e}')
 
     @property
     def computed(self) -> bool:

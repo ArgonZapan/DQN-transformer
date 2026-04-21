@@ -10,8 +10,6 @@ Wymaga network.py z average_attn_weights=False w MultiheadAttention.
 """
 
 import logging
-import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -76,23 +74,24 @@ class AttentionMonitor:
             # Uśrednij po batch
             w = weights.mean(0)   # [heads, seq, seq]
 
-            entropies = []
-            for h in range(H):
-                head_w = w[h]   # [seq, seq] — dla każdego query: distribution nad keys
-                # Entropia każdego wiersza (query), mean po queries
-                ent = self._row_entropy(head_w)
-                entropies.append(ent)
+            # Entropia per głowa — wektoryzowane: jeden sync zamiast H
+            p = w.clamp(min=1e-9)
+            p = p / p.sum(dim=-1, keepdim=True)
+            ent_per_head = -(p * p.log()).sum(dim=-1).mean(dim=-1)   # [heads]
+            entropies = ent_per_head.tolist()
+            for h, ent in enumerate(entropies):
                 self.writer.add_scalar(f'Attention/block{block_idx}/head{h}_entropy', ent, step)
-
             mean_ent = sum(entropies) / len(entropies)
             self.writer.add_scalar(f'Attention/block{block_idx}/mean_entropy', mean_ent, step)
 
-            # Dywergencja KL między głowami (max KL z każdej pary)
-            max_kl = 0.0
-            for i in range(H):
-                for j in range(i + 1, H):
-                    kl = self._kl_divergence(w[i], w[j])
-                    max_kl = max(max_kl, kl)
+            # Symetryczna KL między wszystkimi parami głów — jeden sync na blok
+            log_p = p.log()
+            # KL(p_i || p_j) per row, mean po queries:  sum_k p_i(k) * (log p_i(k) - log p_j(k))
+            # → tensor [H, H]
+            kl_pq = (p.unsqueeze(1) * (log_p.unsqueeze(1) - log_p.unsqueeze(0))).sum(dim=-1).mean(dim=-1)
+            sym_kl = (kl_pq + kl_pq.t()) / 2.0
+            sym_kl.fill_diagonal_(0.0)
+            max_kl = sym_kl.max().item()
             self.writer.add_scalar(f'Attention/block{block_idx}/head_divergence', max_kl, step)
 
             # Koncentracja: max weight per row, mean po batch i queries
@@ -104,26 +103,6 @@ class AttentionMonitor:
 
         self._attn_cache.clear()
         return result
-
-    @staticmethod
-    def _row_entropy(w: torch.Tensor) -> float:
-        """Entropia per wiersz, uśredniona. w: [seq, seq]"""
-        p = w.clamp(min=1e-9)
-        p = p / p.sum(dim=-1, keepdim=True)
-        ent = -(p * p.log()).sum(dim=-1).mean().item()
-        return ent
-
-    @staticmethod
-    def _kl_divergence(p_mat: torch.Tensor, q_mat: torch.Tensor) -> float:
-        """Symetryczna KL dywergencja między dwoma macierzami attention. p,q: [seq, seq]"""
-        eps = 1e-9
-        p = p_mat.clamp(min=eps)
-        q = q_mat.clamp(min=eps)
-        p = p / p.sum(dim=-1, keepdim=True)
-        q = q / q.sum(dim=-1, keepdim=True)
-        kl_pq = (p * (p / q).log()).sum(dim=-1).mean().item()
-        kl_qp = (q * (q / p).log()).sum(dim=-1).mean().item()
-        return (kl_pq + kl_qp) / 2.0
 
     def remove(self) -> None:
         self._remove_hooks()

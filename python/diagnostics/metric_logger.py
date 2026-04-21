@@ -7,6 +7,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 
 
 class MetricLogger:
@@ -20,12 +21,13 @@ class MetricLogger:
     def log(self, step: int, metrics: dict) -> None:
         record = {'step': step, 'ts': time.time()}
         for k, v in metrics.items():
-            if v is None:
-                record[k] = None
-            elif isinstance(v, float) and math.isnan(v):
-                record[k] = 'nan'
-            elif isinstance(v, float) and math.isinf(v):
-                record[k] = 'inf' if v > 0 else '-inf'
+            if isinstance(v, float):
+                if math.isnan(v):
+                    record[k] = 'nan'
+                elif math.isinf(v):
+                    record[k] = 'inf' if v > 0 else '-inf'
+                else:
+                    record[k] = v
             else:
                 record[k] = v
         self._buffer.append(record)
@@ -40,19 +42,20 @@ class MetricLogger:
     def read_window(self, last_n: int = 1000) -> list:
         """Wczytuje ostatnie last_n rekordów z pliku."""
         self._flush()
-        records = []
+        window = deque(maxlen=last_n)
         try:
             with open(self.path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
-                    if line:
-                        try:
-                            records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
+                    if not line:
+                        continue
+                    try:
+                        window.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
         except FileNotFoundError:
             return []
-        return records[-last_n:]
+        return list(window)
 
     def close(self) -> None:
         self._flush()

@@ -319,10 +319,16 @@ if step % evaluation_interval == 0:
 
 ```toml
 [monitoring]
-host = "tcp://127.0.0.1"
-port = 3001
+host                     = "tcp://127.0.0.1"
+port                     = 3001           # ZMQ PUSH — metryki z Learnera → Monitoring
+metrics_pull_port        = 3002           # ZMQ PULL — Monitoring odbiera metryki Aktorów
 metrics_push_interval_sec = 5
 dashboard_poll_interval_sec = 60
+
+[learner]
+metrics_port = 5556   # ZMQ PUB — epsilon/loss_scale do Aktorów (subskrypcja)
+```
+
 ## Metryki tradingowe
 
 Oprócz Sharpe ratio i drawdown, system zbiera podstawowe metryki tradingowe które szybciej pokażą czy sieć uczy się czegoś sensownego.

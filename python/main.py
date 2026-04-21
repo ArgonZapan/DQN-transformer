@@ -24,8 +24,10 @@ def setup_logging(config):
     os.makedirs(log_dir, exist_ok=True)
 
     log_file = os.path.join(log_dir, 'learner.log')
-    if os.path.exists(log_file):
+    try:
         os.remove(log_file)
+    except FileNotFoundError:
+        pass
 
     handler = logging.handlers.RotatingFileHandler(
         log_file,
@@ -33,8 +35,9 @@ def setup_logging(config):
         backupCount=log_cfg['max_files'],
         encoding='utf-8',
     )
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
     console = logging.StreamHandler()
-    console.stream = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
 
     formatter = logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s')
     handler.setFormatter(formatter)
@@ -71,7 +74,7 @@ def main():
 
     health_runner = HealthRunner(trainer, check_interval_sec=3600)
     baseline_comparator = BaselineComparator(config, config['learner']['device'])
-    _baseline_done = baseline_comparator.computed   # True jeśli załadowano z pliku
+    _baseline_done = baseline_comparator.computed   # True if loaded from file
 
     telegram_commands = TelegramCommands(config, trainer, trainer.training_report)
     telegram_commands.start()
@@ -84,7 +87,7 @@ def main():
 
     zmq_server = ZMQServer(config, trainer)
 
-    # Ścieżka absolutna — niezależna od CWD
+    # Absolute path — independent of CWD
     shutdown_flag = os.path.abspath(os.path.join(os.path.dirname(__file__), 'shutdown.flag'))
     if os.path.exists(shutdown_flag):
         os.remove(shutdown_flag)
@@ -99,9 +102,11 @@ def main():
         logger.info("Checkpoint saved. Shutting down.")
         zmq_server.close()
         monitor.close()
-        # Usuń flagę po zapisie — stop.bat czeka aż flaga zniknie
-        if os.path.exists(shutdown_flag):
+        # Remove flag after save — stop.bat waits until the flag is gone
+        try:
             os.remove(shutdown_flag)
+        except FileNotFoundError:
+            pass
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, graceful_shutdown)
@@ -113,7 +118,7 @@ def main():
         last_push = 0.0
         last_buffer_log = 0.0
         training_started = False
-        sps_anchor_step = None  # None = czekaj na pierwszy log żeby ustawić anchor
+        sps_anchor_step = None  # None = wait for first log to set anchor
 
         while zmq_server.running:
             if getattr(trainer, '_paused', False):
@@ -135,7 +140,7 @@ def main():
                     trainer.alert_system.notify_training_started(trainer.step_count, len(trainer.buffer))
                     training_started = True
 
-                # Baseline — raz po zapełnieniu buffera
+                # Baseline — once after buffer is full
                 if not _baseline_done:
                     try:
                         baseline_comparator.compute(trainer.buffer)
@@ -188,7 +193,7 @@ def main():
             time.sleep(1)
             if os.path.exists(shutdown_flag):
                 logger.info("[Learner] Shutdown flag detected — saving checkpoint...")
-                graceful_shutdown(None, None)  # usuwa flagę po zapisie, potem sys.exit
+                graceful_shutdown(None, None)  # removes flag after save, then sys.exit
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         graceful_shutdown(None, None)

@@ -47,3 +47,9 @@ Po każdym zakończonym bloku pracy (nowa funkcja, poprawka, refaktor) wykonaj w
 ## Gitignore
 
 Plik `.gitignore` powinien już wykluczać powyższe. Jeśli nie — uzupełnij go zanim zrobisz commit.
+
+## Język komentarzy w kodzie
+
+Komentarze w kodzie piszemy **wyłącznie po angielsku**.
+
+Jeśli napotkasz komentarz w innym języku (polskim lub innym) — zaktualizuj go na angielski zanim skończysz pracę z danym plikiem.

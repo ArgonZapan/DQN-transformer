@@ -6,36 +6,34 @@ Konfiguracja systemu opiera się na **jednym pliku TOML** — zero hardcoded zmi
 
 ## Konfiguracja config.toml
 
-### Pełny przykład
+### Pełny przykład (aktualna konfiguracja)
+
+Poniższy fragment odzwierciedla kluczowe sekcje aktualnego `config.toml`. Pełna konfiguracja w pliku źródłowym.
 
 ```toml
 [learner]
 host = "tcp://127.0.0.1"
 port = 5555
 metrics_port = 5556
-device = "cuda"
+device = "cuda"   # "cuda" | "cpu" | "auto"
+num_threads = 12
 
 [[actors]]
 symbol = "BTCUSDT"
 exchange = "binance"
 leverage = 1
 
-[[actors]]
-symbol = "ETHUSDT"
-exchange = "binance"
-leverage = 1
-
-[[actors]]
-symbol = "SOLUSDT"
-exchange = "binance"
-leverage = 1
+# ... (ETH, SOL, BNB, XRP analogicznie)
 
 [timeframes]
-candles_1m  = 15
-candles_15m = 15
-candles_1h  = 20
-candles_1d  = 30
-candles_1w  = 54
+candles_1m  = 60
+candles_15m = 32
+candles_1h  = 48
+candles_1d  = 14
+candles_1w  = 0    # 0 = wyłączony
+
+[features]
+num_features = 11
 
 [monitoring]
 host = "tcp://127.0.0.1"
@@ -45,18 +43,19 @@ metrics_push_interval_sec = 5
 dashboard_poll_interval_sec = 60
 
 [training]
-gamma = 0.999
-lr = 0.0001
-batch_size = 256
-buffer_capacity = 500000
-min_buffer_size = 10000
+gamma             = 0.97
+lr                = 1.0e-4
+batch_size        = 512
+buffer_capacity   = 500000
+min_buffer_size   = 100000
 target_update_interval = 1000
-epsilon_start = 1.0
-epsilon_end = 0.05
-epsilon_decay_fraction = 0.3
-dropout = 0.1
-n_step = 1
-seed = 42
+epsilon_start     = 0.90
+epsilon_end       = 0.10
+epsilon_decay_fraction = 0.20
+dropout           = 0.1
+n_step            = 25
+return_mode       = "nstep"
+seed              = 42
 resume_from_checkpoint = ""
 keep_last_n_checkpoints = 5
 checkpoint_interval = 5000

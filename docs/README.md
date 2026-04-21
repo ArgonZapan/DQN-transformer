@@ -19,6 +19,7 @@ Dokumentacja projektu Trading DQN — architektura Actor-Learner Ape-X z modelem
 | [11. Graceful Shutdown](shutdown.md) | stop.bat, kolejność zamykania, obsługa SIGTERM |
 | [12. Setup i konfiguracja](setup.md) | Instalacja, config.toml, bezpieczeństwo API, logowanie, walidacja |
 | [13. Struktura projektu](structure.md) | Struktura plików i folderów |
+| [14. Diagnostics](diagnostics.md) | AlertSystem, TelegramCommands, HealthRunner, MetricLogger, BaselineComparator |
 
 ## Szybki start
 
@@ -35,12 +36,20 @@ Pełna konfiguracja w pliku `config.toml` — zero hardcoded zmiennych w kodzie.
 ## Architektura w skrócie
 
 ```
-Node.js (Actor)                    Python (Learner)
-├── Symulacja środowiska           ├── Replay Buffer
-├── Logika tradingowa              ├── Trening modelu
-└── Zarządzanie epizodami          └── Predykcje
-        │                                  │
-        └──────── ZeroMQ ──────────────────┘
+Node.js (5 Aktorów: BTC/ETH/SOL/BNB/XRP)
+├── Środowisko tradingowe (symulacja)
+├── Inferencja ONNX lokalna (bez ZMQ) → fallback ZMQ RPC
+├── 11 cech × multi-TF (1m/15m/1h/1d)
+└── Wysyłanie n-step doświadczeń
+
+Python (Learner)                    Diagnostics
+├── DualPrioritizedBuffer           ├── AlertSystem (Telegram)
+├── Double DQN + AMP               ├── TelegramCommands (/status, /ereset...)
+├── Conv1D + Transformer (154 tok.) ├── HealthRunner (co 1h)
+├── ONNX export                     ├── MetricLogger (JSONL)
+└── TensorBoard logging             └── TrainingReport (co 5k update'ów)
+        │
+        └──────── ZeroMQ REP/REQ ──────────────────┘
 ```
 
 ## Stack technologiczny

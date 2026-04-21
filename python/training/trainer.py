@@ -32,8 +32,8 @@ class Trainer:
         self.gamma = training_cfg['gamma']
         self.return_mode = training_cfg.get('return_mode', 'mc').lower()
         n_step = training_cfg.get('n_step', 1)
-        # gamma_n — mnożnik bootstrappingu w celach Bellmana
-        # mc:    done=True wszędzie → (1-done)*gamma_n = 0 → gamma_n nieistotne
+        # gamma_n — bootstrap multiplier in Bellman targets
+        # mc:    done=True everywhere → (1-done)*gamma_n = 0 → gamma_n irrelevant
         # nstep: targets = R_t^n + (1-done) * gamma^n * Q(s_{t+n})
         # td:    targets = r_t   + (1-done) * gamma   * Q(s_{t+1})
         if self.return_mode == 'nstep':
@@ -61,23 +61,23 @@ class Trainer:
         self.target_network.load_state_dict(self.main_network.state_dict())
         self.target_network.eval()
 
-        # Mixed Precision (FP16) — Ampere GPU (3090) ma tensor cores; ~2x speedup
-        # CPU nie obsługuje GradScaler — wyłączamy automatycznie
+        # Mixed Precision (FP16) — Ampere GPU (3090) has tensor cores; ~2x speedup
+        # CPU does not support GradScaler — disabled automatically
         self.use_amp = self.device != 'cpu' and torch.cuda.is_available()
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
         if self.use_amp:
             logger.info("[Trainer] Mixed precision (AMP) enabled")
 
-        # torch.compile — przeniesione na koniec __init__ (po załadowaniu checkpointu),
-        # bo OptimizedModule dodaje prefix `_orig_mod.` do state_dict i zrywa load.
+        # torch.compile — moved to end of __init__ (after checkpoint load),
+        # because OptimizedModule adds `_orig_mod.` prefix to state_dict, breaking load.
         self._compile_enabled = config.get('training', {}).get('compile_model', False)
 
         self.optimizer = torch.optim.Adam(self.main_network.parameters(), lr=self.lr)
         self.loss_fn = nn.MSELoss(reduction='none')
 
-        # CosineAnnealing LR scheduler zsynchronizowany z epsilon decay.
-        # T_max = liczba kroków treningu w fazie decay (epsilon_decay_fraction * buffer_capacity).
-        # Aktywny tylko gdy lr_scheduler = "cosine" w config.
+        # CosineAnnealing LR scheduler synchronized with epsilon decay.
+        # T_max = number of training steps in the decay phase (epsilon_decay_fraction * buffer_capacity).
+        # Active only when lr_scheduler = "cosine" in config.
         lr_sched_cfg = training_cfg.get('lr_scheduler', 'none').lower()
         if lr_sched_cfg == 'cosine':
             total_decay_steps = int(training_cfg['epsilon_decay_fraction'] * training_cfg['buffer_capacity'])
@@ -89,25 +89,19 @@ class Trainer:
         else:
             self.lr_scheduler = None
 
-        # Prealokowane stałe maski dla Double DQN (wcześniej tworzone co krok)
+        # Pre-allocated constant masks for Double DQN (previously created every step)
         self._mask_in_pos = torch.tensor([0, 0, 1, 1], dtype=torch.float32, device=self.device)
         self._mask_no_pos = torch.tensor([1, 1, 1, 0], dtype=torch.float32, device=self.device)
 
-        # Kolejka doświadczeń: ZMQ thread tylko enqueue (szybkie), training thread
-        # drainuje na początku każdego train_step — eliminuje GIL contention
+        # Experience queue: ZMQ thread only enqueues (fast), training thread
+        # drains at the start of each train_step — eliminates GIL contention
         self._experience_queue: queue.Queue = queue.Queue(maxsize=50000)
 
         per_cfg = config.get('per', {})
-        if per_cfg.get('alpha', 0) > 0:
-            if per_cfg.get('positive_ratio', 0.0) > 0:
-                self.buffer = DualPrioritizedBuffer(config)
-                logger.info(f"[Trainer] Using DualPrioritizedBuffer (positive_ratio={per_cfg['positive_ratio']})")
-            else:
-                self.buffer = PrioritizedReplayBuffer(config)
-            self.use_per = True
-        else:
-            self.buffer = ReplayBuffer(config)
-            self.use_per = False
+        self.use_per = per_cfg.get('alpha', 0) > 0
+        self.buffer = self._build_buffer()
+        if isinstance(self.buffer, DualPrioritizedBuffer):
+            logger.info(f"[Trainer] Using DualPrioritizedBuffer (positive_ratio={per_cfg['positive_ratio']})")
 
         self.step_count = 0
         self.epsilon = self.epsilon_start
@@ -118,7 +112,7 @@ class Trainer:
         self._logged_training_start = False
         self._sps_step_anchor = 0
         self._sps_time_anchor = time_module.time()
-        self._timing_logged = 0  # ile razy zalogowano timing diagnostics
+        self._timing_logged = 0  # number of times timing diagnostics have been logged
         
         # TensorBoard setup
         tensorboard_cfg = config.get('tensorboard', {})
@@ -131,7 +125,7 @@ class Trainer:
         self.writer = SummaryWriter(os.path.join(tensorboard_dir, f"train_{run_name}"))
         logger.info(f"[Trainer] TensorBoard logging to {tensorboard_dir}/train_{run_name} (interval={self.log_interval_sec}s)")
         
-        # Czas ostatniego logowania TensorBoard
+        # Timestamp of last TensorBoard log
         self._last_tb_log_time = time_module.time()
         self._last_histogram_log_time = time_module.time()
         self._last_hourly_ckpt_time = time_module.time()
@@ -140,23 +134,23 @@ class Trainer:
         self.debugger = TensorBoardDebugger(self.writer, config)
         self._last_debug_time = 0.0
 
-        # Moduł diagnostyczny
+        # Diagnostics module
         diag_dir = 'python/diagnostics'
         self.metric_logger = MetricLogger(os.path.join(diag_dir, 'metrics.jsonl'), flush_every=50)
         self.alert_system = AlertSystem(config)
         self.training_report = TrainingReport(config)
-        # Attention monitor — hooki robią .cpu() na KAŻDY forward pass (GPU sync).
-        # Rejestrujemy dynamicznie tylko w oknie debug_now, potem usuwamy.
+        # Attention monitor — hooks call .cpu() on EVERY forward pass (GPU sync).
+        # Registered dynamically only within the debug_now window, then removed.
         self.attention_monitor = AttentionMonitor(self.main_network, self.writer)
         self._last_advantage_std: float | None = None
         self._last_health: dict | None = None
 
-        # Akumulatory metryk — GPU tensory, jeden sync na log_interval zamiast 8+/krok
+        # Metric accumulators — GPU tensors, one sync per log_interval instead of 8+/step
         self._num_actions = config['model']['num_actions']
         self._gpu_acc = self._make_gpu_accumulator()
         self._gpu_acc_steps = 0
         
-        # Metryki od actorów (per symbol)
+        # Per-symbol actor metrics
         self._actor_metrics = defaultdict(lambda: {
             'transactions': 0,
             'wins': 0,
@@ -167,43 +161,48 @@ class Trainer:
             'episode_count': 0,
             'max_consecutive_losses': 0,
             'current_consecutive_losses': 0,
-            # Statystyki epizodów (od aktora przez ZMQ)
+            # Episode statistics (from actor via ZMQ)
             'episode_length_sum': 0,
             'episode_length_count': 0,
             'episode_trade_wins': 0,
             'episode_trade_losses': 0,
-            # Statystyki handlowe rozszerzone
-            'profit_sum': 0.0,          # suma zyskownych transakcji
-            'loss_sum': 0.0,            # suma stratnych transakcji (abs)
-            'win_hold_steps': 0,        # łączne kroki trzymania zyskownych pozycji
-            'loss_hold_steps': 0,       # łączne kroki trzymania stratnych pozycji
-            'mfe_sum': 0.0,             # suma MFE (Maximum Favorable Excursion)
+            # Extended trade statistics
+            'profit_sum': 0.0,          # sum of profitable trades
+            'loss_sum': 0.0,            # sum of losing trades (abs)
+            'win_hold_steps': 0,        # total hold steps for winning positions
+            'loss_hold_steps': 0,       # total hold steps for losing positions
+            'mfe_sum': 0.0,             # sum of MFE (Maximum Favorable Excursion)
             'long_opens': 0,
             'short_opens': 0,
             'action_long': 0,
             'action_short': 0,
             'action_hold': 0,
             'action_close': 0,
-            # Deque ostatnich 200 episode PnL — do Sharpe/Sortino/MaxDD
+            # Last 200 episode PnL deque — for Sharpe/Sortino/MaxDD
             'episode_pnl_deque': deque(maxlen=200),
-            # Deque ostatnich 5000 gap_steps — do mediany/p10/p90 czasu między transakcjami
+            # Last 5000 gap_steps deque — for median/p10/p90 time between trades
             'gap_steps_deque': deque(maxlen=5000),
         })
         
-        # EMA dla Q-values
+        # EMA for Q-values
         self._q_values_ema = None
         self._q_ema_decay = 0.99
         
-        # Histogram akcji (ostatni batch)
-        self._action_counts = [0] * config['model']['num_actions']
+        # State reset in reset_state(); initialized here to ensure fields
+        # exist before train_step has a chance to set them.
+        self._logged_halfway = False
+        self._last_q = None
+        self._last_rewards = None
+        self._last_td = None
+        self._last_reward_mean = None
 
         self._load_checkpoint_if_exists()
 
-        # torch.compile PO załadowaniu checkpointu — OptimizedModule dodaje `_orig_mod.`
-        # prefix do state_dict, więc kompilacja przed load_state_dict zrywa ładowanie.
+        # torch.compile AFTER checkpoint load — OptimizedModule adds `_orig_mod.`
+        # prefix to state_dict, so compiling before load_state_dict breaks loading.
         if self._compile_enabled and hasattr(torch, 'compile') and self.device != 'cpu':
-            # Windows nie ma Tritona → inductor backend pada. aot_eager działa wszędzie
-            # (mniejszy zysk ~5-10% zamiast 20-40%, ale bez wymagań Triton).
+            # Windows has no Triton → inductor backend fails. aot_eager works everywhere
+            # (smaller gain ~5-10% instead of 20-40%, but no Triton requirement).
             compile_backend = config.get('training', {}).get('compile_backend', 'aot_eager')
             try:
                 self.main_network = torch.compile(self.main_network, backend=compile_backend, dynamic=False)
@@ -212,7 +211,7 @@ class Trainer:
             except Exception as e:
                 logger.warning(f"[Trainer] torch.compile failed, falling back to eager: {e}")
 
-        # Ustaw anchor SPS po załadowaniu checkpointu (step_count może być != 0 przy resume)
+        # Set SPS anchor after checkpoint load (step_count may be != 0 on resume)
         self._sps_step_anchor = self.step_count
         self._sps_time_anchor = time_module.time()
         logger.info(f"[Trainer] Init: batch={self.batch_size}, min_buf={self.min_buffer_size}, steps={self.step_count}, resumed={self.step_count > 0}")
@@ -225,7 +224,7 @@ class Trainer:
 
         ckpt_dir = os.path.join('python', 'checkpoints')
 
-        # Zbierz WSZYSTKIE checkpointy i wybierz ten z najwyższym step jako model
+        # Collect ALL checkpoints and select the one with the highest step as model
         candidates = []
         for name in ('shutdown_checkpoint.pt', 'hourly_checkpoint.pt'):
             p = os.path.join(ckpt_dir, name)
@@ -251,7 +250,7 @@ class Trainer:
         logger.info(f"[Checkpoint] Loading model from: {best_model_path} (step {candidates[0][0]})")
         self._load_checkpoint(best_model_path, load_buffer=False)
 
-        # Buffer wczytaj z najnowszego pliku który go zawiera (shutdown > hourly)
+        # Load buffer from the most recent file that contains it (shutdown > hourly)
         buffer_candidates = []
         for name in ('shutdown_checkpoint.pt', 'hourly_checkpoint.pt'):
             p = os.path.join(ckpt_dir, name)
@@ -310,8 +309,8 @@ class Trainer:
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        # Zapisuj zawsze stan eager modelu — torch.compile dodaje prefix `_orig_mod.`
-        # do state_dict, co zrywa load do eager modelu (compile dzieje się po load).
+        # Always save the eager model state — torch.compile adds `_orig_mod.`
+        # prefix to state_dict, which breaks loading into an eager model (compile happens after load).
         eager_model = getattr(self.main_network, '_orig_mod', self.main_network)
         payload = {
             'step': self.step_count,
@@ -347,7 +346,7 @@ class Trainer:
             logger.info(f"Removed old checkpoint: {old}")
 
     def _make_gpu_accumulator(self):
-        """Tworzy nowy zestaw GPU tensorów do akumulacji metryk — bez sync CPU."""
+        """Creates a new set of GPU tensors for metric accumulation — no CPU sync."""
         z = lambda: torch.zeros((), device=self.device)
         return {
             'loss_sum': z(),
@@ -365,7 +364,7 @@ class Trainer:
         }
 
     def _snapshot_gpu_accumulator(self):
-        """Snapshot akumulatora — jeden sync GPU→CPU, BEZ resetu."""
+        """Snapshot of accumulator — one GPU→CPU sync, WITHOUT reset."""
         n = self._gpu_acc_steps
         if n == 0:
             return {
@@ -402,7 +401,7 @@ class Trainer:
         }
 
     def _sync_gpu_accumulator(self):
-        """Sync + reset — wywoływane tylko w _log_tensorboard."""
+        """Sync + reset — called only in _log_tensorboard."""
         if self._gpu_acc_steps == 0:
             return None
         result = self._snapshot_gpu_accumulator()
@@ -412,19 +411,19 @@ class Trainer:
 
     @property
     def _metrics_accumulator(self):
-        """Backward-compat: callery zewnętrzne (training_report, get_metrics) oczekują dict.
-        Każde odczytanie = jeden sync GPU→CPU. NIE wywoływać w hot path."""
+        """Backward-compat: external callers (training_report, get_metrics) expect a dict.
+        Each read = one GPU→CPU sync. Do NOT call in the hot path."""
         return self._snapshot_gpu_accumulator()
 
     def add_experience(self, state, action, reward, next_state, done, action_mask=None, actor_id=None):
-        # Nie blokuj ZMQ thread — jeśli kolejka pełna, pomijamy (bezpieczne przy PER)
+        # Do not block ZMQ thread — if queue is full, skip (safe with PER)
         try:
             self._experience_queue.put_nowait((state, action, reward, next_state, done, action_mask))
         except queue.Full:
             pass
 
     def _drain_experience_queue(self) -> int:
-        """Przenosi doświadczenia z kolejki do buffera jednym batch_add zamiast N add()."""
+        """Moves experiences from queue to buffer using one batch_add instead of N add() calls."""
         experiences = []
         try:
             while True:
@@ -436,21 +435,22 @@ class Trainer:
         return len(experiences)
 
     def add_actor_metrics(self, symbol, metrics):
-        """Dodaje metryki od aktora do akumulatora TensorBoard."""
+        """Adds actor metrics to the TensorBoard accumulator."""
         if not self.enable_actor_metrics:
             return
             
         actor_data = self._actor_metrics[symbol]
         
-        # Transakcje
+        # Transactions
         if 'transactions' in metrics:
             actor_data['transactions'] += metrics['transactions']
         
         # Episode PnL
+
         if 'episode_pnl' in metrics:
             pnl = metrics['episode_pnl']
             actor_data['episode_pnl_sum'] += pnl
-            # episode_count incremented from episode_length below (nie duplikuj)
+            # episode_count incremented from episode_length below (avoid double-count)
             if pnl > 0:
                 actor_data['wins'] += 1
                 actor_data['current_consecutive_losses'] = 0
@@ -466,13 +466,13 @@ class Trainer:
         if 'total_trades' in metrics:
             actor_data['total_trades'] = metrics['total_trades']
         
-        # Win rate tracking (stary format binarny)
+        # Win rate tracking (legacy binary format)
         if 'win' in metrics and metrics['win']:
             actor_data['wins'] += 1
         if 'loss' in metrics and metrics['loss']:
             actor_data['losses'] += 1
 
-        # Metryki epizodu — wysyłane przez aktora w ostatnim wpisie batcha
+        # Episode metrics — sent by actor in the last entry of the batch
         if 'episode_length' in metrics:
             actor_data['episode_length_sum']   += metrics['episode_length']
             actor_data['episode_length_count'] += 1
@@ -489,7 +489,7 @@ class Trainer:
                 metrics['episode_max_consec_losses']
             )
 
-        # Rozszerzone statystyki handlowe
+        # Extended trade statistics
         if 'episode_profit_sum' in metrics:
             actor_data['profit_sum']      += metrics['episode_profit_sum']
         if 'episode_loss_sum' in metrics:
@@ -515,7 +515,7 @@ class Trainer:
         if 'episode_action_close' in metrics:
             actor_data['action_close']    += metrics['episode_action_close']
 
-        # Deque PnL epizodów — do Sharpe/Sortino/MaxDrawdown
+        # Episode PnL deque — for Sharpe/Sortino/MaxDrawdown
         if 'episode_pnl' in metrics:
             actor_data['episode_pnl_deque'].append(metrics['episode_pnl'])
 
@@ -528,10 +528,10 @@ class Trainer:
 
         if self._epsilon_reset_end_step is not None:
             if self.step_count < self._epsilon_reset_end_step:
-                # Aktywny reset — trzymaj podwyższone epsilon
+                # Active reset — hold elevated epsilon
                 self.epsilon = self._epsilon_reset_target
             else:
-                # Reset wygasł — wróć do krzywej decay i wyczyść stan
+                # Reset expired — return to decay curve and clear state
                 logger.info(f'[Trainer] Epsilon reset ended at step {self.step_count}, resuming decay ε={decay_epsilon:.4f}')
                 self._epsilon_reset_end_step = None
                 self._epsilon_reset_target   = None
@@ -543,9 +543,9 @@ class Trainer:
             self.lr_scheduler.step()
 
     def trigger_epsilon_reset(self, target: float | None = None, duration: int | None = None) -> None:
-        """Tymczasowo podnieś epsilon do `target` na `duration` kroków treningowych.
-        Po zakończeniu epsilon wraca automatycznie do aktualnej wartości krzywej decay.
-        Parametry domyślne z config [training] epsilon_reset_target / epsilon_reset_duration.
+        """Temporarily raise epsilon to `target` for `duration` training steps.
+        After expiry epsilon returns automatically to the current decay curve value.
+        Default parameters come from config [training] epsilon_reset_target / epsilon_reset_duration.
         """
         cfg = self.config['training']
         target   = target   if target   is not None else cfg.get('epsilon_reset_target',   0.8)
@@ -562,31 +562,31 @@ class Trainer:
 
     @property
     def dynamic_loss_scale(self) -> float:
-        """loss_scale sprzężony z epsilon: 1.0 przy epsilon_start → loss_scale_max przy epsilon_end."""
+        """loss_scale coupled to epsilon: 1.0 at epsilon_start → loss_scale_max at epsilon_end."""
         ls_max = self.config['reward'].get('loss_scale', 1.4)
         progress = (self.epsilon_start - self.epsilon) / max(self.epsilon_start - self.epsilon_end, 1e-8)
         progress = max(0.0, min(1.0, progress))
         return 1.0 + (ls_max - 1.0) * progress
 
     def _log_tensorboard(self, force=False):
-        """Loguje do TensorBoard jeśli minął interwał czasowy."""
+        """Logs to TensorBoard if the time interval has elapsed."""
         current_time = time_module.time()
-        
-        # Sprawdź czy czas na logowanie scalar metrics
+
+        # Check whether it's time to log scalar metrics
         if not force and (current_time - self._last_tb_log_time) < self.log_interval_sec:
             return
-            
-        # Sprawdź czy czas na histogramy
+
+        # Check whether it's time for histograms
         log_histograms = (current_time - self._last_histogram_log_time) >= self.histogram_interval_sec
         
         step = self.step_count
         acc = self._sync_gpu_accumulator()  # JEDEN sync GPU→CPU
 
         if acc is not None:
-            # Oblicz średnie
+            # Compute averages
             n = acc['steps_accumulated']
             avg_loss = acc['loss_sum'] / n
-            self.last_loss = avg_loss  # aktualizuj float dla main.py logger
+            self.last_loss = avg_loss  # update float for main.py logger
             avg_td = acc['td_error_sum'] / n
             td_std = np.sqrt(max(0.0, acc['td_error_sq_sum'] / n - avg_td**2)) if n > 1 else 0
             avg_q = acc['q_mean_sum'] / n
@@ -594,7 +594,7 @@ class Trainer:
             avg_q_min = acc['q_min_sum'] / n
             avg_grad = acc['grad_norm_sum'] / n
             
-            # ---- Podstawowe metryki ----
+            # ---- Core metrics ----
             self.writer.add_scalar('Loss/train', avg_loss, step)
             self.writer.add_scalar('Epsilon', self.epsilon, step)
             self.writer.add_scalar('Buffer/size', len(self.buffer), step)
@@ -643,7 +643,7 @@ class Trainer:
                         self.writer.add_scalar('PER/priority_mean', float(non_zero.mean()), step)
                         self.writer.add_scalar('PER/priority_max', float(non_zero.max()), step)
             
-            # ---- Actions distribution (sumowane z batchy) ----
+            # ---- Actions distribution (summed across batches) ----
             total_actions = sum(acc['actions_total'])
             if total_actions > 0:
                 for a, count in enumerate(acc['actions_total']):
@@ -661,7 +661,7 @@ class Trainer:
                         win_rate = data['wins'] / total
                         self.writer.add_scalar(f'{prefix}/win_rate', win_rate, step)
                     
-                    # Profit factor (jeśli mamy dane)
+                    # Profit factor (if data is available)
                     if 'avg_win' in data and 'avg_loss' in data:
                         if data['avg_loss'] != 0:
                             pf = data['avg_win'] / abs(data['avg_loss'])
@@ -681,7 +681,6 @@ class Trainer:
             logger.debug(f"[TensorBoard] Logged at step {step}, accumulated {n} steps")
 
             # ---- Diagnostics: JSON Lines + alerty ----
-            total_actions = sum(acc['actions_total'])
             diag_metrics = {
                 'loss': avg_loss,
                 'q_mean': avg_q,
@@ -691,48 +690,48 @@ class Trainer:
                 'td_std': td_std,
                 'action_ratios': [c / total_actions for c in acc['actions_total']] if total_actions > 0 else [0.0] * 4,
                 'advantage_std': self._last_advantage_std,
-                'reward_mean': getattr(self, '_last_reward_mean', None),
+                'reward_mean': self._last_reward_mean,
                 'epsilon': self.epsilon,
             }
             self.metric_logger.log(step, diag_metrics)
             self.alert_system.check_and_alert(diag_metrics, step)
 
-        # Reset akumulatora zrobiony w _sync_gpu_accumulator()
+        # Accumulator reset done inside _sync_gpu_accumulator()
         self._last_tb_log_time = current_time
         
-        # Histogramy (rzadziej)
+        # Histograms (less frequently)
         if log_histograms:
             self._log_histograms(step)
             self._last_histogram_log_time = current_time
 
     def _log_histograms(self, step):
-        """Loguje histogramy wag, Q-values, nagród i błędów TD."""
-        # Wagi sieci
+        """Logs histograms of weights, Q-values, rewards, and TD errors."""
+        # Network weights
         for name, param in self.main_network.named_parameters():
             short_name = name.replace('.weight', '_w').replace('.bias', '_b')
             self.writer.add_histogram(f'Weights/{short_name}', param.data, step)
 
-        # Debugger v2: histogramy z ostatniego batcha
-        if hasattr(self, '_last_q') and self._last_q is not None:
+        # Debugger v2: histograms from the last batch
+        if self._last_q is not None:
             self.debugger.log_q_diagnostics(self._last_q, step)
-        if hasattr(self, '_last_rewards') and self._last_rewards is not None:
+        if self._last_rewards is not None:
             self.debugger.log_reward_stats(self._last_rewards, step)
             self._last_reward_mean = self._last_rewards.detach().cpu().mean().item()
-        if hasattr(self, '_last_td') and self._last_td is not None:
+        if self._last_td is not None:
             self.debugger.log_td_histogram(self._last_td, step)
 
         logger.debug(f"[TensorBoard] Histograms logged at step {step}")
 
     def train_step(self):
-        # Faza zapełniania: drain przed sprawdzeniem rozmiaru (inaczej queue rośnie, buffer stoi).
-        # Faza treningu: drain po sprawdzeniu — wracamy do starej pozycji.
+        # Fill phase: drain before checking size (otherwise queue grows, buffer stalls).
+        # Training phase: drain after check — return to old position.
         if not self._logged_training_start:
             self._drain_experience_queue()
 
         buffer_size = len(self.buffer)
 
         if buffer_size < self.min_buffer_size:
-            if buffer_size >= self.min_buffer_size * 0.5 and not hasattr(self, '_logged_halfway'):
+            if buffer_size >= self.min_buffer_size * 0.5 and not self._logged_halfway:
                 logger.info(f"[Trainer] Buffer at 50%: {buffer_size}/{self.min_buffer_size}")
                 self._logged_halfway = True
             return None
@@ -741,7 +740,7 @@ class Trainer:
             logger.info(f"[Trainer] TRAINING STARTED - Buffer full at {buffer_size} experiences, resuming={self.step_count > 0}")
             self._logged_training_start = True
 
-        # Faza treningu — drain tutaj (stara pozycja)
+        # Training phase — drain here (old position)
         self._drain_experience_queue()
 
         _t0 = time_module.perf_counter()
@@ -754,7 +753,7 @@ class Trainer:
 
         _t1 = time_module.perf_counter()
 
-        # Debugger v2: sprawdź czy czas na ciężkie metryki
+        # Debugger v2: check whether it's time for heavy metrics
         debug_now = (time_module.time() - self._last_debug_time) >= self.debugger.debug_interval_sec
 
         self.main_network.train()
@@ -767,21 +766,21 @@ class Trainer:
         state_tensors = [states[k] for k in sorted(states.keys())]
         next_state_tensors = [next_states[k] for k in sorted(next_states.keys())]
 
-        # ── Forward main (z grad) ──────────────────────────────────────────
+        # ── Forward main (with grad) ──────────────────────────────────────────
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             current_q = self.main_network(state_tensors, position_features=pos_features)
             current_q_values = current_q.gather(1, actions.unsqueeze(1)).squeeze(1)
 
         _t2 = time_module.perf_counter()
 
-        # ── Forward Double DQN (bez grad, z autocast) ──────────────────────
+        # ── Forward Double DQN (no grad, with autocast) ──────────────────────
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.use_amp):
             next_masks = action_masks.clone()
             next_masks[actions == 0] = self._mask_in_pos  # po LONG
             next_masks[actions == 1] = self._mask_in_pos  # po SHORT
             next_masks[actions == 3] = self._mask_no_pos  # po CLOSE
 
-            # Double DQN: main network wybiera akcję, target network ocenia wartość
+            # Double DQN: main network selects action, target network evaluates value
             self.main_network.eval()
             next_q_main = self.main_network(next_state_tensors, action_mask=next_masks, position_features=next_pos_features)
             self.main_network.train()
@@ -792,7 +791,7 @@ class Trainer:
 
         _t3 = time_module.perf_counter()
 
-        # ── Loss (poza autocast — MSE w fp32 dla stabilności) ──────────────
+        # ── Loss (outside autocast — MSE in fp32 for stability) ──────────────
         current_q_values_fp32 = current_q_values.float()
         td_errors = targets - current_q_values_fp32
         loss_per_sample = self.loss_fn(current_q_values_fp32, targets)
@@ -809,7 +808,7 @@ class Trainer:
         else:
             loss.backward()
 
-        # AMP: unscale przed obliczeniem normy gradientu i clippingiem
+        # AMP: unscale before computing gradient norm and clipping
         if self.use_amp:
             self.scaler.unscale_(self.optimizer)
 
@@ -817,11 +816,11 @@ class Trainer:
             self.main_network.parameters(), 1.0
         )
 
-        _norm_val = pre_clip_norm.item()
+        # .item() forces GPU→CPU sync; only when we actually need to log.
         if not torch.isfinite(pre_clip_norm):
-            logger.warning(f"[Trainer] Gradient explosion at step {self.step_count}: norm={_norm_val:.2f} — AMP scaler will skip update")
+            logger.warning(f"[Trainer] Gradient explosion at step {self.step_count}: norm={pre_clip_norm.item():.2f} — AMP scaler will skip update")
 
-        # Loguj gradient flow PO unscale i clippingu — wartości są rzeczywiste
+        # Log gradient flow AFTER unscale and clipping — values are actual
         if debug_now:
             self.debugger.log_gradient_flow(self.main_network, self.step_count)
 
@@ -852,10 +851,9 @@ class Trainer:
 
         _t5 = time_module.perf_counter()
 
-        # Timing diagnostics — loguj 5 razy po starcie treningu, potem co 500 kroków
+        # Timing diagnostics — log 5 times after training starts, then every 500 steps
         if self._timing_logged < 5 or self.step_count % 500 == 0:
             self._timing_logged += 1
-            _t_total = time_module.perf_counter()
             logger.info(
                 f"[Timing] sample={(_t1-_t0)*1000:.1f}ms  fwd_main={(_t2-_t1)*1000:.1f}ms  "
                 f"fwd_double={(_t3-_t2)*1000:.1f}ms  bwd={(_t4-_t3)*1000:.1f}ms  "
@@ -869,7 +867,7 @@ class Trainer:
             beta_fraction = min(1.0, self.step_count / self.config['training']['buffer_capacity'])
             self.buffer.update_beta(beta_fraction)
 
-        # ===== Akumuluj metryki — wszystko na GPU, żadnych .item() ani .cpu() =====
+        # ===== Accumulate metrics — all on GPU, no .item() or .cpu() calls =====
         acc = self._gpu_acc
         with torch.no_grad():
             q_det = current_q.detach()
@@ -894,17 +892,17 @@ class Trainer:
             acc['action_entropy_sum'] += entropy
             acc['q_hold_sum'] += q_det[:, 2].mean()
 
-            # Zamiast pętli Python nad actions.cpu().numpy() — bincount na GPU
+            # Instead of a Python loop over actions.cpu().numpy() — bincount on GPU
             acc['actions_total'] += torch.bincount(actions, minlength=self._num_actions)
 
         self._gpu_acc_steps += 1
 
-        # Zachowaj ostatni batch dla histogramów (wciąż na GPU, sync dopiero w _log_histograms)
+        # Keep the last batch for histograms (still on GPU, sync happens in _log_histograms)
         self._last_q = q_det
         self._last_rewards = rewards.detach()
         self._last_td = td_det
 
-        # ---- Loguj do TensorBoard co określony interwał ----
+        # ---- Log to TensorBoard at the configured interval ----
         self._log_tensorboard()
 
         if self.step_count % self.target_update_interval == 0:
@@ -969,8 +967,8 @@ class Trainer:
                 return np.random.randint(0, self.config['model']['num_actions'])
 
             # Biased exploration: P(HOLD) = clamp(epsilon, hold_bias_min, hold_bias_max).
-            # Wczesny trening (wysoki epsilon) → dużo HOLD → dłuższe epizody.
-            # Późny trening (niski epsilon) → więcej LONG/SHORT/CLOSE → intensywna eksploracja.
+            # Early training (high epsilon) → lots of HOLD → longer episodes.
+            # Late training (low epsilon) → more LONG/SHORT/CLOSE → intensive exploration.
             training_cfg = self.config['training']
             hold_bias_min = training_cfg.get('hold_bias_min', 0.3)
             hold_bias_max = training_cfg.get('hold_bias_max', 0.7)
@@ -991,8 +989,8 @@ class Trainer:
         return action
 
     def _export_onnx(self):
-        """Eksportuje sieć do formatu ONNX — wywoływana przy każdym update target network.
-        Aktorzy ładują plik lokalnie i wnioskują bez RPC (issue #28).
+        """Exports the network to ONNX format — called on every target network update.
+        Actors load the file locally and infer without RPC (issue #28).
         """
         onnx_cfg = self.config.get('onnx', {})
         if not onnx_cfg.get('enabled', False):
@@ -1010,8 +1008,8 @@ class Trainer:
                        if self.config['timeframes'][k] > 0]
             num_features = self.config['features']['num_features']
 
-            # Wrapper spłaszcza listę tensorów TF + pos_features + action_mask
-            # do pozycyjnych argumentów — ONNX wymaga nazwanych skalarnych wejść.
+            # Wrapper flattens the list of TF tensors + pos_features + action_mask
+            # into positional arguments — ONNX requires named scalar inputs.
             class _OnnxWrapper(torch.nn.Module):
                 def __init__(self, model, n_tf):
                     super().__init__()
@@ -1050,25 +1048,25 @@ class Trainer:
                     opset_version=14,
                     do_constant_folding=True,
                 )
-                # PyTorch ≥2.1: dynamo=False wymusza legacy TorchScript exporter
-                # (nie wymaga onnxscript); starsze wersje nie mają tego parametru
+                # PyTorch ≥2.1: dynamo=False forces the legacy TorchScript exporter
+                # (no onnxscript required); older versions don't have this parameter
                 import inspect
                 if 'dynamo' in inspect.signature(torch.onnx.export).parameters:
                     export_kwargs['dynamo'] = False
 
-                # aten::_native_multi_head_attention (fused C++ kernel) nie jest exportowalny
-                # do żadnego opset ONNX. W PyTorch 2.4+ jest wywoływany bezpośrednio nawet
-                # podczas tracingu gdy batch_first=True. Monkey-patch na poziomie klasy wymusza
-                # slow path (F.multi_head_attention_forward z explicit attn_mask), który ONNX
-                # rozumie jako oddzielne operacje Linear + softmax.
+                # aten::_native_multi_head_attention (fused C++ kernel) is not exportable
+                # to any ONNX opset. In PyTorch 2.4+ it's called directly even during tracing
+                # when batch_first=True. Class-level monkey-patch forces the slow path
+                # (F.multi_head_attention_forward with explicit attn_mask), which ONNX
+                # understands as separate Linear + softmax operations.
                 _orig_mha_forward = torch.nn.MultiheadAttention.forward
 
                 def _mha_slow_forward(self, query, key, value,
                                       key_padding_mask=None, need_weights=True,
                                       attn_mask=None, **kwargs):
                     if attn_mask is None:
-                        # Zero-mask to no-op matematycznie, ale `attn_mask is not None`
-                        # wyłącza warunek `_native_multi_head_attention` fast path.
+                        # Zero-mask is a mathematical no-op, but `attn_mask is not None`
+                        # disables the `_native_multi_head_attention` fast-path condition.
                         tgt = query.size(1) if self.batch_first else query.size(0)
                         attn_mask = query.new_zeros(tgt, tgt)
                     return _orig_mha_forward(self, query, key, value,
@@ -1076,7 +1074,7 @@ class Trainer:
                                              need_weights=need_weights,
                                              attn_mask=attn_mask, **kwargs)
 
-                torch.nn.MultiheadAttention.forward = _mha_slow_forward
+                torch.nn.MultiheadAttention.forward = _mha_slow_forward  # apply patch
                 try:
                     with warnings.catch_warnings():
                         warnings.filterwarnings('ignore', message='Constant folding')
@@ -1084,7 +1082,7 @@ class Trainer:
                 finally:
                     torch.nn.MultiheadAttention.forward = _orig_mha_forward
 
-            # Atomowy rename — aktor nigdy nie widzi częściowego pliku
+            # Atomic rename — actor never sees a partial file
             if os.path.exists(export_path):
                 os.remove(export_path)
             os.rename(tmp_path, export_path)
@@ -1098,45 +1096,43 @@ class Trainer:
                 except OSError:
                     pass
 
+    def _build_buffer(self):
+        per_cfg = self.config.get('per', {})
+        if per_cfg.get('alpha', 0) > 0:
+            if per_cfg.get('positive_ratio', 0.0) > 0:
+                return DualPrioritizedBuffer(self.config)
+            return PrioritizedReplayBuffer(self.config)
+        return ReplayBuffer(self.config)
+
     def reset_training(self):
-        """Resetuje model, bufor i stan treningu do zera. Wywoływane przez /restart w Telegramie."""
-        import queue as _queue
+        """Resets model, buffer, and training state to zero. Invoked by /restart in Telegram."""
         logger.info('[Trainer] Resetting training — fresh weights, empty buffer, step=0')
 
-        # Świeże wagi sieci
-        from model.network import TradingDQN
+        # Fresh network weights
         self.main_network = TradingDQN(self.config).to(self.device)
         self.target_network = TradingDQN(self.config).to(self.device)
         self.target_network.load_state_dict(self.main_network.state_dict())
         self.target_network.eval()
 
-        # Nowy optimizer
+        # New optimizer
         self.optimizer = torch.optim.Adam(self.main_network.parameters(), lr=self.lr)
         if self.use_amp:
             self.scaler = torch.amp.GradScaler('cuda')
 
-        # Wyczyść bufor
-        from training.prioritized_buffer import PrioritizedReplayBuffer, DualPrioritizedBuffer
-        from training.replay_buffer import ReplayBuffer
-        per_cfg = self.config.get('per', {})
-        if per_cfg.get('alpha', 0) > 0:
-            if per_cfg.get('positive_ratio', 0.0) > 0:
-                self.buffer = DualPrioritizedBuffer(self.config)
-            else:
-                self.buffer = PrioritizedReplayBuffer(self.config)
-        else:
-            self.buffer = ReplayBuffer(self.config)
+        self.buffer = self._build_buffer()
+        self._experience_queue = queue.Queue(maxsize=50000)
 
-        # Wyczyść kolejkę doświadczeń
-        self._experience_queue = _queue.Queue(maxsize=50000)
-
-        # Reset stanu treningu
+        # Reset training state
         self.step_count   = 0
         self.epsilon      = self.epsilon_start
         self.last_loss    = 0.0
         self._paused      = False
         self._logged_training_start = False
-        self._logged_halfway = False if hasattr(self, '_logged_halfway') else False
+        self._logged_halfway = False
+        self._last_q = None
+        self._last_rewards = None
+        self._last_td = None
+        self._last_reward_mean = None
         self._sps_step_anchor = 0
         self._sps_time_anchor = time_module.time()
         self._timing_logged   = 0
@@ -1160,10 +1156,10 @@ class Trainer:
         self.writer.close()
 
     def get_metrics(self):
-        """Zwraca metryki dla systemu monitoringu (ZMQ push)."""
+        """Returns metrics for the monitoring system (ZMQ push)."""
         acc = self._metrics_accumulator
-        
-        # Oblicz średnie z akumulatora
+
+        # Compute averages from accumulator
         n = acc['steps_accumulated']
         avg_loss = acc['loss_sum'] / n if n > 0 else 0.0
         avg_td = acc['td_error_sum'] / n if n > 0 else 0.0
@@ -1172,7 +1168,7 @@ class Trainer:
             'step': self.step_count,
             'epsilon': self.epsilon,
             'loss': self.last_loss,
-            'loss_avg': avg_loss,  # Średnia z akumulatora
+            'loss_avg': avg_loss,  # average from accumulator
             'buffer_size': len(self.buffer),
             'buffer_capacity': self.config['training']['buffer_capacity'],
             'buffer_fill_ratio': len(self.buffer) / self.config['training']['buffer_capacity'],
@@ -1183,13 +1179,11 @@ class Trainer:
             'histogram_interval_sec': self.histogram_interval_sec,
             # Q-values EMA
             'q_values_ema': self._q_values_ema if self._q_values_ema is not None else 0.0,
-            # Akcje z ostatniego batcha
-            'action_counts': self._action_counts.copy(),
-            # TD error avg z akumulatora
+            # TD error average from accumulator
             'td_error_avg': avg_td,
         }
         
-        # Grad norm z ostatniego sync GPU acc
+        # Grad norm from the last GPU acc sync
         gpu = self._gpu_acc
         gpu_n = self._gpu_acc_steps
         metrics['grad_norm'] = float(gpu['grad_norm_sum'] / gpu_n) if gpu_n > 0 else 0.0

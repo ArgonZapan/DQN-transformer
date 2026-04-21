@@ -7,27 +7,36 @@ Projekt implementuje architekturę **Actor-Learner Ape-X** z modelem Conv1D + Tr
 ## Diagram architektury
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        Node.js                          │
-│                                                         │
-│  Actor 1 ──┐                                            │
-│  Actor 2 ──┼──► actorManager ──► ZMQ REQ/REP ──┐        │
-│  Actor N ──┘         ▲                           │        │
-│                        │                           ▼        │
-│              ◄── nextAction ◄──── ZMQ REQ/REP             │
-│                                                         │
-│  Każdy moduł ──► PUSH metrics ──► Monitoring Svc         │
-└─────────────────────────────────────────────────────────┘
-     │                                    │
-     ▼                                    ▼
-┌─────────────┐              ┌─────────────────────────┐
-│   Python    │              │   Node.js Monitoring     │
-│             │              │   (agregacja metryk)      │
-│  ZeroMQ ───►│              ├─────────────────────────┤
-│  Replay Buf │              │   Dashboard (Vite+React) │
-│  Trainer ──►│              │   pull co 1 min, GET     │
-│  Model      │              │   tylko wyświetla        │
-└─────────────┘              └─────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        Node.js                                   │
+│                                                                  │
+│  Actor BTC ──┐                                                   │
+│  Actor ETH ──┤                                                   │
+│  Actor SOL ──┼──► actorManager ──► ZMQ REQ/REP batch ──┐         │
+│  Actor BNB ──┤         ▲                                 │         │
+│  Actor XRP ──┘         │                                 ▼         │
+│                        └──── Q-values + epsilon ◄── ZMQ REQ/REP  │
+│                                                                  │
+│  Actor (eksploatacja): ONNX local inference ──► brak ZMQ         │
+│  Actor (fallback):     ZMQ RPC do Pythona                        │
+│                                                                  │
+│  Każdy moduł ──► PUSH metrics ──► Monitoring Svc                 │
+└──────────────────────────────────────────────────────────────────┘
+     │                                          │
+     ▼                                          ▼
+┌───────────────────────────┐    ┌─────────────────────────┐
+│   Python (Learner)        │    │   Node.js Monitoring     │
+│                           │    │   (agregacja metryk)      │
+│  DualPrioritizedBuffer    │    ├─────────────────────────┤
+│  Double DQN + AMP (FP16) │    │   Dashboard (Vite+React) │
+│  Conv1D + Transformer     │    │   HTTP GET co 60s        │
+│  ONNX export (co ckpt)   │    └─────────────────────────┘
+│  Diagnostics:             │
+│    AlertSystem (Telegram) │
+│    HealthRunner            │
+│    MetricLogger           │
+│    TelegramCommands       │
+└───────────────────────────┘
 ```
 
 ## Podział odpowiedzialności
@@ -91,7 +100,7 @@ stop.bat  :: Graceful shutdown w odpowiedniej kolejności
 ```
 
 Kolejność startu: Monitoring Service → Learner → Actorzy → Dashboard.
-Kolejność zamykania: Actorzy → Learner (zapisuje checkpoint) → Monitoring → Dashboard.
+Kolejność zamykania: Actorzy → Learner (zapisuje shutdown_checkpoint.pt + model.onnx) → Monitoring → Dashboard.
 
 Pełna dokumentacja: [Graceful Shutdown](shutdown.md).
 

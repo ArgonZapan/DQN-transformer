@@ -191,20 +191,32 @@ for t in reversed(range(len(episode))):
 
 Daje **dokładniejsze oszacowanie wartości długoterminowych** — sieć widzi rzeczywisty wynik całej sekwencji decyzji, a nie tylko natychmiastową nagrodę. Szczególnie ważne w tradingu gdzie konsekwencje decyzji mogą ujawnić się dopiero po wielu krokach.
 
-## N-step Returns (opcjonalny)
+## N-step Returns (aktywny, n_step=25)
 
 ### Opis
 
-Zamiast 1-step TD error, używasz n-step lookahead:
+Zamiast 1-step TD error, używamy n-step lookahead z `n_step=25`:
 
 ```python
-target = r_t + γ·r_{t+1} + ... + γ^{n-1}·r_{t+n-1} + γ^n × max(Q_target(s_{t+n}))
+# return_mode = "nstep", n_step = 25
+R_t^n = Σ_{k=0}^{n-1} γ^k × r_{t+k}
+target = R_t^n + (1 - done) × γ^n × Q_target(s_{t+n})
 ```
 
-### Korzyści
+N-krokowy zwrot jest obliczany przez Actora (Node.js) przed wysłaniem do bufora. Learner używa `gamma_n = gamma^n_step` jako mnożnika bootstrappingu.
 
-- Lepsze oszacowanie wartości
-- Szybsza konwergencja
+### Return Modes
+
+| Tryb | Config | Opis |
+|---|---|---|
+| `nstep` | domyślny, n_step=25 | N-krokowe sumowanie nagród |
+| `mc` | Monte Carlo | Pełny zdyskontowany return do końca epizodu |
+| `td` | 1-step TD | Klasyczny Bellman (wysoka wariancja) |
+
+### Korzyści n-step
+
+- Szybsza propagacja sygnałów nagród w buforze
+- Lepsze oszacowanie wartości niż 1-step TD
 - Mniejsza wariancja niż czyste Monte Carlo
 
 ## Epsilon-Greedy Eksploracja
@@ -221,10 +233,19 @@ Sieć wybiera akcję:
 epsilon = max(epsilon_end, epsilon_start - (epsilon_start - epsilon_end) * (steps / decay_steps))
 ```
 
-### Parametry
+### Parametry (aktualna konfiguracja)
 
 | Parametr | Wartość | Config field |
 |---|---|---|
-| Epsilon start | 1.0 | `[training].epsilon_start` |
-| Epsilon end | 0.05 | `[training].epsilon_end` |
-| Decay fraction | 30% kroków | `[training].epsilon_decay_fraction` |
+| Epsilon start | 0.90 | `[training].epsilon_start` |
+| Epsilon end | 0.10 | `[training].epsilon_end` |
+| Decay fraction | 20% kroków | `[training].epsilon_decay_fraction` |
+
+### Hold Bias
+
+Przy losowej eksploracji HOLD ma wyższe prawdopodobieństwo wyboru (60% vs 13% dla pozostałych). Zapobiega dominacji OPEN akcji na początku treningu i churning'owi w buforze.
+
+```toml
+hold_bias_min = 0.5
+hold_bias_max = 0.5
+```

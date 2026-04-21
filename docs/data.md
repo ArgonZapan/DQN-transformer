@@ -4,11 +4,34 @@
 
 Model używa **multi-scale temporal representation** — danych z wielu timeframe'ów pokrywających tę samą historię z różną rozdzielczością. Im bliżej teraźniejszości, tym więcej szczegółów.
 
-## Timeframe'y
+## Timeframe'y (aktualna konfiguracja)
 
-### Konfiguracja
+```toml
+[timeframes]
+candles_1m  = 60   # świece 1-minutowe
+candles_15m = 32   # świece 15-minutowe
+candles_1h  = 48   # świece 1-godzinne
+candles_1d  = 14   # świece dzienne
+candles_1w  = 0    # wyłączony (0 = pominięty)
+```
 
-Wszystkie timeframe'y są zdefiniowane globalnie — jeden zestaw dla wszystkich aktorów, jeden model.
+### Pokrycie czasowe
+
+| Timeframe | Świece | Pokryty okres |
+|---|---|---|
+| 1m  | 60 | 1 godzina |
+| 15m | 32 | 8 godzin |
+| 1h  | 48 | 2 dni |
+| 1d  | 14 | 2 tygodnie |
+| 1w  | 0  | wyłączony |
+
+Łączna długość sekwencji wejściowej modelu: **154 tokeny** (świece).
+
+### Wyłączanie timeframe'ów
+
+Timeframe z `candles_X = 0` jest **pomijany** zarówno przez Node.js actora jak i przez model Python. Liczba Conv1D bloków dostosowuje się automatycznie.
+
+### Konfiguracja alternatywna (z 1w)
 
 ```toml
 [timeframes]
@@ -19,235 +42,201 @@ candles_1d  = 30
 candles_1w  = 54
 ```
 
-### Pokrycie czasowe
+## 11 cech na świecę (v1+v2)
 
-| Timeframe | Świece | Pokryty okres |
-|---|---|---|
-| 1m  | 15 | 15 minut |
-| 15m | 15 | 3.75 godziny |
-| 1h  | 20 | 20 godzin |
-| 1d  | 30 | 30 dni |
-| 1w  | 54 | ~1 rok |
-
-### Dlaczego taka konfiguracja?
-
-- **Żadna świeca nie pokrywa innej** — czysta logarytmiczna skala rozdzielczości
-- **1m** — mikro trendy, szybkie reakcje
-- **15m** — krótkoterminowe momentum
-- **1h** — średnioterminowe trendy
-- **1d** — dzienne trendy, sentiment rynkowy
-- **1w** — długoterminowy kontekst
-
-## 8 cech na świecę
+Aktualna implementacja łączy cechy z obu wersji feature engineering w jednym zestawie.
 
 ### Lista cech
 
-```python
-features = [
-    (close - mean) / std,           # 1. znormalizowana cena close
-    (high - low) / close,           # 2. relative range świecy
-    (close - open) / close,         # 3. kierunek świecy
-    volume / mean_volume,           # 4. znormalizowany wolumen
-    rsi / 100,                      # 5. RSI w zakresie [0, 1]
-    macd_normalized,                # 6. MACD znormalizowany
-    (close - prev_close) / prev_close,  # 7. zmiana % względem poprzedniej
-    float(close > sma20),           # 8. czy powyżej SMA20 (0 lub 1)
+```javascript
+// node/env/state.js — buildFeatures()
+features[i] = [
+    (close - mean) / std,                          // 0. normalizedClose
+    (high - low) / close,                          // 1. relativeRange
+    (close - open) / close,                        // 2. candleDirection
+    Math.min(volume / meanVolume, 3.0),            // 3. volumeClipped (cap 3×)
+    rsi / 100,                                      // 4. rsiNorm
+    (close - min14) / (max14 - min14),             // 5. stochasticK
+    macdLine / close,                               // 6. macdNorm
+    (macdLine - signalLine) / close,               // 7. macdHistNorm
+    (close - prevClose) / prevClose,               // 8. pctChange
+    (4 * std20) / sma20,                           // 9. bollingerWidth
+    (close - sma20) / close,                       // 10. smaDistance
 ]
 ```
 
 ### Opis cech
 
-| # | Cecha | Opis | Zakres |
-|---|---|---|---|
-| 1 | Znormalizowana cena | `(close - mean) / std` | ~[-3, 3] |
-| 2 | Relative range | `(high - low) / close` | [0, ∞) |
-| 3 | Kierunek świecy | `(close - open) / close` | [-1, 1] |
-| 4 | Wolumen | `volume / mean_volume` | [0, ∞) |
-| 5 | RSI | `rsi / 100` | [0, 1] |
-| 6 | MACD | `macd_normalized` | ~[-1, 1] |
-| 7 | Zmiana % | `(close - prev_close) / prev_close` | [-1, 1] |
-| 8 | SMA20 | `float(close > sma20)` | {0, 1} |
+| # | Nazwa | Formuła | Zakres | Opis |
+|---|---|---|---|---|
+| 0 | normalizedClose | `(close - mean) / std` | ~[-3, 3] | Z-score ceny |
+| 1 | relativeRange | `(H - L) / close` | [0, ∞) | Volatilność świecy |
+| 2 | candleDirection | `(close - open) / close` | [-1, 1] | Kierunek świecy |
+| 3 | volumeClipped | `min(vol / meanVol, 3.0)` | [0, 3] | Wolumen z capem |
+| 4 | rsiNorm | `RSI(14) / 100` | [0, 1] | RSI znormalizowany |
+| 5 | stochasticK | `(close - min14) / (max14 - min14)` | [0, 1] | Stochastic K |
+| 6 | macdNorm | `macdLine / close` | ~[-0.01, 0.01] | MACD znorm. przez cenę |
+| 7 | macdHistNorm | `(macdLine - signal) / close` | ~[-0.005, 0.005] | Histogram MACD |
+| 8 | pctChange | `(close - prevClose) / prevClose` | [-1, 1] | Zmiana % |
+| 9 | bollingerWidth | `4 * std20 / sma20` | [0, ∞) | Szerokość Bollingera |
+| 10 | smaDistance | `(close - sma20) / close` | ~[-0.1, 0.1] | Odległość od SMA20 |
 
-### Dlaczego 8 cech?
+### Dlaczego 11 cech?
 
 - **Cena znormalizowana** — sieć widzi te same wzorce przy BTC=1000 i BTC=100000
-- **Range świecy** — informacja o zmienności/volatilności
+- **Relative range** — informacja o volatilności świecy
 - **Kierunek** — bull/bear candle
-- **Wolumen** — potwierdzenie siły ruchu
-- **RSI** — momentum, wykupienie/wyprzedanie
-- **MACD** — trend, konwergencja/dywergencja
-- **Zmiana %** — momentum krótkoterminowe
-- **SMA20** — pozycja względem trendu
+- **Wolumen clipped** — unika dominacji outlier'ów (skoki 100×)
+- **RSI** — klasyczny momentum (wykupienie/wyprzedanie)
+- **Stochastic K** — alternatywny oscylator momentum (14-period lookback)
+- **MACD znorm** — trend, crossover sygnałowy
+- **MACD histogram** — siła i kierunek trendu MACD
+- **Zmiana %** — krótkoterminowe momentum (1-bar return)
+- **Bollinger Width** — volatilność względem SMA20
+- **SMA Distance** — pozycja ceny względem SMA20 (ciągła, nie binarna)
+
+## Wskaźniki techniczne
+
+### RSI (14-period)
+
+```javascript
+// Relative Strength Index
+delta = close[i] - close[i-1]
+gain = rolling_mean(max(delta, 0), 14)
+loss = rolling_mean(max(-delta, 0), 14)
+rs = gain / loss
+rsi = 100 - (100 / (1 + rs))
+```
+
+### Stochastic K (14-period)
+
+```javascript
+// Oscylator stochastyczny — pozycja close względem zakresu 14-period
+min14 = min(low[i-13..i])
+max14 = max(high[i-13..i])
+stochK = (close - min14) / (max14 - min14)
+```
+
+### MACD
+
+```javascript
+ema12 = EMA(close, 12)
+ema26 = EMA(close, 26)
+macdLine = ema12 - ema26
+signal = EMA(macdLine, 9)
+
+// Normalizacja przez cenę (nie surowe wartości)
+macdNorm = macdLine / close
+macdHistNorm = (macdLine - signal) / close
+```
+
+### Bollinger Width
+
+```javascript
+sma20 = SMA(close, 20)
+std20 = rolling_std(close, 20)
+bollingerWidth = 4 * std20 / sma20   // = (upper - lower) / middle
+```
+
+Wąskie pasma → konsolidacja. Szerokie → wysoka volatilność.
 
 ## Normalizacja
 
 ### Zasada
 
-**Nigdy surowe ceny** — zawsze zmiany procentowe lub znormalizowane wartości.
+**Nigdy surowe ceny** — wszystkie cechy są znormalizowane relative lub przez Z-score. Sieć musi widzieć te same wzorce bez względu na to czy BTC kosztuje 1000 czy 100000.
 
-### Dlaczego?
+### Rolling window
 
-Sieć musi widzieć te same wzorce bez względu na to czy BTC kosztuje 1000 czy 100000. Surowe ceny zmieniają się o rzędy wielkości — wzorce są te same, ale wartości inne.
-
-### Metody normalizacji
-
-#### Z-score normalizacja
-
-```python
-mean = prices.rolling(window=20).mean()
-std = prices.rolling(window=20).std()
-normalized = (close - mean) / std
+```toml
+[data]
+normalization_window = 60   # okno rolling mean/std dla Z-score
 ```
 
-#### Min-Max normalizacja
-
-```python
-min_val = prices.rolling(window=20).min()
-max_val = prices.rolling(window=20).max()
-normalized = (close - min_val) / (max_val - min_val)
+```javascript
+mean = rollingMean(closes, normWindow)   // średnia krocząca 60 świec
+std  = rollingStd(closes, normWindow)    // odch. std krocząca 60 świec
+normalizedClose = (close - mean) / std
 ```
 
-#### Percentage change
+## Synchronizacja czasowa timeframe'ów
 
-```python
-pct_change = (close - prev_close) / prev_close
+Każdy krok Actor buduje stan używając świec które są **zamknięte** w momencie bieżącej świecy 1m. Zapobiega look-ahead bias.
+
+### Algorytm (binary search O(log N))
+
+```javascript
+function getAlignedCandles(allCandles, currentTime, numCandles) {
+    // Binary search: znajdź pierwszą świecę z close_time > currentTime
+    let lo = 0, hi = allCandles.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (allCandles[mid].close_time <= currentTime) lo = mid + 1;
+        else hi = mid;
+    }
+    const start = Math.max(0, lo - numCandles);
+    return allCandles.slice(start, lo);
+}
 ```
 
-## Wskaźniki techniczne
+### Przykład
 
-### RSI (Relative Strength Index)
+```
+Bieżąca świeca 1m: close_time = 2024-01-15 14:30:00
 
-```python
-# 14-period RSI
-delta = close.diff()
-gain = delta.where(delta > 0, 0).rolling(14).mean()
-loss = -delta.where(delta < 0, 0).rolling(14).mean()
-rs = gain / loss
-rsi = 100 - (100 / (1 + rs))
+Świece 15m: ostatnia zamknięta to 14:15-14:30 ✓
+Świece 1h:  ostatnia zamknięta to 13:00-14:00 ✓ (14:00-15:00 jest otwarta — pomijamy)
+Świece 1d:  ostatnia zamknięta to 2024-01-14 ✓
 ```
 
-**Interpretacja:**
-- RSI > 70 — wykupienie (możliwa korekta)
-- RSI < 30 — wyprzedanie (możliwe odbicie)
+## Struktura stanu
 
-### MACD (Moving Average Convergence Divergence)
-
-```python
-ema_12 = close.ewm(span=12).mean()
-ema_26 = close.ewm(span=26).mean()
-macd = ema_12 - ema_26
-signal = macd.ewm(span=9).mean()
-histogram = macd - signal
+```javascript
+state = {
+    candles_1m:  Float32Array([60, 11]),  // 60 świec × 11 cech
+    candles_15m: Float32Array([32, 11]),
+    candles_1h:  Float32Array([48, 11]),
+    candles_1d:  Float32Array([14, 11]),
+    // candles_1w pomijane (0 w config)
+}
 ```
 
-**Normalizacja MACD:**
-```python
-macd_normalized = macd / close
-```
-
-### SMA (Simple Moving Average)
-
-```python
-sma_20 = close.rolling(20).mean()
-```
-
-**Sygnał binarny:**
-```python
-above_sma = float(close > sma_20)  # 1 lub 0
-```
-
-## Struktura danych wejściowych
-
-### Dla jednego timeframe'a
-
-```python
-# Shape: [num_candles, num_features]
-state_1m = torch.zeros(15, 8)   # 15 świec × 8 cech
-state_15m = torch.zeros(15, 8)  # 15 świec × 8 cech
-state_1h = torch.zeros(20, 8)   # 20 świec × 8 cech
-state_1d = torch.zeros(30, 8)   # 30 świec × 8 cech
-state_1w = torch.zeros(54, 8)   # 54 świece × 8 cech
-```
-
-### Łączny rozmiar stanu
-
-```python
-# Łączna liczba elementów
-total = 15*8 + 15*8 + 20*8 + 30*8 + 54*8 = 1072 floatów
-```
+Łączny rozmiar: `(60 + 32 + 48 + 14) × 11 = 1694 float32`.
 
 ## Źródła danych
 
-### Binance API
+### Tryb file (domyślny)
 
-```python
-import requests
-
-def fetch_klines(symbol, interval, limit=1000):
-    url = "https://api.binance.com/api/v3/klines"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
-    response = requests.get(url, params=params)
-    return response.json()
+```toml
+[data]
+source = "file"
+path = "node/data/historical/"
 ```
 
-### Interwały Binance
+Actor ładuje pliki CSV z danymi historycznymi. Pliki pobiera się raz przez `scripts/download_data.js`.
 
-| Interwał | Wartość |
-|---|---|
-| 1 minuta | 1m |
-| 15 minut | 15m |
-| 1 godzina | 1h |
-| 1 dzień | 1d |
-| 1 tydzień | 1w |
+### Tryb API (real-time)
 
-### Cache danych
-
-Dane są cachowane lokalnie aby uniknąć zbędnych zapytań API i przyspieszyć trening.
-
-```
-node/data/cache/
-├── BTCUSDT_1m.csv
-├── BTCUSDT_15m.csv
-├── BTCUSDT_1h.csv
-├── ...
+```toml
+[data]
+source = "api"
+binance_rate_limit = 1000   # ms między żądaniami
+api_retry_interval_sec = 60
 ```
 
-## Pobieranie danych historycznych — download_data.js
+Dane pobierane na bieżąco z Binance REST API. Centralny `BinanceClient` kolejkuje requesty i pilnuje rate-limitów.
 
-### Opis
-
-Skrypt `scripts/download_data.js` służy do pobrania danych historycznych z Binance API i zapisania ich lokalnie. Dzięki temu trening może działać offline i nie zależy od rate-limitów API.
-
-### Uruchomienie
+## Pobieranie danych historycznych
 
 ```bash
 cd scripts
 node download_data.js --symbol BTCUSDT --interval 1m --days 30
+node download_data.js --symbol BTCUSDT --interval 15m --days 90
+node download_data.js --symbol BTCUSDT --interval 1h --days 365
+node download_data.js --symbol BTCUSDT --interval 1d --days 1095
 ```
 
-### Parametry
-
-| Parametr | Opis | Domyślnie |
-|---|---|---|
-| `--symbol` | Para kryptowalutowa | BTCUSDT |
-| `--interval` | Timeframe (1m, 15m, 1h, 1d, 1w) | 1h |
-| `--days` | Liczba dni wstecz | 30 |
-| `--output` | Folder zapisu (relative do projektu) | node/data/historical/ |
-
-### Format zapisu
-
-Dane są zapisywane jako **CSV** z kolumnami:
-
-```csv
-timestamp,open,high,low,close,volume,close_time,quote_volume,trades,taker_buy_base,taker_buy_quote,ignore
-1697000000000,34500.5,34600.0,34400.0,34550.0,1234.5,...
-```
-
-### Lokalizacja plików
+### Format plików
 
 ```
 node/data/historical/
@@ -255,204 +244,41 @@ node/data/historical/
 ├── BTCUSDT_15m.csv
 ├── BTCUSDT_1h.csv
 ├── BTCUSDT_1d.csv
-├── BTCUSDT_1w.csv
 ├── ETHUSDT_1h.csv
-└── SOLUSDT_1h.csv
+└── ...
 ```
 
-### Jak Actor wie gdzie szukać danych?
+Format CSV: `timestamp,open,high,low,close,volume,close_time,...`
 
-Actor ładuje ścieżkę z `config.toml`:
+## Obsługa brakującej historii
 
 ```toml
 [data]
-source = "file"  # "api" lub "file"
-path = "node/data/historical/"
-cache_path = "node/data/cache/"
+allow_partial_history = false  # true = zero-padding dla brakujących świec
 ```
 
-- **source = "file"** — ładuj z plików historycznych
-- **source = "api"** — pobieraj z Binance API w czasie rzeczywistym
-
-### Zasięg danych
-
-| Timeframe | Zalecany okres | Min. okres |
-|---|---|---|
-| 1m | 30 dni | 7 dni |
-| 15m | 90 dni | 30 dni |
-| 1h | 1 rok | 90 dni |
-| 1d | 3 lata | 1 rok |
-| 1w | 5+ lat | 2 lata |
-
-### Przykład pobrania pełnego zestawu
-
-```bash
-# BTC - wszystkie timeframe'y
-node download_data.js --symbol BTCUSDT --interval 1m --days 30
-node download_data.js --symbol BTCUSDT --interval 15m --days 90
-node download_data.js --symbol BTCUSDT --interval 1h --days 365
-node download_data.js --symbol BTCUSDT --interval 1d --days 1095
-node download_data.js --symbol BTCUSDT --interval 1w --days 1825
-
-# ETH, SOL - 1h (wystarczy dla Faz 2+)
-node download_data.js --symbol ETHUSDT --interval 1h --days 365
-node download_data.js --symbol SOLUSDT --interval 1h --days 365
-```
-
-## Przygotowanie danych
-
-### Pipeline
-
-```python
-def prepare_data(raw_klines):
-    # 1. Ekstrakcja OHLCV
-    df = extract_ohlcv(raw_klines)
-    
-    # 2. Oblicz wskaźniki
-    df['rsi'] = calculate_rsi(df['close'])
-    df['macd'] = calculate_macd(df['close'])
-    df['sma20'] = calculate_sma(df['close'], 20)
-    
-    # 3. Normalizacja
-    df['close_norm'] = z_score_normalize(df['close'])
-    df['volume_norm'] = df['volume'] / df['volume'].rolling(20).mean()
-    
-    # 4. Buduj features
-    features = build_features(df)
-    
-    # 5. Podziel na sekwencje
-    sequences = create_sequences(features)
-    
-    return sequences
-```
+Gdy `false` — Actor nie startuje jeśli brakuje danych dla jakiegoś timeframe'a.
+Gdy `true` — brakujące świece wypełniane zerami od lewej (cold start).
 
 ## Config
 
-Wszystkie parametry danych są konfigurowalne:
-
 ```toml
 [features]
-num_features = 8
+num_features = 11
 
 [timeframes]
-candles_1m  = 15
-candles_15m = 15
-candles_1h  = 20
-candles_1d  = 30
-candles_1w  = 54
-## Synchronizacja czasowa timeframe'ów
+candles_1m  = 60
+candles_15m = 32
+candles_1h  = 48
+candles_1d  = 14
+candles_1w  = 0
 
-Każdy krok Actor buduje stan używając świec które są **zamknięte** w momencie bieżącej świecy 1m. Nie można używać świec które jeszcze nie są zamknięte — to byłoby patrzenie w przyszłość (look-ahead bias).
-
-### Zasada
-
-Świeca wyższego timeframe'a jest aktualna jeśli jej `close_time <= current_1m_close_time`.
-
-```javascript
-function getAlignedCandles(allCandles, currentTime, timeframe) {
-    // Znajdź ostatnią świecę której close_time nie przekracza currentTime
-    return allCandles[timeframe]
-        .filter(c => c.close_time <= currentTime)
-        .slice(-config.timeframes[`candles_${timeframe}`]);
-}
-```
-
-### Przykład z konkretnym timestamp
-
-```
-Bieżąca świeca 1m: close_time = 2024-01-15 14:30:00
-
-Świece 15m: ostatnia zamknięta to 14:15-14:30 (close_time = 14:30:00) ✓
-Świece 1h:  ostatnia zamknięta to 13:00-14:00 (close_time = 14:00:00) ✓
-            świeca 14:00-15:00 jest otwarta — pomijamy ✗
-Świece 1d:  ostatnia zamknięta to 2024-01-14 (close_time = 2024-01-15 00:00:00) ✓
-Świece 1w:  ostatnia zamknięta to tydz. kończący 2024-01-14 ✓
-```
-
-### Dlaczego to ważne?
-
-Bez synchronizacji Actor mógłby patrzeć na niezamkniętą świecę 1h która zawiera informacje o przyszłości względem bieżącej świecy 1m — model nauczyłby się cheatingować na danych historycznych i zawodziłby w produkcji.
-
-## Rate limiting Binance API
-
-Binance ma limity zapytań które przy wielu Aktorach można łatwo przekroczyć.
-
-### Limity Binance REST API
-
-| Endpoint | Limit |
-|---|---|
-| GET /api/v3/klines | 1200 requestów/minutę (waga 1-10 per request) |
-| Ogólny limit | 6000 wag/minutę |
-
-### Centralny manager zapytań
-
-`data/binance.js` kolejkuje wszystkie requesty i pilnuje limitów — Actorzy nie odpytują API bezpośrednio.
-
-```javascript
-class BinanceRateLimiter {
-    constructor(config) {
-        this.maxRequestsPerMinute = config.data.binance_rate_limit;
-        this.queue = [];
-        this.requestsThisMinute = 0;
-
-        // Reset licznika co minutę
-        setInterval(() => { this.requestsThisMinute = 0; }, 60000);
-    }
-
-    async fetch(symbol, interval, limit) {
-        // Czekaj jeśli limit osiągnięty
-        while (this.requestsThisMinute >= this.maxRequestsPerMinute) {
-            await sleep(1000);
-        }
-
-        this.requestsThisMinute++;
-        return await fetchFromBinance(symbol, interval, limit);
-    }
-}
-```
-
-### Konfiguracja
-
-```toml
 [data]
-source = "file"                 # "file" lub "api"
+source = "file"
 path = "node/data/historical/"
 cache_path = "node/data/cache/"
-binance_rate_limit = 1000       # Max requestów/minutę (margines bezpieczeństwa)
-normalization_window = 20
-allow_partial_history = true
-```
-
-### Retry logic przy błędach API
-
-```javascript
-async function fetchWithRetry(symbol, interval, limit, maxRetries = 3) {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            return await rateLimiter.fetch(symbol, interval, limit);
-        } catch (err) {
-            if (attempt === maxRetries) {
-                logger.error(`Fetch failed after ${maxRetries} retries: ${err.message}`);
-                throw err;
-            }
-            // Exponential backoff: 1s, 2s, 4s
-            const delay = Math.pow(2, attempt - 1) * 1000;
-            logger.warn(`Binance API error (attempt ${attempt}/${maxRetries}), retry in ${delay}ms`);
-            await sleep(delay);
-        }
-    }
-}
-```
-
-### Zachowanie gdy API niedostępne
-
-Gdy Binance API jest niedostępne przez dłuższy czas (wszystkie retry wyczerpane):
-- Actor loguje błąd i **pauzuje trening** dla tej pary
-- Pozostałe Actory działają normalnie
-- Monitoring Service wyświetla alert o niedostępności pary
-- Actor próbuje ponownie co `api_retry_interval_sec` sekund
-
-```toml
-[data]
-api_retry_interval_sec = 60    # Próbuj ponownie co minutę przy długiej niedostępności
+normalization_window = 60
+allow_partial_history = false
+binance_rate_limit = 1000
+api_retry_interval_sec = 60
 ```

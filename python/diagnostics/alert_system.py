@@ -1,21 +1,26 @@
 """
-AlertSystem — alerty przez Telegram przy krytycznych zdarzeniach treningowych.
+AlertSystem — Telegram alerts for critical training events.
 
-Alerty:
-  NAN_DETECTED       — NaN w loss lub Q-values (natychmiast)
-  GRADIENT_EXPLODE   — grad_norm > próg
-  ACTION_COLLAPSE    — jedna akcja dominuje > próg
-  LOSS_PLATEAU       — brak poprawy loss przez N kroków
-  ADVANTAGE_DEAD     — advantage_std < 0.001 przez > 500 kroków
-  TRAINING_STARTED   — pierwsza notyfikacja po starcie
+Alert types:
+  NAN_DETECTED       — NaN in loss or Q-values (immediate)
+  GRADIENT_EXPLODE   — grad_norm exceeds threshold
+  ACTION_COLLAPSE    — one action dominates above threshold
+  LOSS_PLATEAU       — no loss improvement for N steps
+  ADVANTAGE_DEAD     — advantage_std < 0.001 for > 500 steps
+  TRAINING_STARTED   — first notification after startup
 """
 
 import logging
 import math
-import threading
 import time
+import urllib.parse
+import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+
+
+def _is_nan(v) -> bool:
+    return isinstance(v, float) and math.isnan(v)
 
 logger = logging.getLogger('learner')
 
@@ -32,28 +37,28 @@ class AlertSystem:
         self._plateau_steps = alerts_cfg.get('loss_plateau_steps', 2000)
 
         # Stan wewnętrzny
-        self._last_sent: dict[str, float] = {}   # typ alertu → timestamp ostatniego wysłania
+        self._last_sent: dict[str, float] = {}   # alert type → timestamp of last send
         self._loss_history: deque = deque(maxlen=self._plateau_steps)
         self._advantage_dead_count: int = 0
         self._training_started_sent: bool = False
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='alert')
 
         if self.enabled and (not self._token or not self._chat_id):
-            logger.warning('[Alerts] Telegram token lub chat_id nie skonfigurowane — alerty wyłączone')
+            logger.warning('[Alerts] Telegram token or chat_id not configured — alerts disabled')
             self.enabled = False
 
-    # ── publiczne API ─────────────────────────────────────────────────────
+    # ── public API ────────────────────────────────────────────────────────
 
     def notify_training_started(self, step: int, buffer_size: int) -> None:
         if self._training_started_sent:
             return
         self._training_started_sent = True
         self._send_async('TRAINING_STARTED',
-                         f'🟢 Trening rozpoczęty\nKrok: {step}\nBufor: {buffer_size:,}',
+                         f'🟢 Training started\nStep: {step}\nBuffer: {buffer_size:,}',
                          retries=3, retry_delay=30.0)
 
     def check_and_alert(self, metrics: dict, step: int) -> None:
-        """Sprawdza metryki i wysyła alerty. Nieblokujące — wszystko w wątkach tła."""
+        """Check metrics and send alerts. Non-blocking — all work dispatched to background threads."""
         if not self.enabled:
             return
 
@@ -63,23 +68,23 @@ class AlertSystem:
         action_ratios = metrics.get('action_ratios', [])
         advantage_std = metrics.get('advantage_std')
 
-        # NaN — natychmiast, bez cooldownu
+        # NaN — immediate, no cooldown
         nan_fields = []
-        if loss is not None and isinstance(loss, float) and math.isnan(loss):
+        if _is_nan(loss):
             nan_fields.append(f'loss={loss}')
-        if q_mean is not None and isinstance(q_mean, float) and math.isnan(q_mean):
+        if _is_nan(q_mean):
             nan_fields.append(f'q_mean={q_mean}')
         if nan_fields:
             self._send_async('NAN_DETECTED',
-                             f'🔴 NaN wykryty!\nKrok: {step}\nPola: {", ".join(nan_fields)}',
+                             f'🔴 NaN detected!\nStep: {step}\nFields: {", ".join(nan_fields)}',
                              ignore_cooldown=True)
 
-        # Eksplodujący gradient
+        # Gradient explosion
         if grad_norm is not None and grad_norm > self._grad_threshold:
             self._send_async('GRADIENT_EXPLODE',
-                             f'⚠️ Eksplodujący gradient\nKrok: {step}\ngrad_norm={grad_norm:.3f} (próg: {self._grad_threshold})')
+                             f'⚠️ Gradient explosion\nStep: {step}\ngrad_norm={grad_norm:.3f} (threshold: {self._grad_threshold})')
 
-        # Kolaps akcji
+        # Action collapse
         if action_ratios:
             max_ratio = max(action_ratios)
             max_idx = action_ratios.index(max_ratio)
@@ -87,23 +92,23 @@ class AlertSystem:
             if max_ratio > self._collapse_threshold:
                 name = action_names[max_idx] if max_idx < len(action_names) else str(max_idx)
                 self._send_async('ACTION_COLLAPSE',
-                                 f'⚠️ Kolaps polityki\nKrok: {step}\n{name}={max_ratio:.1%} (próg: {self._collapse_threshold:.0%})')
+                                 f'⚠️ Policy collapse\nStep: {step}\n{name}={max_ratio:.1%} (threshold: {self._collapse_threshold:.0%})')
 
-        # Plateau loss
-        if loss is not None and not (isinstance(loss, float) and math.isnan(loss)):
+        # Loss plateau
+        if loss is not None and not _is_nan(loss):
             self._loss_history.append(loss)
             if len(self._loss_history) == self._plateau_steps:
                 history = list(self._loss_history)
                 half = self._plateau_steps // 2
                 first_half = sum(history[:half]) / half
                 second_half = sum(history[half:]) / half
-                if second_half >= first_half * 0.99:   # mniej niż 1% poprawy
+                if second_half >= first_half * 0.99:   # less than 1% improvement
                     self._send_async('LOSS_PLATEAU',
-                                     f'📊 Plateau loss\nKrok: {step}\n'
-                                     f'Pierwsza połowa: {first_half:.5f}\n'
-                                     f'Druga połowa: {second_half:.5f}')
+                                     f'📊 Loss plateau\nStep: {step}\n'
+                                     f'First half: {first_half:.5f}\n'
+                                     f'Second half: {second_half:.5f}')
 
-        # Martwy advantage stream
+        # Dead advantage stream
         if advantage_std is not None:
             if advantage_std < 0.001:
                 self._advantage_dead_count += 1
@@ -111,11 +116,11 @@ class AlertSystem:
                 self._advantage_dead_count = 0
             if self._advantage_dead_count >= 500:
                 self._send_async('ADVANTAGE_DEAD',
-                                 f'⚠️ Advantage stream martwy\nKrok: {step}\n'
-                                 f'advantage_std={advantage_std:.5f} przez {self._advantage_dead_count} kroków')
-                self._advantage_dead_count = 0   # reset żeby nie spamować
+                                 f'⚠️ Advantage stream dead\nStep: {step}\n'
+                                 f'advantage_std={advantage_std:.5f} for {self._advantage_dead_count} steps')
+                self._advantage_dead_count = 0   # reset to avoid spam
 
-    # ── wewnętrzne ────────────────────────────────────────────────────────
+    # ── internal ──────────────────────────────────────────────────────────
 
     def _send_async(self, alert_type: str, message: str, ignore_cooldown: bool = False,
                     retries: int = 0, retry_delay: float = 0.0) -> None:
@@ -127,8 +132,6 @@ class AlertSystem:
         self._executor.submit(self._send, message, retries, retry_delay)
 
     def _send(self, message: str, retries: int = 0, retry_delay: float = 0.0) -> None:
-        import urllib.request
-        import urllib.parse
         url = f'https://api.telegram.org/bot{self._token}/sendMessage'
         data = urllib.parse.urlencode({
             'chat_id': self._chat_id,
@@ -145,7 +148,7 @@ class AlertSystem:
                     return
             except Exception as e:
                 if attempt <= retries:
-                    logger.warning(f'[Alerts] Telegram send failed (próba {attempt}/{attempts}): {e} — retry za {retry_delay:.0f}s')
+                    logger.warning(f'[Alerts] Telegram send failed (attempt {attempt}/{attempts}): {e} — retry in {retry_delay:.0f}s')
                     time.sleep(retry_delay)
                 else:
-                    logger.warning(f'[Alerts] Telegram send failed (próba {attempt}/{attempts}): {e}')
+                    logger.warning(f'[Alerts] Telegram send failed (attempt {attempt}/{attempts}): {e}')

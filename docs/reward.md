@@ -2,405 +2,243 @@
 
 ## Przegląd
 
-System nagradzania jest kluczowym elementem uczenia przez wzmacnianie — to jedyny sygnał jaki sieć otrzymuje do nauki. Źle zaprojektowany system nagród prowadzi do niepożądanych zachowań.
+System nagradzania składa się z dwóch warstw:
 
-> **Ważne:** Wszystkie wartości liczbowe (prowizje, kary, progi clipowania) są **konfigurowalne przez `config.toml`** — wartości pokazane w przykładach są ilustracyjne i nie są hardcoded w kodzie.
+1. **Nagroda per krok** — natychmiastowe sygnały przy każdym kroku (delta uPnL, kary za bezczynność i trzymanie)
+2. **Nagroda przy zamknięciu pozycji** — zrealizowany P&L z prowizją, time decay i karą za drawdown
+
+> **Ważne:** Wszystkie wartości są **konfigurowalne przez `config.toml` [reward]** — zero hardcoded w kodzie.
+
+## Aktualna konfiguracja
 
 ```toml
 [reward]
-commission_open = 0.001      # Prowizja za otwarcie (0.1%)
-commission_close = 0.001     # Prowizja za zamknięcie (0.1%)
-trade_penalty = 0.001        # Dodatkowa kara za transakcję
-clip_min = -1.0              # Minimalna nagroda po clipowaniu
-clip_max = 1.0               # Maksymalna nagroda po clipowaniu
-intermediate_reward_max = 0.1 # Max nagrody pośredniej
+commission_open  = 0.00075   # prowizja Binance za otwarcie (taker 0.075%)
+commission_close = 0.00075   # prowizja Binance za zamknięcie (taker 0.075%)
+trade_penalty    = 0.0       # dodatkowa kara za otwarcie (można zwiększyć przy churning)
+close_penalty    = 0.0       # dodatkowa kara za zamknięcie
+
+post_close_cooldown_steps = 12  # trade_penalty ×2 gdy nowe otwarcie < N kroków po zamknięciu
+intermediate_reward_max   = 0.1 # cap absolutny na delta uPnL per krok
+
+loss_scale            = 1.4    # mnożnik ujemnych delt uPnL (straty ważniejsze)
+hold_penalty_per_bar  = 0.0002 # kara per krok za trzymanie pozycji (anty-przetrzymanie)
+time_decay_hours      = 4.0    # half-life: po 4h trzymania PnL × 0.5
+drawdown_penalty      = 0.0    # kara za maxDrawdown podczas trzymania
+idle_penalty_per_bar  = 0.0002 # kara per krok BEZ pozycji (anty-HOLD collapse)
+
+clip_min = -1.0   # dolny clip całkowitej nagrody per krok
+clip_max =  1.0   # górny clip całkowitej nagrody per krok
+
+reward_scale            = 1.0   # globalny mnożnik wszystkich nagród
+unrealized_reward_scale = 0.02  # mnożnik absolutnego uPnL dodawanego per krok
 ```
 
-## Zasady nagradzania
+## Architektura nagród
 
-### Realized P&L tylko
+### 1. Przy otwarciu pozycji
 
-Nagroda jest dawana **tylko przy zamknięciu pozycji** (realized P&L). Podczas trzymania pozycji (akcja HOLD) nagroda wynosi 0.
+```
+reward_open = -(commission_open + trade_penalty)
+```
 
-### Dlaczego nie per-krok?
+Jeśli otwarcie nastąpiło przed upłynięciem cooldown od ostatniego zamknięcia:
+```
+trade_penalty jest podwojona
+```
 
-Nagroda per-krok prowadzi do uczenia się na **unrealized huśtawce cenowej** — sieć widzi "zysk" który jeszcze nie istnieje i może szybko zniknąć.
+Sieć od razu "czuje" koszt wejścia.
 
-```python
-if position.open:
-    reward = 0  # żadna nagroda podczas trzymania (HOLD)
+### 2. Per krok (HOLD z otwartą pozycją)
+
+```
+delta_upnl = unrealized_pnl[t] - unrealized_pnl[t-1]
+
+# Asymetria: straty ważniejsze
+if delta_upnl < 0:
+    scaled_delta = delta_upnl * loss_scale     # × 1.4
 else:
-    reward = calculate_realized_pnl(position)
+    scaled_delta = delta_upnl
+
+# Cap absolutny
+clipped = clip(scaled_delta, -intermediate_reward_max, +intermediate_reward_max)
+
+# Kara za trzymanie (anty-przetrzymywanie)
+reward_step = clipped × unrealized_reward_scale - hold_penalty_per_bar
 ```
 
-## Formuła nagrody
-
-### Podstawowa formuła
+### 3. Per krok (HOLD bez pozycji)
 
 ```
-nagroda = pnl_procentowy
-        - prowizja_otwarcia
-        - prowizja_zamknięcia
-        - kara_za_transakcję
+reward_step = -idle_penalty_per_bar   # zniechęcenie do bezczynności
 ```
 
-### Dla pozycji LONG
+### 4. Przy zamknięciu pozycji
 
-```python
-def calculate_pnl_long(open_price, close_price):
-    """LONG: zysk gdy cena rośnie"""
-    return (close_price - open_price) / open_price
+```
+pnl = realized P&L (LONG: (close-open)/open, SHORT: (open-close)/open)
+
+# Time decay: zniechęca do przetrzymywania
+holding_hours = (close_time - open_time) / 3_600_000
+time_decay = 1.0 / (1.0 + holding_hours / time_decay_hours)
+pnl_decayed = pnl * time_decay
+
+# Kara za drawdown podczas trzymania
+drawdown_loss = max_drawdown × drawdown_penalty
+
+reward_close = pnl_decayed - commission_close - close_penalty - drawdown_loss
+reward_close = clip(reward_close, clip_min, clip_max)
 ```
 
-### Dla pozycji SHORT
+## Przepływ nagród przez epizod
 
-```python
-def calculate_pnl_short(open_price, close_price):
-    """SHORT: zysk gdy cena spada"""
-    return (open_price - close_price) / open_price
 ```
+Krok 1: LONG otwarta
+   → reward = -(commission_open + trade_penalty)         ← natychmiastowy koszt
 
-### Uniwersalna formuła
+Krok 2-N: HOLD
+   → reward = delta_uPnL × scale - hold_penalty_per_bar  ← per-krok signal
 
-```python
-def calculate_pnl(position):
-    """Oblicz PnL niezależnie od kierunku pozycji"""
-    if position.side == "LONG":
-        pnl = (position.close_price - position.open_price) / position.open_price
-    elif position.side == "SHORT":
-        pnl = (position.open_price - position.close_price) / position.open_price
-    else:
-        return 0  # brak pozycji
-    
-    return pnl
+Krok N+1: CLOSE
+   → reward = pnl × decay - commission_close            ← zrealizowany wynik
+
+Krok N+2-M: HOLD (brak pozycji)
+   → reward = -idle_penalty_per_bar                      ← zniechęcenie do leżenia
 ```
 
 ## Prowizja
 
-### Dlaczego prowizja jest ważna?
-
-Prowizja musi być odjęta od nagrody — **bez niej sieć nie widzi kosztu transakcji** i uczy się overtradingu (churning).
-
-### Binance fees
+### Binance taker fees
 
 | Strona | Prowizja |
 |---|---|
-| Otwarcie | 0.1% |
-| Zamknięcie | 0.1% |
-| **Round trip** | **0.2%** |
+| Otwarcie | 0.075% |
+| Zamknięcie | 0.075% |
+| **Round trip** | **0.15%** |
 
-### Implementacja
+### Dlaczego prowizja jest kluczowa?
 
-```python
-# Wartości z config.toml, nie hardcoded!
-config = load_config()
-commission_open = config['reward']['commission_open']
-commission_close = config['reward']['commission_close']
+Bez prowizji sieć nie widzi kosztu transakcji i uczy się churning'u (ciągłego kupowania i sprzedawania). Już przy 10 round-tripach na epizod koszty wynoszą 1.5% — więcej niż typowy zysk.
 
-reward = pnl - commission_open - commission_close
+## Time Decay
+
+```
+time_decay = 1.0 / (1.0 + t_hours / time_decay_hours)
 ```
 
-## Kara za transakcję
+| Czas trzymania | Decay (time_decay_hours=4) |
+|---|---|
+| 0h | 1.00 (brak kary) |
+| 4h | 0.50 (połowa P&L) |
+| 8h | 0.33 |
+| 24h | 0.14 |
 
-### Opis
+Zniechęca do przetrzymywania pozycji bez wyraźnego trendu.
 
-Mała **dodatkowa kara** niezależna od prowizji zniechęca do nadmiernego handlu.
-
-```python
-# Wartość z config.toml
-trade_penalty = config['reward']['trade_penalty']
-reward -= trade_penalty  # przy każdym otwarciu pozycji
-```
-
-### Dlaczego dodatkowa kara?
-
-Prowizja Binance to tylko koszt finansowy. Dodatkowa kara modeluje:
-- Slippage (różnica między oczekiwaną a rzeczywistą ceną)
-- Koszt czasu i zasobów
-- Preferencję dla rzadszych, lepszych sygnałów
-
-## Skala nagród i clipping
-
-### Zakresy nagród
-
-| Typ | Zakres | Opis |
-|---|---|---|
-| Nagrody pośrednie | max ±0.1 | Bicie stop loss, take profit |
-| Nagroda końcowa | ±1.0 | Wygrana/przegrana epizodu |
-| Po clipowaniu | [-1, 1] | Ostateczny zakres |
-
-### Clipowanie
+## Asymetria strat (loss_scale)
 
 ```python
-# Wartości z config.toml
-clip_min = config['reward']['clip_min']  # -1.0
-clip_max = config['reward']['clip_max']  # 1.0
-
-reward = max(clip_min, min(clip_max, reward))
+if delta_upnl < 0:
+    scaled = delta_upnl * 1.4   # straty ważą więcej
+else:
+    scaled = delta_upnl
 ```
 
-### Dlaczego clipowanie?
+Empirycznie straty bardziej destabilizują trening niż równoważne zyski — `loss_scale > 1.0` wzmacnia sygnał z ujemnych przejść.
 
-Ostateczna nagroda jest zawsze clipowana do zakresu `[-1, 1]` dla **stabilności gradientów**. Ekstremalne nagrody destabilizują trening.
+## Cooldown po zamknięciu
 
-### Dlaczego pośrednie << końcowe?
+```
+post_close_cooldown_steps = 12
 
-Nagrody pośrednie muszą być **znacznie mniejsze** niż końcowa — inaczej sieć optymalizuje pod nagrody pośrednie kosztem wyniku końcowego.
+Jeśli kroki_od_zamknięcia < 12:
+    trade_penalty = trade_penalty × 2
+```
 
-## Confidence score (opcjonalny modyfikator)
+Zniechęca do natychmiastowego ponownego wejścia zaraz po zamknięciu pozycji.
 
-Jeśli model zwraca **confidence score** (pewność co do akcji), można go użyć do modyfikacji nagrody:
+## Kara za bezczynność (idle_penalty)
 
 ```python
-def calculate_reward_with_confidence(position, confidence):
-    """
-    Confidence w zakresie [0, 1]:
-    - 1.0 = pełna pewność (normalna nagroda)
-    - 0.5 = średnia pewność (pomniejszona nagroda)
-    - 0.0 = brak pewności (zerowa nagroda)
-    """
-    base_reward = calculate_reward(position)
-    
-    # Nagroda proporcjonalna do pewności
-    reward = base_reward * confidence
-    
-    return max(clip_min, min(clip_max, reward))
+if not position_open:
+    reward -= idle_penalty_per_bar   # 0.0002 per krok
 ```
 
-### Dlaczego confidence score?
+Zapobiega degeneracji do strategii "zawsze HOLD" bez otwartej pozycji.
 
-- Sieć uczy się nie tylko **którą akcję** wybrać, ale też **kiedy być pewna**
-- Nagradza świadome decyzje, karze losowe zgadywanie
-- Przydatne przy niskim epsilon (faza eksploatacji)
-
-## Interaction z Prioritized Experience Replay
-
-### Priorytet w PER
-
-Priorytet doświadczenia w **Prioritized Experience Replay** jest liczony od **TD error**, nie od samej nagrody:
+## Kara za trzymanie (hold_penalty)
 
 ```python
-# TD error = target - Q_value
-td_error = target_q - current_q
-
-# Priorytet = |TD error| + epsilon (mała stała)
-priority = abs(td_error) + epsilon_per
+if position_open:
+    reward -= hold_penalty_per_bar   # 0.0002 per krok
 ```
 
-### Dlaczego od TD error a nie od nagrody?
+Zniechęca do przetrzymywania — razem z time decay tworzy presję na zamknięcie pozycji w odpowiednim momencie.
 
-- **Clipowana nagroda** traci informację o skali błędu
-- **TD error** zachowuje pełną informację o tym jak bardzo sieć się myliła
-- Doświadczenia gdzie sieć **bardzo się myliła** (duży TD error) są najważniejsze do nauki
+## Clipowanie nagród
 
-### Proces zapisu do PER
+Całkowita nagroda per krok jest zawsze w przedziale `[clip_min, clip_max] = [-1.0, 1.0]`.
+
+Clipowanie zapewnia **stabilność gradientów** — ekstremalne nagrody destabilizują trening.
+
+## Reward scale
 
 ```python
-def add_to_buffer(state, action, reward, next_state, done, td_error=None):
-    """
-    Dodaj doświadczenie do Prioritized Replay Buffer
-    
-    Jeśli td_error nie jest podany (nowe doświadczenie):
-    - Użyj maksymalnego priorytetu (nowe = ważne)
-    - Priorytet zostanie zaktualizowany po treningu
-    """
-    if td_error is None:
-        # Nowe doświadczenie - max priorytet
-        priority = max_priority
-    else:
-        # Zaktualizowany TD error z treningu
-        priority = abs(td_error) + epsilon_per
-    
-    buffer.add(state, action, reward, next_state, done, priority)
+reward = raw_reward * reward_scale   # globalna amplifikacja sygnału
 ```
 
-### Aktualizacja priorytetów
+Przy `reward_scale = 1.0` (domyślnie) — bez zmian. Zwiększenie wzmacnia sygnał gdy nagrody są zbyt małe do efektywnego uczenia.
+
+## N-step Returns
+
+Nagrody per krok są sumowane w N-krokowym zwrocie przed wysłaniem do bufora:
 
 ```python
-def update_priorities(indices, td_errors):
-    """
-    Po kroku treningu zaktualizuj priorytety samplowanych doświadczeń
-    """
-    for idx, td_err in zip(indices, td_errors):
-        new_priority = abs(td_err) + epsilon_per
-        buffer.update_priority(idx, new_priority)
+# n_step = 25
+R_t^n = Σ_{k=0}^{n-1} γ^k × r_{t+k}
+target = R_t^n + (1 - done) × γ^n × Q(s_{t+n})
 ```
+
+Pozwala sygnaływi nagrody propagować się przez 25 kroków wstecz.
 
 ## Typowe problemy
 
 ### Churning (overtrading)
 
-**Objaw:** Sieć ciągle kupuje i sprzedaje.
-
-**Przyczyny:**
-- Brak prowizji w nagrodzie
-- Nagroda per-krok zamiast realized only
-- Zbyt mała kara za transakcję
+**Objaw:** Sieć otwiera i zamyka pozycje co 1-2 kroki.
 
 **Rozwiązanie:**
-```python
-# Wartości z config.toml
-commission = config['reward']['commission_open'] + config['reward']['commission_close']
-trade_penalty = config['reward']['trade_penalty']
-
-# Tylko przy zamknięciu pozycji (CLOSE)
-if not position.closed:
-    reward = 0
-else:
-    reward = calculate_pnl(position) - commission - trade_penalty
-    reward = max(clip_min, min(clip_max, reward))
+```toml
+trade_penalty = 0.001         # dodaj karę za otwarcie
+post_close_cooldown_steps = 20  # dłuższy cooldown
 ```
 
-### Nigdy nie handluje
+### HOLD collapse (zawsze HOLD)
 
-**Objaw:** Sieć nauczyła się zawsze czekać (akcja "hold").
-
-**Przyczyny:**
-- Zbyt duże kary za transakcje
-- Zbyt wysoka prowizja
-- Zbyt małe nagrody za wygrane
+**Objaw:** Sieć nigdy nie otwiera pozycji.
 
 **Rozwiązanie:**
-```python
-# Zmniejsz wartości w config.toml:
-# trade_penalty = 0.0005  # zamiast 0.001
-# commission_open = 0.0005  # zamiast 0.001
-
-# Zwiększ gamma aby sieć była cierpliwsza
-# gamma = 0.999  # zamiast 0.99
+```toml
+idle_penalty_per_bar = 0.0005   # silniejsza kara za bezczynność
+trade_penalty = 0.0             # usuń lub zmniejsz karę za otwarcie
 ```
 
-### Overfit do danych treningowych
+### Przetrzymywanie pozycji
 
-**Objaw:** Na danych treningowych działa świetnie, na nowych losowo.
-
-**Przyczyny:**
-- Trening na jednym krótkim wykresie
-- Zawsze ten sam start epizodu
-- Zbyt duża sieć względem danych
+**Objaw:** Sieć trzyma pozycje zbyt długo (straty narastają).
 
 **Rozwiązanie:**
-- Losowe starty epizodów
-- Różne okresy treningowe
-- Walidacja out-of-sample (20% danych)
-- Redukcja wielkości sieci
-
-### Gaming reward
-
-**Objaw:** Sieć znajduje lukę w systemie nagród.
-
-**Przykład:** Jeśli nagradzasz za każdą zamkniętą pozycję, sieć będzie otwierać i zamykać pozycje bez zysku byle dostać nagrodę.
-
-**Rozwiązanie:** Nagroda proporcjonalna do P&L (ujemny P&L = ujemna nagroda) + kara za transakcję.
-
-## Przykładowe implementacje
-
-> Wszystkie wartości liczbowe w przykładach są **ilustracyjne**. W produkcji ładuj je z `config.toml`.
-
-### Prosta nagroda (uniwersalna dla LONG/SHORT)
-
-```python
-def calculate_reward(position, config):
-    """
-    Prosta nagroda realized P&L z prowizją i karą.
-    Działa zarówno dla LONG jak i SHORT.
-    """
-    if not position.closed:
-        return 0
-    
-    # Oblicz PnL zależnie od kierunku
-    if position.side == "LONG":
-        pnl = (position.close_price - position.open_price) / position.open_price
-    elif position.side == "SHORT":
-        pnl = (position.open_price - position.close_price) / position.open_price
-    else:
-        return 0
-    
-    # Prowizja i kara z configu
-    commission = config['reward']['commission_open'] + config['reward']['commission_close']
-    trade_penalty = config['reward']['trade_penalty']
-    
-    reward = pnl - commission - trade_penalty
-    reward = max(config['reward']['clip_min'], min(config['reward']['clip_max'], reward))
-    
-    return reward
+```toml
+hold_penalty_per_bar = 0.0005  # silniejsza kara per krok z pozycją
+time_decay_hours = 2.0          # szybszy decay PnL
 ```
 
-### Nagroda z risk-adjusted return
+### Nigdy nie zamyka ze stratą
 
-```python
-def calculate_reward_risk_adjusted(position, config):
-    """
-    Nagroda z karą za maksymalny drawdown podczas trzymania pozycji.
-    Zachęca do zamykania pozycji zanim strata stanie się duża.
-    """
-    if not position.closed:
-        return 0
-    
-    # PnL zależnie od kierunku
-    if position.side == "LONG":
-        pnl = (position.close_price - position.open_price) / position.open_price
-    elif position.side == "SHORT":
-        pnl = (position.open_price - position.close_price) / position.open_price
-    
-    # Kara za drawdown (im większy spadek, tym większa kara)
-    max_drawdown = calculate_max_drawdown(position)  # funkcja pomocnicza
-    risk_penalty = max_drawdown * config['reward']['drawdown_penalty']
-    
-    commission = config['reward']['commission_open'] + config['reward']['commission_close']
-    trade_penalty = config['reward']['trade_penalty']
-    
-    reward = pnl - commission - trade_penalty - risk_penalty
-    reward = max(config['reward']['clip_min'], min(config['reward']['clip_max'], reward))
-    
-    return reward
+**Objaw:** Sieć unika CLOSE gdy pozycja jest na minusie.
+
+**Rozwiązanie:**
+```toml
+drawdown_penalty = 0.5    # kara za głęboki drawdown podczas trzymania
+loss_scale = 1.8          # silniejsza penalizacja ujemnych delta uPnL
 ```
-
-### Nagroda z time decay
-
-```python
-def calculate_reward_time_decay(position, config):
-    """
-    Nagroda zmniejszana czasem trzymania pozycji.
-    Zachęca do szybszego zamykania pozycji.
-    """
-    if not position.closed:
-        return 0
-    
-    # PnL zależnie od kierunku
-    if position.side == "LONG":
-        pnl = (position.close_price - position.open_price) / position.open_price
-    elif position.side == "SHORT":
-        pnl = (position.open_price - position.close_price) / position.open_price
-    
-    # Im dłużej trzymasz, tym mniejsza nagroda
-    holding_time = position.close_time - position.open_time
-    time_decay = 1.0 / (1.0 + holding_time / config['reward']['time_decay_hours'])
-    
-    commission = config['reward']['commission_open'] + config['reward']['commission_close']
-    trade_penalty = config['reward']['trade_penalty']
-    
-    reward = pnl * time_decay - commission - trade_penalty
-    reward = max(config['reward']['clip_min'], min(config['reward']['clip_max'], reward))
-    
-    return reward
-```
-
-### Nagroda z confidence score
-
-```python
-def calculate_reward_with_confidence(position, confidence, config):
-    """
-    Nagroda modyfikowana przez confidence score z modelu.
-    Confidence w zakresie [0, 1].
-    """
-    # Bazowa nagroda
-    base_reward = calculate_reward(position, config)
-    
-    # Modyfikacja przez pewność modelu
-    confidence_scale = config.get('reward', {}).get('confidence_scale', 1.0)
-    reward = base_reward * (confidence_scale * confidence + (1 - confidence_scale))
-    
-    reward = max(config['reward']['clip_min'], min(config['reward']['clip_max'], reward))
-    
-    return reward

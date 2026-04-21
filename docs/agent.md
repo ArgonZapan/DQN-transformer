@@ -24,6 +24,10 @@ Komentarze tylko w miejscach nieoczywistych — tam gdzie logika mogłaby być n
 - Action masking — dlaczego `-inf` zamiast `0`
 - Synchronizacja czasowa timeframe'ów — look-ahead bias
 - Wzór Dueling DQN — odejmowanie `mean(A)`
+- LayerNorm zamiast BatchNorm — dlaczego (train/eval rozbieżność w Double DQN)
+- Kauzalny padding Conv1D — brak look-ahead w sekwencji świec
+- Brak GAP po Conv1D — dlaczego Transformer dostaje pełną sekwencję (nie 4 tokeny)
+- `gamma_n = gamma^n_step` — mnożnik bootstrappingu przy n-step returns
 
 **Nie komentuj:**
 - Przypisań zmiennych
@@ -38,21 +42,22 @@ Implementuj w tej kolejności — każdy etap zależy od poprzedniego:
 
 1. `config.toml` + loadery konfiguracji (Python i Node.js)
 2. `scripts/download_data.js` — pobieranie danych historycznych
-3. `node/data/` — indicators, normalizer, binance client
-4. `node/env/` — state, reward, episode, tradingEnv
-5. `python/model/network.py` — architektura sieci
-6. `python/training/replay_buffer.py` + `prioritized_buffer.py`
-7. `python/server/zmq_server.py` + schemas
-8. `python/training/trainer.py`
-9. `python/main.py`
-10. `node/actors/actor.js` + `actorManager.js`
-11. `node/client/pythonClient.js`
-12. `node/index.js`
-13. `monitoring/server.js`
-14. `dashboard/` — komponenty React
-15. `run.bat` + `stop.bat`
-16. `scripts/evaluate.py` — backtesting
-17. `debug/` — smoke testy integracyjne
+3. `node/data/` — indicators (11 cech v1+v2), normalizer, binance client
+4. `node/env/` — state (11 cech, 4 aktywne TF), reward (delta uPnL + realized), episode (nstep/mc/td), tradingEnv
+5. `python/model/network.py` — Conv1D (LayerNorm, kauzalny pad) + Transformer (pełna sekwencja) + position branch + Dueling
+6. `python/training/replay_buffer.py` + `prioritized_buffer.py` (DualPrioritizedBuffer)
+7. `python/server/zmq_server.py` + schemas (batch format)
+8. `python/training/trainer.py` (Double DQN + AMP + LR scheduler)
+9. `python/diagnostics/` — alert_system, metric_logger, health_runner, telegram_commands, training_report
+10. `python/main.py`
+11. `node/actors/actor.js` (ONNX local + ZMQ fallback) + `actorManager.js`
+12. `node/client/pythonClient.js`
+13. `node/index.js`
+14. `monitoring/server.js`
+15. `dashboard/` — komponenty React
+16. `run.bat` + `stop.bat`
+17. `python/backtest.py` — backtesting OOS
+18. `debug/` — smoke testy integracyjne
 
 ## Komunikacja między modułami
 

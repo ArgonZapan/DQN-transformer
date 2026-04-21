@@ -1,23 +1,23 @@
 """
-TelegramCommands — polling bot odbierający komendy ze skonfigurowanego chatu.
+TelegramCommands — long-polling bot receiving commands from the configured chat.
 
-Dostępne komendy:
-  /status   — szybki podgląd: krok, sps, epsilon, loss, bufor
-  /health   — natychmiastowy health check
-  /pause    — wstrzymaj pętlę treningową
-  /resume   — wznów pętlę treningową
-  /checkpoint — wymusz zapis checkpointu
-  /buffer   — statystyki buffera
-  /actors   — status aktorów
-  /stop     — graceful shutdown
-  /restart  — reset modelu, bufora i checkpointów (nowe szkolenie)
-  /delete   — usuwa checkpointy i model ONNX (wymaga potwierdzenia: /delete confirm)
-  /raport   — wymusza natychmiastowy raport treningowy
-  /set      — ustaw wartość w configu: /set sekcja.klucz wartość
-  /get      — pobierz wartość z configu: /get sekcja[.klucz]
-  /ereset   — tymczasowy reset eksploracji: /ereset [target] [duration_steps]
+Available commands:
+  /status     — quick overview: step, sps, epsilon, loss, buffer
+  /health     — immediate health check
+  /pause      — pause the training loop
+  /resume     — resume the training loop
+  /checkpoint — force checkpoint save
+  /buffer     — buffer statistics
+  /actors     — actor status
+  /stop       — graceful shutdown
+  /restart    — reset model, buffer and checkpoints (fresh training)
+  /delete     — delete checkpoints and ONNX model (requires confirmation: /delete confirm)
+  /raport     — force immediate training report
+  /set        — set config value: /set section.key value
+  /get        — get config value: /get section[.key]
+  /ereset     — temporary exploration reset: /ereset [target] [duration_steps]
 
-Bot używa long-pollingu co 2s. Token i chat_id brane z [report] lub [alerts] w config.toml.
+Bot uses long-polling every 2s. Token and chat_id taken from [report] or [alerts] in config.toml.
 """
 
 import glob

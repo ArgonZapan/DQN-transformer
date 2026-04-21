@@ -1,8 +1,8 @@
 """
-HealthRunner — co godzinę robi forward pass na 100 stanach z buffera
-i oblicza metryki zdrowia sieci: Q-spread, action diversity, Q-sign consistency.
+HealthRunner — every hour runs a forward pass on 100 buffer states
+and computes network health metrics: Q-spread, action diversity, Q-sign consistency.
 
-Wyniki logowane do TensorBoard (prefix Health/) i do health_checks.jsonl.
+Results logged to TensorBoard (prefix Health/) and to health_checks.jsonl.
 """
 
 import json
@@ -28,7 +28,7 @@ class HealthRunner:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     def maybe_run(self) -> dict | None:
-        """Wywołać po każdym train_step. Zwraca metryki jeśli wykonał check, None wpp."""
+        """Call after each train_step. Returns metrics if a check was performed, None otherwise."""
         if time.time() - self._last_check_time < self.check_interval_sec:
             return None
         if len(self.trainer.buffer) < self.trainer.min_buffer_size:

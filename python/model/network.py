@@ -4,44 +4,44 @@ import torch.nn.functional as F
 
 
 class Conv1DBlock(nn.Module):
-    """Blok konwolucyjny dla pojedynczego timeframe'a.
-    Wykrywa lokalne wzorce cenowe, skoki wolumenu, momentum.
-    Używa kauzalnego paddingu (tylko w lewo) — brak look-ahead bias.
+    """Convolutional block for a single timeframe.
+    Detects local price patterns, volume spikes, momentum.
+    Uses causal padding (left-only) — no look-ahead bias.
 
-    Zmiany vs poprzednia wersja:
-    - BatchNorm1d zastąpiony LayerNorm: BN w trybie eval używa statystyk z całego
-      treningu zamiast bieżącego batcha — to powoduje rozbieżność w Double DQN
-      (main.eval() → action selection vs main.train() → backprop).
-      LayerNorm normalizuje per-sample, bez trybu train/eval.
-    - Brak Global Average Pooling: GAP redukował sekwencję N świec do 1 tokenu,
-      co czyniło Transformer zbędnym (self-attention nad 4 tokenami = ważona suma).
-      Teraz zwracamy pełną sekwencję [batch, seq_len, conv_filters] — Transformer
-      dostaje wszystkie świece ze wszystkich TF jako tokeny.
+    Changes vs previous version:
+    - BatchNorm1d replaced by LayerNorm: BN in eval mode uses training-wide statistics
+      instead of the current batch — causes divergence in Double DQN
+      (main.eval() for action selection vs main.train() for backprop).
+      LayerNorm normalizes per-sample, independent of train/eval mode.
+    - No Global Average Pooling: GAP reduced N-candle sequence to 1 token,
+      making the Transformer redundant (self-attention over 4 tokens = weighted sum).
+      Now returns the full sequence [batch, seq_len, conv_filters] — Transformer
+      receives all candles from all timeframes as tokens.
     """
 
     def __init__(self, num_features, conv_filters, kernel_size, dropout):
         super().__init__()
-        # padding=0 — pad ręcznie tylko po lewej stronie (przeszłość)
+        # padding=0 — pad manually on the left side only (past candles)
         self.conv = nn.Conv1d(num_features, conv_filters, kernel_size, padding=0)
-        self.causal_pad = kernel_size - 1  # ile zer dodać po lewej
-        self.ln = nn.LayerNorm(conv_filters)  # per-sample, niezależny od trybu train/eval
+        self.causal_pad = kernel_size - 1  # number of zeros to prepend
+        self.ln = nn.LayerNorm(conv_filters)  # per-sample, train/eval agnostic
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         # x: [batch, seq_len, features]
         x = x.transpose(1, 2)                  # [batch, features, seq_len]
-        x = F.pad(x, (self.causal_pad, 0))     # kauzalny padding
+        x = F.pad(x, (self.causal_pad, 0))     # causal padding
         x = self.conv(x)                        # [batch, conv_filters, seq_len]
         x = x.transpose(1, 2)                  # [batch, seq_len, conv_filters]
-        x = self.ln(x)                          # LayerNorm po osi conv_filters
+        x = self.ln(x)                          # LayerNorm over conv_filters axis
         x = F.gelu(x)
         x = self.dropout(x)
-        # Zwracamy pełną sekwencję [batch, seq_len, conv_filters] — bez GAP
+        # Return full sequence [batch, seq_len, conv_filters] — no GAP here
         return x
 
 
 class TransformerEncoderBlock(nn.Module):
-    """Blok Transformer Encoder z Multi-Head Attention i residual connections."""
+    """Transformer Encoder block with Multi-Head Attention and residual connections."""
 
     def __init__(self, d_model, n_heads, ff_dim, dropout):
         super().__init__()
@@ -66,18 +66,18 @@ class TransformerEncoderBlock(nn.Module):
 
 class TradingDQN(nn.Module):
     """
-    Główna sieć Conv1D + Transformer + Dueling DQN.
+    Main network: Conv1D + Transformer + Dueling DQN.
 
-    Architektura (po poprawkach issue #31):
-    1. N Conv1D bloków (jeden per timeframe) → [batch, seq_tf, conv_filters]
-       - LayerNorm zamiast BatchNorm (brak rozbieżności train/eval w Double DQN)
-       - Brak GAP — sekwencja zachowana w całości
-    2. Konkatenacja sekwencji ze wszystkich TF → [batch, total_seq, conv_filters]
-       - Transformer dostaje ~130 tokenów (świece) zamiast 4 (jeden per TF)
-       - Usunięta zbędna projekcja identity Linear(d→d)
-    3. M Transformer Encoder bloków → [batch, total_seq, conv_filters]
-    4. Global Average Pooling po osi sekwencji → [batch, conv_filters]
-    5. Trunk Dense + concat z cechami pozycji → Dueling heads
+    Architecture (after fixes from issue #31):
+    1. N Conv1D blocks (one per timeframe) → [batch, seq_tf, conv_filters]
+       - LayerNorm instead of BatchNorm (no train/eval divergence in Double DQN)
+       - No GAP — full sequence preserved
+    2. Concatenate sequences from all timeframes → [batch, total_seq, conv_filters]
+       - Transformer receives ~130 tokens (candles) instead of 4 (one per TF)
+       - Removed redundant identity projection Linear(d→d)
+    3. M Transformer Encoder blocks → [batch, total_seq, conv_filters]
+    4. Global Average Pooling over sequence axis → [batch, conv_filters]
+    5. Trunk Dense + concat with position features → Dueling heads
     """
 
     def __init__(self, config):
@@ -100,10 +100,10 @@ class TradingDQN(nn.Module):
         self.timeframe_keys = [k for k in sorted(timeframes_cfg.keys()) if timeframes_cfg[k] > 0]
         self.num_timeframes = len(self.timeframe_keys)
 
-        # Normalizacja wejścia — wyrównuje skale 8 cech zanim trafią do Conv1D.
-        # MACD jest unbounded, volume spikes >100x, ceny z-score ±3 — bez normy
-        # cechy o dużej skali dominują gradienty.
-        # LayerNorm zamiast BatchNorm: normalizuje per-sample, brak trybu train/eval.
+        # Input normalization — equalizes scales of all features before Conv1D.
+        # MACD is unbounded, volume spikes >100x, price z-score ±3 — without normalization
+        # high-scale features dominate gradients.
+        # LayerNorm instead of BatchNorm: normalizes per-sample, no train/eval dependency.
         self.input_norm = nn.LayerNorm(self.num_features)
 
         self.conv_blocks = nn.ModuleList([
@@ -114,8 +114,8 @@ class TradingDQN(nn.Module):
         concat_dim = self.conv_filters * self.num_timeframes
 
         if self.n_transformer_blocks > 0:
-            # Projekcja identity Linear(d→d) usunięta — nie zwiększa ekspresywności
-            # bez nieliniowości (issue #31, problem 3)
+            # Identity projection Linear(d→d) removed — adds no expressiveness
+            # without nonlinearity (issue #31, problem 3)
             self.transformer_blocks = nn.ModuleList([
                 TransformerEncoderBlock(self.conv_filters, self.n_heads, self.ff_dim, self.dropout)
                 for _ in range(self.n_transformer_blocks)
@@ -125,8 +125,8 @@ class TradingDQN(nn.Module):
             self.transformer_blocks = nn.ModuleList()
             trunk_dim = concat_dim
 
-        trunk_h1 = self.conv_filters * 4  # np. 64→256, 256→1024
-        trunk_h2 = self.conv_filters * 2  # np. 64→128, 256→512
+        trunk_h1 = self.conv_filters * 4  # e.g. 64→256
+        trunk_h2 = self.conv_filters * 2  # e.g. 64→128
         self.trunk = nn.Sequential(
             nn.Linear(trunk_dim, trunk_h1),
             nn.GELU(),
@@ -136,8 +136,8 @@ class TradingDQN(nn.Module):
             nn.Dropout(self.dropout)
         )
 
-        # Gałąź pozycji: [is_long, is_short, unrealized_pnl, hold_6h, hold_48h,
-        #                  sin_hour, cos_hour, sin_week, cos_week, is_weekend] → 32
+        # Position branch: [is_long, is_short, unrealized_pnl, hold_6h, hold_48h,
+        #                    sin_hour, cos_hour, sin_week, cos_week, is_weekend] → 32
         self.pos_fc = nn.Sequential(
             nn.Linear(10, 32),
             nn.GELU(),
@@ -148,7 +148,7 @@ class TradingDQN(nn.Module):
         self.value_stream = nn.Linear(dueling_dim, 1)
         self.advantage_stream = nn.Linear(dueling_dim, self.num_actions)
 
-        # Inicjalizacja głowic do bliskich zera — zapobiega wczesnemu action collapse
+        # Initialize heads close to zero — prevents early action collapse
         nn.init.uniform_(self.advantage_stream.weight, -0.01, 0.01)
         nn.init.zeros_(self.advantage_stream.bias)
         nn.init.uniform_(self.value_stream.weight, -0.01, 0.01)
@@ -156,12 +156,12 @@ class TradingDQN(nn.Module):
 
     def forward(self, states, action_mask=None, position_features=None):
         """
-        states: dict z kluczami timeframe'ów, każdy [batch, seq_len, num_features]
-                lub lista tensorów w kolejności timeframe_keys
-        action_mask: [batch, num_actions] binary mask (1=dozwolone, 0=zablokowane)
+        states: dict with timeframe keys, each [batch, seq_len, num_features]
+                or list of tensors in timeframe_keys order
+        action_mask: [batch, num_actions] binary mask (1=allowed, 0=blocked)
         position_features: [batch, 10] — [is_long, is_short, unrealized_pnl, hold_6h, hold_48h,
                                           sin_hour, cos_hour, sin_week, cos_week, is_weekend]
-                           None → zerowy wektor (brak kontekstu pozycji)
+                           None → zero vector (no position context)
         """
         if isinstance(states, dict):
             tf_tensors = [states[k] for k in self.timeframe_keys]
@@ -175,43 +175,43 @@ class TradingDQN(nn.Module):
             conv_outputs.append(conv_out)
 
         if self.n_transformer_blocks > 0:
-            # Połącz sekwencje ze wszystkich TF wzdłuż osi czasu
-            # → [batch, total_seq, conv_filters]  (np. 30+24+48+30 = 132 tokenów)
+            # Concatenate sequences from all timeframes along the time axis
+            # → [batch, total_seq, conv_filters]  (e.g. 60+32+48+14 = 154 tokens)
             x = torch.cat(conv_outputs, dim=1)
             for block in self.transformer_blocks:
                 x = block(x)
-            # GAP po osi sekwencji — po Transformerze, nie przed
+            # GAP over sequence axis — after Transformer, not before
             x = x.mean(dim=1)                         # [batch, conv_filters]
         else:
-            # Bez Transformera: GAP per TF, potem concat
+            # No Transformer: GAP per TF, then concat
             x = torch.cat([c.mean(dim=1) for c in conv_outputs], dim=1)
 
-        x = self.trunk(x)  # [batch, 256]
+        x = self.trunk(x)
 
-        # Konkatencja z cechami pozycji
+        # Concatenate with position features
         if position_features is not None:
             pos = self.pos_fc(position_features)
         else:
             pos = torch.zeros(x.shape[0], 32, device=x.device, dtype=x.dtype)
-        x = torch.cat([x, pos], dim=1)            # [batch, 288]
+        x = torch.cat([x, pos], dim=1)
 
         value = self.value_stream(x)
         advantage = self.advantage_stream(x)
-        # Q = V + (A - mean(A)) — odejmowanie mean(A) identyfikuje model jednoznacznie
+        # Q = V + (A - mean(A)) — subtracting mean(A) uniquely identifies the model
         q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
-        # Przechowaj dla debuggera (bez narzutu gdy debugger nieaktywny)
+        # Store for debugger (zero overhead when debugger is inactive)
         self._debug_value = value
         self._debug_advantage = advantage
 
         if action_mask is not None:
-            # Zablokuj niedozwolone akcje ustawiając Q na -inf
-            # zamiast 0, bo 0 mogłoby być wyższe niż Q dozwolonej akcji
+            # Block illegal actions by setting Q to -inf
+            # (not 0, because 0 could be higher than a legal action's Q-value)
             q_values = q_values.masked_fill(action_mask == 0, float('-inf'))
 
         return q_values
 
     def reset_noise(self):
-        """Reset szumu w NoisyLinear (jeśli używane)."""
+        """Reset noise in NoisyLinear layers (if used)."""
         for module in self.modules():
             if hasattr(module, 'reset_noise'):
                 module.reset_noise()

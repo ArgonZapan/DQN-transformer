@@ -17,17 +17,31 @@ trading-dqn/
 │   │   └── noisy_linear.py
 │   ├── training/
 │   │   ├── replay_buffer.py
+│   │   ├── prioritized_buffer.py
 │   │   ├── trainer.py
-│   │   └── prioritized_buffer.py
+│   │   └── debugger.py          ← TensorBoardDebugger (histogramy, attention)
 │   ├── server/
 │   │   ├── zmq_server.py
 │   │   └── schemas.py
 │   ├── utils/
-│   │   ├── normalizer.py
 │   │   └── metrics.py
 │   ├── monitoring/
 │   │   └── monitor_client.py    ← ZeroMQ PUSH metryk do Monitoring Svc
+│   ├── diagnostics/
+│   │   ├── alert_system.py      ← alerty Telegram (NaN, grad explode, collapse)
+│   │   ├── attention_monitor.py ← monitorowanie attention weights
+│   │   ├── baseline_comparator.py ← porównanie z losową siecią
+│   │   ├── health_runner.py     ← health checks co N kroków
+│   │   ├── metric_logger.py     ← zapis metryk do JSONL
+│   │   ├── telegram_commands.py ← komendy Telegram (/ereset, /status, ...)
+│   │   ├── training_report.py   ← raporty treningowe (co N tysięcy update'ów)
+│   │   ├── backtest_runner.py   ← uruchamianie backtestów
+│   │   └── report.py            ← formatowanie raportów
+│   ├── backtest.py              ← entry point backtestingu (OOS)
 │   └── checkpoints/
+│       ├── checkpoint_step_*.pt ← checkpointy krokowe
+│       ├── shutdown_checkpoint.pt ← zapis przy graceful shutdown
+│       └── model.onnx           ← eksport ONNX do lokalnej inferencji
 │
 ├── node/
 │   ├── index.js
@@ -130,14 +144,23 @@ trading-dqn/
 | `model/regime_detector.py` | Wykrywanie reżimu rynkowego |
 | `model/noisy_linear.py` | Warstwy NoisyLinear dla eksploracji |
 | `training/replay_buffer.py` | Pre-alokowany replay buffer z pinned memory |
-| `training/trainer.py` | Logika treningu (loss, target update) |
-| `training/prioritized_buffer.py` | Prioritized Experience Replay |
+| `training/prioritized_buffer.py` | Prioritized Experience Replay (PER + DualPER) |
+| `training/trainer.py` | Logika treningu (Double DQN, AMP, LR scheduler) |
+| `training/debugger.py` | TensorBoardDebugger (histogramy wag, attention) |
 | `server/zmq_server.py` | Obsługa ZMQ requestów od Actorów |
 | `server/schemas.py` | Schematy wiadomości MessagePack |
-| `utils/normalizer.py` | Normalizacja danych wejściowych |
 | `utils/metrics.py` | Obliczanie metryk (Sharpe, Drawdown, itp.) |
 | `monitoring/monitor_client.py` | Wysyłanie metryk do Monitoring Service |
-| `checkpoints/` | Zapisane wagi modelu |
+| `diagnostics/alert_system.py` | Alerty Telegram przy krytycznych zdarzeniach |
+| `diagnostics/attention_monitor.py` | Monitorowanie attention weights w Transformerze |
+| `diagnostics/baseline_comparator.py` | Porównanie wytrenowanej sieci z losową bazą |
+| `diagnostics/health_runner.py` | Health checks co N kroków |
+| `diagnostics/metric_logger.py` | Zapis metryk treningowych do JSONL |
+| `diagnostics/telegram_commands.py` | Komendy przez Telegram (/ereset, /status) |
+| `diagnostics/training_report.py` | Raporty treningowe co N tysięcy update'ów |
+| `diagnostics/backtest_runner.py` | Uruchamianie backtestów OOS |
+| `backtest.py` | Entry point backtestingu |
+| `checkpoints/` | Zapisane wagi modelu (.pt, model.onnx) |
 
 ### Node.js (Actors)
 
