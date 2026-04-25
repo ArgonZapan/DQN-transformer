@@ -881,6 +881,12 @@ def brute_force_tp_sl_top20(
     # Calculate total combinations for EV-based strategy
     total_combinations = len(horizons) * len(thresholds) * len(entry_probs)
 
+    # EV-based strategy needs quantile predictions
+    pred_q = results.get('pred_quantile')  # [N, n_horizons, n_quantiles, n_dir]
+    if pred_q is None:
+        logger.error('[Backtest] Quantile predictions not available for EV-based strategy.')
+        return
+
     # Build per-symbol data once (precomputed NumPy arrays for the inner loop).
     # Windows are sorted by current_close_time so the sequential next_entry_time
     # lock in the worker reflects the true chronological order.
@@ -892,7 +898,9 @@ def brute_force_tp_sl_top20(
         order = sorted(range(len(sym_windows)),
                        key=lambda k: int(sym_windows[k]['current_close_time']))
         sym_windows = [sym_windows[k] for k in order]
-        sym_pred    = pred[np.asarray(sym_idx, dtype=np.int64)][np.asarray(order, dtype=np.int64)]
+        order_arr   = np.asarray(order, dtype=np.int64)
+        sym_pred    = pred[np.asarray(sym_idx, dtype=np.int64)][order_arr]
+        sym_pred_q_sorted = pred_q[np.asarray(sym_idx, dtype=np.int64)][order_arr] if pred_q is not None else None
 
         current_times  = np.asarray([int(w['current_close_time']) for w in sym_windows], dtype=np.int64)
         entry_prices   = np.asarray([float(w['current_close'])    for w in sym_windows], dtype=np.float64)
@@ -911,18 +919,13 @@ def brute_force_tp_sl_top20(
             'horizon_times':  horizon_times,
             'horizon_closes': horizon_closes,
             'pred':           np.ascontiguousarray(sym_pred),
+            'pred_q':         np.ascontiguousarray(sym_pred_q_sorted) if sym_pred_q_sorted is not None else None,
             'ohlcv_times':    o_times,
             'ohlcv_highs':    ohlcv['highs'],
             'ohlcv_lows':     ohlcv['lows'],
             'entry_idx':      entry_idx,
         }
     timer.checkpoint('prepared per-symbol arrays')
-
-    # EV-based strategy: extract quantile predictions and compute combos
-    pred_q = results.get('pred_quantile')  # [N, n_horizons, n_quantiles, n_dir]
-    if pred_q is None:
-        logger.error('[Backtest] Quantile predictions not available for EV-based strategy.')
-        return
 
     symbol_rows: dict[str, list[dict]] = {sym: [] for sym in symbols}
     total_combos = 0
@@ -936,16 +939,16 @@ def brute_force_tp_sl_top20(
     print(f'Strategy: Dynamic TP/SL from quantiles, Kelly Criterion sizing')
 
     for sym in symbols:
-        sym_idx = [i for i, w in enumerate(windows) if w['symbol'] == sym]
-        sym_pred_q = pred_q[np.asarray(sym_idx, dtype=np.int64)]
-
+        sd = sym_data[sym]
         for hi, horizon_h in enumerate(horizons):
             for ti, threshold_t in enumerate(thresholds):
                 for entry_prob in entry_probs:
                     total_combos += 1
                     row = _simulate_combo_ev(
-                        sym_data[sym], sym, hi, ti, entry_prob, direction,
-                        horizon_h, threshold_t, sym_pred_q, pred[:, :, :, :],
+                        sd, sym, hi, ti, entry_prob, direction,
+                        horizon_h, threshold_t,
+                        sd['pred_q'],   # per-symbol, time-sorted quantile predictions
+                        sd['pred'],     # per-symbol, time-sorted threshold predictions
                         q_idx_tp=4, q_idx_sl=0  # p90 TP, p10 SL
                     )
                     if row:
@@ -962,6 +965,74 @@ def brute_force_tp_sl_top20(
 
     timer.checkpoint('aggregated and printed results')
     print(f'\n  * = fewer than {MIN_TRADES_VALID} trades (statistically low)')
+
+    return all_rows, {
+        'test_start': test_start,
+        'test_end':   test_end,
+        'symbols':    list(symbols),
+        'entry_probs': entry_probs,
+    }
+
+
+def export_strategy_top100(all_rows: list, meta: dict, save_path: str):
+    """Serialize top-100 strategy combos (by SQN) to JSON for the dashboard."""
+    sorted_rows = sorted(
+        [r for r in all_rows if r['n_trades'] >= MIN_TRADES_VALID],
+        key=lambda r: r['sqn'], reverse=True
+    )[:100]
+
+    out = {
+        'generated_at': datetime.now(UTC).isoformat(),
+        'test_range': {
+            'start': _format_ts(meta['test_start']),
+            'end':   _format_ts(meta['test_end']),
+        },
+        'symbols':         meta['symbols'],
+        'entry_prob_grid': meta['entry_probs'],
+        'combos': [],
+    }
+
+    for rank, row in enumerate(sorted_rows, start=1):
+        out['combos'].append({
+            'rank':         rank,
+            'symbol':       row['symbol'],
+            'horizon':      row['horizon'],
+            'threshold':    row['threshold'],
+            'direction':    row['direction'],
+            'entry_prob':   row['entry_prob'],
+            'tp_pct':       row['tp_pct'],
+            'sl_pct':       row['sl_pct'],
+            'n_trades':     row['n_trades'],
+            'p_win':        row['p_win'],
+            'avg_win':      row['avg_win'],
+            'avg_loss':     row['avg_loss'],
+            'total_return': row['total_return'],
+            'sharpe':       row['sharpe'],
+            'sqn':          row['sqn'],
+            'ev':           row['ev'],
+            'kelly':        row['kelly'],
+            'tp_rate':      row['tp_rate'],
+            'sl_rate':      row['sl_rate'],
+            'hz_rate':      row['hz_rate'],
+            'max_dd':       row['max_dd'],
+            'trades': [
+                {
+                    'symbol':     t['symbol'],
+                    'entry_time': int(t['entry_time']),
+                    'exit_time':  int(t['exit_time']),
+                    'return':     round(float(t['return']), 6),
+                    'exit_type':  t['exit_type'],
+                    'tp_pct':     t['tp_pct'],
+                    'sl_pct':     t['sl_pct'],
+                }
+                for t in row.get('trades', [])
+            ],
+        })
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(out, f, indent=2)
+    logger.info(f'[Strategy] Saved top-{len(out["combos"])} combos to {save_path}')
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1007,7 +1078,11 @@ def main():
     ohlcv_by_symbol, base_tf_min = load_ohlcv(config)
     main_timer.checkpoint('loaded OHLCV')
 
-    brute_force_tp_sl_top20(results, test_windows, config, ohlcv_by_symbol, base_tf_min)
+    bt_result = brute_force_tp_sl_top20(results, test_windows, config, ohlcv_by_symbol, base_tf_min)
+    if bt_result is not None:
+        all_rows, meta = bt_result
+        strategy_json = os.path.join(run_dir, 'strategy_top100.json')
+        export_strategy_top100(all_rows, meta, strategy_json)
     main_timer.checkpoint('completed brute-force simulation')
 
     print('\n[Backtest] Done.')
