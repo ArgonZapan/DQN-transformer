@@ -62,28 +62,26 @@ def calculate_kelly(p_win: float, avg_win: float, avg_loss: float) -> float:
 
 
 def get_quantile_tp_sl(quantiles: np.ndarray, q_idx_tp: int, q_idx_sl: int,
-                       entry_price: float, direction: str) -> tuple[float, float]:
-    """Extract TP and SL prices from quantiles.
+                       direction: str) -> tuple[float, float]:
+    """Extract TP and SL percentages from predicted return quantiles.
 
     Args:
-        quantiles: [n_quantiles] predicted prices at quantile levels
+        quantiles: [n_quantiles] predicted RETURNS at quantile levels (e.g. 0.05 = 5%)
         q_idx_tp: index for TP quantile (e.g., 4 for p90)
         q_idx_sl: index for SL quantile (e.g., 0 for p10)
-        entry_price: current entry price
         direction: 'long' or 'short'
 
     Returns:
-        (tp_pct, sl_pct) as percentages
+        (tp_pct, sl_pct) as positive percentages
     """
     if direction == 'long':
-        tp_price = quantiles[q_idx_tp]  # upper quantile
-        sl_price = quantiles[q_idx_sl]  # lower quantile
+        # For long: TP = upper quantile return, SL = magnitude of lower quantile return
+        tp_pct = float(quantiles[q_idx_tp]) * 100.0   # e.g. 0.08 -> 8%
+        sl_pct = -float(quantiles[q_idx_sl]) * 100.0  # e.g. -0.03 -> 3%
     else:  # short
-        tp_price = quantiles[q_idx_sl]  # lower quantile (profit)
-        sl_price = quantiles[q_idx_tp]  # upper quantile (loss)
-
-    tp_pct = ((tp_price - entry_price) / entry_price) * 100.0
-    sl_pct = ((entry_price - sl_price) / entry_price) * 100.0
+        # For short: TP = magnitude of lower quantile (price drops = profit), SL = upper quantile
+        tp_pct = -float(quantiles[q_idx_sl]) * 100.0  # e.g. -0.08 -> 8%
+        sl_pct = float(quantiles[q_idx_tp]) * 100.0   # e.g. 0.03 -> 3%
     return tp_pct, sl_pct
 
 
@@ -521,12 +519,12 @@ def _collect_ev_based_trades(
         h_time    = horizon_times[idx, hi]
         h_close   = horizon_closes[idx, hi]
 
-        # Get dynamic TP/SL from quantiles
+        # Get dynamic TP/SL from quantiles (predicted returns, not prices)
         # For long: use quantiles[:, 0], for short: use quantiles[:, 1]
         dir_idx = 0 if trade_dir > 0 else 1
-        quantiles = pred_q[idx, hi, :, dir_idx]  # [n_quantiles]
-        tp_pct, sl_pct = get_quantile_tp_sl(quantiles, q_idx_tp, q_idx_sl, entry_px,
-                                           'long' if trade_dir > 0 else 'short')
+        quantiles = pred_q[idx, hi, :, dir_idx]  # [n_quantiles] — predicted returns
+        tp_pct, sl_pct = get_quantile_tp_sl(quantiles, q_idx_tp, q_idx_sl,
+                                            'long' if trade_dir > 0 else 'short')
 
         # Safety: ensure positive SL, cap TP at horizon
         sl_pct = max(sl_pct, 0.5)  # minimum 0.5% SL
