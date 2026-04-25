@@ -688,31 +688,31 @@ def _simulate_combo_ev(
     }
 
 
-def _print_top20_ev(rows: list[dict], title: str) -> list[dict]:
-    """Print top 20 by SQN for EV-based strategy."""
+def _print_top100_ev(rows: list[dict], title: str) -> list[dict]:
+    """Print top 100 by SQN across all symbols."""
     any_valid = any(r['n_trades'] >= MIN_TRADES_VALID for r in rows)
     display   = [r for r in rows if r['n_trades'] >= MIN_TRADES_VALID] if any_valid else rows
-    top20     = sorted(display, key=lambda r: r['sqn'], reverse=True)[:20]
+    top100    = sorted(display, key=lambda r: r['sqn'], reverse=True)[:100]
 
-    print(f'\n{"=" * 110}')
+    print(f'\n{"=" * 122}')
     print(f'{title}')
-    print(f'{"=" * 110}')
-    print(f'{"#":>3} {"H":>5} {"Thr%":>5} {"Entry%":>8} {"N":>6} {"P(Win)":>7} {"Avg+%":>7} {"Avg-%":>7} '
+    print(f'{"=" * 122}')
+    print(f'{"#":>3} {"Symbol":>8} {"H":>5} {"Thr%":>5} {"Entry%":>8} {"N":>6} {"P(Win)":>7} {"Avg+%":>7} {"Avg-%":>7} '
           f'{"Total%":>8} {"Sharpe":>7} {"SQN":>7} {"EV%":>7} {"Kelly":>7} {"TP%":>5} {"SL%":>5}')
-    print('-' * 110)
+    print('-' * 122)
 
-    for rank, row in enumerate(top20, 1):
+    for rank, row in enumerate(top100, 1):
         low_flag = ' *' if row['n_trades'] < MIN_TRADES_VALID else '  '
         entry_str = f'{row["entry_prob"]:.0%}'
         print(
-            f'{rank:>3} {row["horizon"]:>4}h {row["threshold"]:>4.1f}% '
+            f'{rank:>3} {row["symbol"]:>8} {row["horizon"]:>4}h {row["threshold"]:>4.1f}% '
             f'{entry_str:>8} {row["n_trades"]:>5}{low_flag} '
             f'{row["p_win"] * 100:>6.1f}% {row["avg_win"]:>6.2f}% {row["avg_loss"]:>6.2f}% '
             f'{row["total_return"]:>7.2f}% {row["sharpe"]:>7.2f} {row["sqn"]:>7.2f} '
             f'{row["ev"]:>6.2f}% {row["kelly"]:>6.3f} '
             f'{row["tp_pct"]:>4.1f}% {row["sl_pct"]:>4.1f}%'
         )
-    return top20
+    return top100
 
 
 def _print_top20(rows: list[dict], title: str,
@@ -816,26 +816,6 @@ def _build_row(trades: list, symbol: str, h: float, thr: float, direction: str,
         'max_dd_nh':  max_dd_nh,
     }
 
-
-def _print_symbol_results(all_rows: list[dict], symbol: str,
-                          total_combinations: int):
-    n_with_trades = len(all_rows)
-
-    # EV-based strategy: no dedup needed (each entry_prob produces unique quantile-derived TP/SL)
-    # But keep entry_probs_list for consistency with printing
-    for row in all_rows:
-        row['entry_probs_list'] = [row['entry_prob']]
-
-    print(f'\nCombinations tested: {total_combinations} total | '
-          f'{n_with_trades} with trades | {total_combinations - n_with_trades} empty (no signals)')
-
-    if not all_rows:
-        print(f'No trades generated for {symbol}.')
-        return
-
-    top20 = _print_top20_ev(all_rows, title=f'{symbol} — EV-BASED STRATEGY TOP 20')
-
-    # No Hz-excluded table for EV-based (focused on total performance)
 
 
 def brute_force_tp_sl_top20(
@@ -973,11 +953,12 @@ def brute_force_tp_sl_top20(
 
     timer.checkpoint(f'computed {total_combos} EV-based combos')
 
-    for symbol in symbols:
-        print(f'\n{"-" * 70}')
-        print(f'  {symbol}')
-        print(f'{"-" * 70}')
-        _print_symbol_results(symbol_rows[symbol], symbol, total_combinations)
+    all_rows = [row for sym in symbols for row in symbol_rows[sym]]
+    n_with_trades = len(all_rows)
+    print(f'\nCombinations tested: {len(symbols) * total_combinations} total | '
+          f'{n_with_trades} with trades | {len(symbols) * total_combinations - n_with_trades} empty (no signals)')
+
+    _print_top100_ev(all_rows, title='ALL SYMBOLS — EV-BASED STRATEGY TOP 100 BY SQN')
 
     timer.checkpoint('aggregated and printed results')
     print(f'\n  * = fewer than {MIN_TRADES_VALID} trades (statistically low)')
