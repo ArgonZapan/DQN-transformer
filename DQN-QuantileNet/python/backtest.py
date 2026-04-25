@@ -701,11 +701,6 @@ def _print_top20_ev(rows: list[dict], title: str) -> list[dict]:
           f'{"Total%":>8} {"Sharpe":>7} {"SQN":>7} {"EV%":>7} {"Kelly":>7} {"TP%":>5} {"SL%":>5}')
     print('-' * 110)
 
-    top20_hash = hashlib.md5(
-        ''.join(f'{r["n_trades"]}:{r["sqn"]:.6f}|' for r in top20).encode()
-    ).hexdigest()[:16]
-    print(f'\n[DEBUG] top20 hash: {top20_hash}')
-
     for rank, row in enumerate(top20, 1):
         low_flag = ' *' if row['n_trades'] < MIN_TRADES_VALID else '  '
         entry_str = f'{row["entry_prob"]:.0%}'
@@ -737,11 +732,6 @@ def _print_top20(rows: list[dict], title: str,
     print(f'{"#":>3} {"H":>5} {"Thr%":>5} {"Entry(s)":>13} {"TP%":>5} {"SL%":>5} {"RR":>5} '
           f'{"N":>6} {"TP%":>6} {"SL%":>6}{hz_col} {"AvgR%":>7} {"Total%":>8} {"MDD%":>7} {"Sharpe":>7} {"SQN":>7}')
     print('-' * width)
-
-    top20_hash = hashlib.md5(
-        ''.join(f'{r["n_trades"]}:{r[sqn_key]:.6f}|' for r in top20).encode()
-    ).hexdigest()[:16]
-    print(f'\n[DEBUG] top20 hash: {top20_hash}')
 
     for rank, row in enumerate(top20, 1):
         low_flag = ' *' if row[n_key] < MIN_TRADES_VALID else '  '
@@ -881,9 +871,6 @@ def brute_force_tp_sl_top20(
 
     pred = results['pred_threshold']   # [N, n_horizons, n_thr, n_dir]
 
-    pred_hash = int(hashlib.md5(pred.tobytes()).hexdigest()[:16], 16)
-    print(f'\n[DEBUG] pred_threshold hash: {pred_hash:016x}  shape={pred.shape}  dtype={pred.dtype}')
-
     print(f'\nPred threshold stats: min={pred.min():.4f}  max={pred.max():.4f}'
           f'  mean={pred.mean():.4f}  p50={np.median(pred):.4f}'
           f'  p90={np.percentile(pred, 90):.4f}  p95={np.percentile(pred, 95):.4f}')
@@ -990,13 +977,6 @@ def brute_force_tp_sl_top20(
         print(f'\n{"-" * 70}')
         print(f'  {symbol}')
         print(f'{"-" * 70}')
-        try:
-            # Simple hash of trade counts and EVs
-            data_str = ''.join(f'{r["n_trades"]}:{r["ev"]:.6f}|' for r in symbol_rows[symbol])
-            rows_hash = hashlib.md5(data_str.encode()).hexdigest()[:16]
-            print(f'[DEBUG] symbol_rows[{symbol}] hash: {rows_hash}  (n_rows={len(symbol_rows[symbol])})')
-        except Exception as e:
-            print(f'[DEBUG] symbol_rows hash error: {e}')
         _print_symbol_results(symbol_rows[symbol], symbol, total_combinations)
 
     timer.checkpoint('aggregated and printed results')
