@@ -511,9 +511,12 @@ def _collect_ev_based_trades(
 
     cost = 2.0 * COMMISSION
     trades: list[dict] = []
+    next_entry_time = -1  # sequential lock: no new entry before previous trade closes
 
     for idx in sig_indices:
         ct = current_times[idx]
+        if ct < next_entry_time:
+            continue  # previous trade still open, skip this signal
         trade_dir = int(dirs_all[idx])
         entry_px  = entry_prices[idx]
         h_time    = horizon_times[idx, hi]
@@ -584,6 +587,7 @@ def _collect_ev_based_trades(
             'tp_pct':     float(tp_pct),
             'sl_pct':     float(sl_pct),
         })
+        next_entry_time = exit_t  # block new entries until this trade closes
 
     return trades
 
