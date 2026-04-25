@@ -685,22 +685,22 @@ def _simulate_combo_ev(
 
 
 def _print_top20_ev(rows: list[dict], title: str) -> list[dict]:
-    """Print top 20 by EV (Expected Value) for EV-based strategy."""
+    """Print top 20 by SQN for EV-based strategy."""
     any_valid = any(r['n_trades'] >= MIN_TRADES_VALID for r in rows)
     display   = [r for r in rows if r['n_trades'] >= MIN_TRADES_VALID] if any_valid else rows
-    top20     = sorted(display, key=lambda r: r['ev'], reverse=True)[:20]
+    top20     = sorted(display, key=lambda r: r['sqn'], reverse=True)[:20]
 
-    print(f'\n{"=" * 100}')
+    print(f'\n{"=" * 110}')
     print(f'{title}')
-    print(f'{"=" * 100}')
+    print(f'{"=" * 110}')
     print(f'{"#":>3} {"H":>5} {"Thr%":>5} {"Entry%":>8} {"N":>6} {"P(Win)":>7} {"Avg+%":>7} {"Avg-%":>7} '
-          f'{"Total%":>8} {"Sharpe":>7} {"EV%":>7} {"Kelly":>7} {"TP%":>5} {"SL%":>5}')
-    print('-' * 100)
+          f'{"Total%":>8} {"Sharpe":>7} {"SQN":>7} {"EV%":>7} {"Kelly":>7} {"TP%":>5} {"SL%":>5}')
+    print('-' * 110)
 
     top20_hash = hashlib.md5(
-        ''.join(f'{r["n_trades"]}:{r["ev"]:.6f}|' for r in top20).encode()
+        ''.join(f'{r["n_trades"]}:{r["sqn"]:.6f}|' for r in top20).encode()
     ).hexdigest()[:16]
-    print(f'\n[DEBUG] top20_ev hash: {top20_hash}')
+    print(f'\n[DEBUG] top20 hash: {top20_hash}')
 
     for rank, row in enumerate(top20, 1):
         low_flag = ' *' if row['n_trades'] < MIN_TRADES_VALID else '  '
@@ -709,7 +709,8 @@ def _print_top20_ev(rows: list[dict], title: str) -> list[dict]:
             f'{rank:>3} {row["horizon"]:>4}h {row["threshold"]:>4.1f}% '
             f'{entry_str:>8} {row["n_trades"]:>5}{low_flag} '
             f'{row["p_win"] * 100:>6.1f}% {row["avg_win"]:>6.2f}% {row["avg_loss"]:>6.2f}% '
-            f'{row["total_return"]:>7.2f}% {row["sharpe"]:>7.2f} {row["ev"]:>6.2f}% {row["kelly"]:>6.3f} '
+            f'{row["total_return"]:>7.2f}% {row["sharpe"]:>7.2f} {row["sqn"]:>7.2f} '
+            f'{row["ev"]:>6.2f}% {row["kelly"]:>6.3f} '
             f'{row["tp_pct"]:>4.1f}% {row["sl_pct"]:>4.1f}%'
         )
     return top20
