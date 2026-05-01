@@ -4,9 +4,9 @@ import torch.nn as nn
 
 class RegimeDetector(nn.Module):
     """
-    Moduł wykrywający reżim rynkowy (trend/boczny/volatilny).
-    Pozwala modelowi dostosować strategię do aktualnych warunków.
-    Opcjonalny — placeholder do uzupełnienia po eksperymentach.
+    Module detecting market regime (trending/ranging/volatile).
+    Allows the model to adapt its strategy to current conditions.
+    Optional — placeholder to be filled in after experiments.
     """
 
     def __init__(self, input_dim, num_regimes=3):

@@ -4,8 +4,8 @@ import zmq
 import torch
 
 from server.schemas import (
-    validate_step_request, validate_predict_request, validate_batch_request,
-    build_step_response, build_predict_response, build_batch_response
+    validate_predict_request, validate_batch_request,
+    build_step_response, build_predict_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,8 @@ class ZMQServer:
 
         self.running = False
 
+        self._actor_throttle_ms = int(config['training'].get('actor_throttle_ms', 0))
+
     def bind(self):
         address = f"tcp://*:{self.port}"
         self.socket.bind(address)
@@ -43,7 +45,7 @@ class ZMQServer:
                 packed = msgpack.packb(response)
                 self.socket.send(packed)
                 
-                # Log co 500 wiadomości (mniej spamu)
+                # Log every 10K messages (reduce spam)
                 if hasattr(self, '_msg_count'):
                     self._msg_count += 1
                 else:
@@ -58,8 +60,8 @@ class ZMQServer:
                 try:
                     error_response = msgpack.packb({'error': str(e)})
                     self.socket.send(error_response)
-                except Exception:
-                    pass
+                except Exception as send_err:
+                    logger.error(f"Failed to send error response: {send_err}")
 
     def _handle_request(self, data):
         if isinstance(data, list):
@@ -70,7 +72,7 @@ class ZMQServer:
             return self._handle_predict(data)
 
     def _handle_step(self, data):
-        # Waliduj czy wszystkie wymagane pola są obecne
+        # Validate all required fields are present
         required = ['state', 'action', 'reward', 'nextState', 'done']
         for field in required:
             if field not in data:
@@ -104,9 +106,9 @@ class ZMQServer:
     def _handle_batch(self, batch):
         validate_batch_request(batch)
 
-        # Aktorzy z ONNX robią inference lokalnie i ignorują predict z odpowiedzi —
-        # czytają tylko epsilon. Nie wywołujemy trainer.predict() per item (były to
-        # tysiące zbędnych forward passów GPU size=1 konkurujących z treningiem).
+        # ONNX actors run inference locally and ignore the predict field in the response —
+        # they only read epsilon. We do not call trainer.predict() per item (this used to
+        # produce thousands of redundant size=1 GPU forward passes competing with training).
         for item in batch:
             actor_id = item['actorId']
             symbol = item.get('symbol', actor_id)
@@ -126,15 +128,20 @@ class ZMQServer:
             if metrics:
                 self.trainer.add_actor_metrics(symbol, metrics)
 
+        throttle_ms = 0
+        if self._actor_throttle_ms > 0 and len(self.trainer.buffer) >= self.trainer.buffer.capacity:
+            throttle_ms = self._actor_throttle_ms
+
         return {
-            'epsilon':    float(self.trainer.epsilon),
-            'loss_scale': float(self.trainer.dynamic_loss_scale),
+            'epsilon':     float(self.trainer.epsilon),
+            'loss_scale':  float(self.trainer.dynamic_loss_scale),
+            'throttle_ms': throttle_ms,
         }
 
     def close(self):
         self.running = False
         logger.info("Closing ZMQ Server...")
-        self.socket.setsockopt(zmq.LINGER, 500)  # czekaj max 500ms na wysyłkę zakolejkowanych
+        self.socket.setsockopt(zmq.LINGER, 500)  # wait up to 500ms for queued messages to send
         self.socket.close()
         self.context.term()
         logger.info("ZMQ Server closed.")

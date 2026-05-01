@@ -1,0 +1,21 @@
+node/node_modules/
+node/data/historical/
+node/data/cache/
+python/checkpoints/
+python/logs/
+python/runs/
+python/__pycache__/
+python/**/__pycache__/
+*.pt
+*.pth
+*.onnx
+*.log
+shutdown.flag
+
+# Build artifacts
+dashboard/dist/
+dashboard/node_modules/
+
+# Runtime output
+python/live_predictions.json
+backtest_output.txt

@@ -33,7 +33,7 @@ host = "tcp://127.0.0.1"
 port = 5555             # ZMQ PULL — odbiera batche od aktorów
 metrics_port = 5556     # ZMQ PUB — wysyła epsilon, loss_scale do aktorów
 device = "cuda"         # "cuda" | "cpu" | "auto"
-num_threads = 16        # wątki CPU dla torch (operacje poza GPU)
+num_threads = 12         # wątki CPU dla torch (operacje poza GPU)
 
 # ── Okna czasowe ───────────────────────────────────────────────────────────────
 # Liczba świec na każdy timeframe w stanie sieci. 0 = wyłączony TF.
@@ -55,15 +55,15 @@ dashboard_poll_interval_sec = 60 # jak często monitor odpytuje aktorów
 # ── Trening ────────────────────────────────────────────────────────────────────
 [training]
 gamma = 0.97                    # współczynnik dyskontowania nagród
-lr = 5.0e-5                     # learning rate (nadpisuje checkpoint przy resume)
-batch_size = 256
+lr = 1.0e-4                     # learning rate (nadpisuje checkpoint przy resume)
+batch_size = 512
 buffer_capacity = 500000        # maksymalna pojemność bufora PER
-min_buffer_size = 50000         # minimalna liczba doświadczeń przed startem treningu
+min_buffer_size = 100000         # minimalna liczba doświadczeń przed startem treningu
 target_update_interval = 1000   # co ile kroków synchronizować sieć docelową
 
-epsilon_start = 1.0             # eksploracja na początku treningu
+epsilon_start = 0.90             # eksploracja na początku treningu
 epsilon_end = 0.1               # minimalna eksploracja
-epsilon_decay_fraction = 0.15    # po jakim ułamku łącznych kroków epsilon osiąga minimum
+epsilon_decay_fraction = 0.20    # po jakim ułamku łącznych kroków epsilon osiąga minimum
 
 dropout = 0.1
 seed = 42
@@ -71,13 +71,13 @@ seed = 42
 resume_from_checkpoint = ""     # ścieżka do checkpointu lub "" dl`a treningu od zera
 keep_last_n_checkpoints = 24    # liczba zachowanych checkpointów krokowych
 checkpoint_interval = 20000     # co ile kroków zapis checkpointu
-evaluation_interval = 5000      # co ile kroków ewaluacja / raport
+evaluation_interval = 20000     # co ile kroków ewaluacja / raport
 
 validation_days = 30            # ostatnie N dni danych zarezerwowane jako OOS
 validation_weeks = 0            # alternatywa: tygodnie (nadpisuje validation_days gdy > 0)
 training_months = 48            # liczba miesięcy danych treningowych (0 = cała historia)
 
-episode_length = 960            # maksymalna liczba kroków epizodu
+episode_length = 500            # maksymalna liczba kroków epizodu
 step_interval = 15              # co ile świec 1m wykonywany jest krok (1 = każda świeca)
 max_trades_per_episode = 1      # limit transakcji per epizod (1 = zamknięcie kończy epizod)
 
@@ -88,7 +88,7 @@ compile_model = false           # torch.compile — przyspiesza trening, wymaga 
 
 min_hold_steps = 4              # minimalna liczba kroków od otwarcia przed możliwością zamknięcia
 
-lr_scheduler = "none"           # "none" | "cosine" — scheduler LR zsynchronizowany z epsilon
+lr_scheduler = "cosine"         # "none" | "cosine" — scheduler LR zsynchronizowany z epsilon
 lr_min = 1e-5                   # dolna granica LR dla schedulera cosine
 
 hold_bias_min = 0.5             # minimalna szansa na HOLD przy losowej eksploracji
@@ -97,6 +97,8 @@ hold_bias_max = 0.5             # maksymalna szansa na HOLD przy losowej eksplor
 epsilon_reset_target   = 0.50   # docelowy epsilon przy /ereset
 epsilon_reset_duration = 10000   # na ile kroków epsilon_reset_target jest utrzymywany
 episode_mirror         = false   # dublowanie epizodów LONG→SHORT, balansuje dane treningowe
+
+actor_throttle_ms = 20           # opóźnienie (ms) wysyłane do aktorów gdy bufor jest pełny (0 = wyłączone)
 
 # ── Prioritized Experience Replay ──────────────────────────────────────────────
 [per]
@@ -164,7 +166,7 @@ idle_penalty_per_bar = 0.0002  # kara per krok bez otwartej pozycji (anty-HOLD c
 clip_min = -1.0   # dolny clip całkowitej nagrody per krok (przed reward_scale)
 clip_max =  1.0   # górny clip całkowitej nagrody per krok
 
-reward_scale          = 10.0  # globalny mnożnik wszystkich nagród (wzmacnia sygnał)
+reward_scale          = 1.0  # globalny mnożnik wszystkich nagród (wzmacnia sygnał)
 unrealized_reward_scale = 0.02 # mnożnik absolutnego uPnL dodawanego per krok z pozycją
 
 # ── Dane historyczne ────────────────────────────────────────────────────────────

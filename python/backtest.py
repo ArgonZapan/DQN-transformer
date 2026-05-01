@@ -160,19 +160,19 @@ def precompute_features(candles: list, norm_window: int) -> np.ndarray:
     return out
 
 
-# ── Wskaźniki v2 (niezaktywowane) ────────────────────────────────────────────
+# ── Indicators v2 (not activated) ────────────────────────────────────────────
 #
-# 8 cech (num_features = 8, bez zmian architektury):
-#   0: normalizedClose   — z-score, okno 60 (bez zmian)
-#   1: relativeRange     — (H-L)/close (bez zmian)
-#   2: candleDirection   — (close-open)/close (bez zmian)
-#   3: volumeClipped     — min(vol/meanVol, 3.0) — clip na 3x mean
+# 8 features (num_features = 8, no architecture changes):
+#   0: normalizedClose   — z-score, window 60 (unchanged)
+#   1: relativeRange     — (H-L)/close (unchanged)
+#   2: candleDirection   — (close-open)/close (unchanged)
+#   3: volumeClipped     — min(vol/meanVol, 3.0) — clipped at 3x mean
 #   4: stochasticK       — (close-min14)/(max14-min14)
 #   5: macdHistNorm      — (macdLine-signalLine)/close
 #   6: bollingerWidth    — 4*std20/sma20
 #   7: smaDistance       — (close-sma20)/close
 #
-# Opcjonalne (num_features = 9):
+# Optional (num_features = 9):
 #   8: atrNorm           — ATR(14)/close
 
 
@@ -202,7 +202,7 @@ def precompute_features_v2(candles: list, norm_window: int) -> np.ndarray:
     """
     Pre-compute all 8 v2 features. Returns float32 array of shape [N, 8].
     Drop-in replacement for precompute_features() — matches precomputeIndicatorsV2() in state.js.
-    NIEZAKTYWOWANE — użyj zamiast precompute_features() gdy gotowe do testu.
+    NOT ACTIVATED — use in place of precompute_features() when ready to test.
     """
     n = len(candles)
     closes  = np.array([c['close']  for c in candles], dtype=np.float64)
@@ -237,7 +237,7 @@ def precompute_features_v2(candles: list, norm_window: int) -> np.ndarray:
 
 def precompute_features_combined(candles: list, norm_window: int) -> np.ndarray:
     """
-    11 cech (v1+v2 bez duplikatów). Zwraca float32 [N, 11].
+    11 features (v1+v2 without duplicates). Returns float32 [N, 11].
       0: normalizedClose, 1: relativeRange,  2: candleDirection,
       3: volumeClipped,   4: rsiNorm,        5: stochasticK,
       6: macdNorm,        7: macdHistNorm,   8: pctChange,
@@ -588,7 +588,7 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
         t_ms = candle['close_time']
         price = candle['close']
 
-        # Cechy czasu: sin/cos godziny (24h) + sin/cos dnia tygodnia (168h) + is_weekend
+        # Time features: sin/cos of hour (24h) + sin/cos of week-hour (168h) + is_weekend
         import math as _math
         _dt = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc)
         _hour_frac = (_dt.hour + _dt.minute / 60) / 24
@@ -599,7 +599,7 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
         _cos_week  = _math.cos(2 * _math.pi * _week_frac)
         _is_weekend = 1.0 if _dt.weekday() >= 5 else 0.0
 
-        # Cechy pozycji: [is_long, is_short, unrealized_pnl, hold_6h, hold_48h, sin_hour, cos_hour, sin_week, cos_week, is_weekend]
+        # Position features: [is_long, is_short, unrealized_pnl, hold_6h, hold_48h, sin_hour, cos_hour, sin_week, cos_week, is_weekend]
         _step_interval = config.get('training', {}).get('step_interval', 15)
         if position is not None:
             is_long  = 1 if position.side == 'LONG'  else 0
@@ -747,7 +747,7 @@ def main():
     model = load_model(model_path, config, args.device)
 
     try:
-        raw = input("\nIle ostatnich swiec 1m przetestowac? (Enter = wszystkie OOS): ").strip()
+        raw = input("\nHow many most recent 1m candles to test? (Enter = all OOS): ").strip()
         last_n = int(raw) if raw else None
     except (ValueError, EOFError):
         last_n = None

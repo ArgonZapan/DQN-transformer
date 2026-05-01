@@ -6,11 +6,11 @@ import torch
 
 class SumTree:
     """
-    SumTree — drzewo binarne do efektywnego samplowania z rozkładem priorytetów.
-    Liście przechowują priorytety, węzły wewnętrzne sumę potomków.
-    Operacja sample i update w O(log n) zamiast O(n).
+    SumTree — binary tree for efficient priority-weighted sampling.
+    Leaves store priorities, internal nodes store the sum of their children.
+    Sample and update are O(log n) instead of O(n).
 
-    Implementacja iteracyjna (nie rekurencyjna) + wektoryzowane batch ops.
+    Iterative (non-recursive) implementation + vectorized batch ops.
     """
 
     def __init__(self, capacity):
@@ -19,13 +19,13 @@ class SumTree:
         self.data_pointer = 0
 
     def _propagate(self, idx, change):
-        # Iteracyjnie w górę drzewa — bez rekurencji (szybsze, brak stack overhead)
+        # Iteratively walk up the tree — no recursion (faster, no stack overhead)
         while idx != 0:
             idx = (idx - 1) // 2
             self.tree[idx] += change
 
     def _retrieve(self, idx, s):
-        # Iteracyjna wersja — bez rekurencji
+        # Iterative version — no recursion
         while True:
             left = 2 * idx + 1
             if left >= len(self.tree):
@@ -37,7 +37,7 @@ class SumTree:
                 idx = left + 1
 
     def _retrieve_batch(self, s_array):
-        """Wektoryzowane batch samplowanie — jeden numpy pass zamiast N wywołań Pythona."""
+        """Vectorized batch sampling — one numpy pass instead of N Python calls."""
         idx = np.zeros(len(s_array), dtype=np.int64)
         s = s_array.copy()
         tree_len = len(self.tree)
@@ -68,7 +68,7 @@ class SumTree:
         self._propagate(idx, change)
 
     def update_batch(self, data_indices, priorities):
-        """Batch update priorytetów — wektoryzowana propagacja w górę drzewa."""
+        """Batch priority update — vectorized propagation up the tree."""
         tree_indices = (data_indices + self.capacity - 1).astype(np.int64)
         changes = priorities - self.tree[tree_indices]
         self.tree[tree_indices] = priorities
@@ -94,10 +94,12 @@ class SumTree:
 
 class PrioritizedReplayBuffer:
     """
-    Prioritized Experience Replay z SumTree.
-    Doświadczenia z większym TD error są samplowane częściej.
-    Importance Sampling weights korygują bias.
+    Prioritized Experience Replay with SumTree.
+    Experiences with larger TD error are sampled more often.
+    Importance Sampling weights correct the resulting bias.
     """
+
+    _MAX_PRIORITY = 1e6  # hard cap — prevents Inf propagating into the tree
 
     def __init__(self, config):
         self.capacity = config['training']['buffer_capacity']
@@ -113,6 +115,7 @@ class PrioritizedReplayBuffer:
 
         self.beta = self.beta_start
         self.use_pin = torch.cuda.is_available()
+        pin = (lambda t: t.pin_memory()) if self.use_pin else (lambda t: t)
 
         tf_cfg = config['timeframes']
         self.timeframe_keys = [k for k in sorted(tf_cfg.keys()) if tf_cfg[k] > 0]
@@ -122,23 +125,15 @@ class PrioritizedReplayBuffer:
         self.next_states = {}
         for key in self.timeframe_keys:
             seq_len = self.timeframe_sizes[key]
-            s = torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32)
-            ns = torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32)
-            self.states[key] = s.pin_memory() if self.use_pin else s
-            self.next_states[key] = ns.pin_memory() if self.use_pin else ns
+            self.states[key]      = pin(torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32))
+            self.next_states[key] = pin(torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32))
 
-        a = torch.zeros(self.capacity, dtype=torch.long)
-        r = torch.zeros(self.capacity, dtype=torch.float32)
-        d = torch.zeros(self.capacity, dtype=torch.float32)
-        m = torch.zeros(self.capacity, self.num_actions, dtype=torch.float32)
-        pf  = torch.zeros(self.capacity, 10, dtype=torch.float32)
-        npf = torch.zeros(self.capacity, 10, dtype=torch.float32)
-        self.actions = a.pin_memory() if self.use_pin else a
-        self.rewards = r.pin_memory() if self.use_pin else r
-        self.dones = d.pin_memory() if self.use_pin else d
-        self.action_masks = m.pin_memory() if self.use_pin else m
-        self.pos_features      = pf.pin_memory()  if self.use_pin else pf
-        self.next_pos_features = npf.pin_memory() if self.use_pin else npf
+        self.actions           = pin(torch.zeros(self.capacity, dtype=torch.long))
+        self.rewards           = pin(torch.zeros(self.capacity, dtype=torch.float32))
+        self.dones             = pin(torch.zeros(self.capacity, dtype=torch.float32))
+        self.action_masks      = pin(torch.zeros(self.capacity, self.num_actions, dtype=torch.float32))
+        self.pos_features      = pin(torch.zeros(self.capacity, 10, dtype=torch.float32))
+        self.next_pos_features = pin(torch.zeros(self.capacity, 10, dtype=torch.float32))
 
         self.tree = SumTree(self.capacity)
         self.max_priority = 1.0
@@ -152,14 +147,14 @@ class PrioritizedReplayBuffer:
             tf_name = key.replace('candles_', '')
             seq_len = self.timeframe_sizes[key]
             
-            # Pobierz state dla tego timeframe'a
+            # Fetch state for this timeframe
             state_data = None
             if key in state:
                 state_data = state[key]
             elif tf_name in state:
                 state_data = state[tf_name]
             
-            # Waliduj i konwertuj state
+            # Validate and convert state
             if state_data is None or len(state_data) == 0:
                 self.states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
             else:
@@ -175,7 +170,7 @@ class PrioritizedReplayBuffer:
                 else:
                     self.states[key][idx] = state_tensor
             
-            # Pobierz next_state dla tego timeframe'a
+            # Fetch next_state for this timeframe
             if next_state is not None:
                 next_state_data = None
                 if key in next_state:
@@ -214,10 +209,22 @@ class PrioritizedReplayBuffer:
             self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
 
         pf = state.get('position') if isinstance(state, dict) else None
-        self.pos_features[idx] = torch.tensor(pf[:10], dtype=torch.float32) if pf is not None else torch.zeros(10)
+        if pf is not None:
+            arr = torch.zeros(10, dtype=torch.float32)
+            src = torch.tensor(pf[:10], dtype=torch.float32)
+            arr[:src.shape[0]] = src
+            self.pos_features[idx] = arr
+        else:
+            self.pos_features[idx] = torch.zeros(10, dtype=torch.float32)
 
         npf = next_state.get('position') if isinstance(next_state, dict) else None
-        self.next_pos_features[idx] = torch.tensor(npf[:10], dtype=torch.float32) if npf is not None else torch.zeros(10)
+        if npf is not None:
+            arr = torch.zeros(10, dtype=torch.float32)
+            src = torch.tensor(npf[:10], dtype=torch.float32)
+            arr[:src.shape[0]] = src
+            self.next_pos_features[idx] = arr
+        else:
+            self.next_pos_features[idx] = torch.zeros(10, dtype=torch.float32)
 
         if td_error is not None:
             td_val = abs(td_error) if np.isfinite(td_error) else self.max_priority
@@ -277,10 +284,12 @@ class PrioritizedReplayBuffer:
         for i, (state, _, _, next_state, _, _) in enumerate(experiences):
             p = state.get('position') if isinstance(state, dict) else None
             if p is not None:
-                pf[i] = np.asarray(p[:10], dtype=np.float32)
-            np_ = next_state.get('position') if isinstance(next_state, dict) else None
-            if np_ is not None:
-                npf[i] = np.asarray(np_[:10], dtype=np.float32)
+                arr = np.asarray(p[:10], dtype=np.float32)
+                pf[i, :arr.shape[0]] = arr
+            next_pos = next_state.get('position') if isinstance(next_state, dict) else None
+            if next_pos is not None:
+                arr = np.asarray(next_pos[:10], dtype=np.float32)
+                npf[i, :arr.shape[0]] = arr
         self.pos_features[positions] = torch.from_numpy(pf)
         self.next_pos_features[positions] = torch.from_numpy(npf)
 
@@ -301,15 +310,19 @@ class PrioritizedReplayBuffer:
                 uniform_priority = 1.0
             self.tree.tree[:] = 0.0
             self.max_priority = uniform_priority
-            for i in range(self.size):
-                self.tree.update(i, uniform_priority)
+            if self.size > 0:
+                # Batch update: ~500K Python-level update() calls caused a noticeable hang
+                # with a full buffer. update_batch does it in a single vectorized pass.
+                indices = np.arange(self.size, dtype=np.int64)
+                priorities = np.full(self.size, uniform_priority, dtype=np.float64)
+                self.tree.update_batch(indices, priorities)
 
     def sample(self, batch_size):
         self._sanitize_tree()
         total = self.tree.total()
         segment = total / batch_size
 
-        # Wektoryzowane samplowanie: jeden batch numpy zamiast pętli Pythona
+        # Vectorized sampling: a single numpy batch instead of a Python loop
         a = np.arange(batch_size, dtype=np.float64) * segment
         b = a + segment
         s_array = np.random.uniform(a, b)
@@ -322,7 +335,7 @@ class PrioritizedReplayBuffer:
 
         is_weights = (self.size * sampling_probs) ** (-self.beta)
         is_weights /= is_weights.max()
-        is_weights = torch.tensor(is_weights, dtype=torch.float32).to(self.device)
+        is_weights = torch.from_numpy(is_weights.astype(np.float32)).to(self.device, non_blocking=True)
 
         states_batch = {}
         next_states_batch = {}
@@ -338,8 +351,6 @@ class PrioritizedReplayBuffer:
         next_pos_features = self.next_pos_features[indices].to(self.device, non_blocking=True)
 
         return states_batch, actions, rewards, next_states_batch, dones, action_masks, pos_features, next_pos_features, indices, is_weights
-
-    _MAX_PRIORITY = 1e6  # hard cap — prevents Inf propagating into the tree
 
     def update_priorities(self, indices, td_errors):
         td_vals = np.abs(td_errors).astype(np.float64)
@@ -358,7 +369,7 @@ class PrioritizedReplayBuffer:
         return self.size >= min_size
 
     def get_state(self):
-        """Zwraca serializowalny stan bufora (tylko wypełniona część)."""
+        """Returns a serializable buffer state (only the filled portion)."""
         n = self.size
         return {
             'size': self.size,
@@ -377,7 +388,7 @@ class PrioritizedReplayBuffer:
         }
 
     def get_reward_stats(self, recent_n: int = 10_000) -> dict:
-        """Rozkład nagród — identyczna logika jak w ReplayBuffer."""
+        """Reward distribution — identical logic to ReplayBuffer."""
         n = self.size
         if n == 0:
             return {}
@@ -419,7 +430,7 @@ class PrioritizedReplayBuffer:
         return stats
 
     def load_state(self, state):
-        """Przywraca bufor z zapisanego stanu."""
+        """Restores the buffer from a saved state."""
         n = min(state['size'], self.capacity)
         self.size = n
         self.position = state['position'] % self.capacity
@@ -445,18 +456,18 @@ class PrioritizedReplayBuffer:
 
 class DualPrioritizedBuffer:
     """
-    Dual Buffer z gwarantowaną proporcją zyskownych próbek w batchu.
+    Dual Buffer with a guaranteed proportion of profitable samples per batch.
 
-    Składa się z dwóch buforów:
-    - main:     PrioritizedReplayBuffer pełnej pojemności — wszystkie doświadczenia, PER
-    - positive: okrągły bufor (1/4 pojemności) — tylko reward > 0, próbkowanie jednostajne
+    Composed of two buffers:
+    - main:     full-capacity PrioritizedReplayBuffer — all experiences, PER
+    - positive: circular buffer (1/4 capacity) — only reward > 0, uniform sampling
 
-    Przy każdym sample() gwarantowana jest minimalna frakcja próbek z positive buffer
-    (parametr positive_ratio w [per]). Gdy positive buffer jest pusty lub za mały —
-    fallback na same próbki z main (brak błędu).
+    Each sample() guarantees a minimum fraction of samples from the positive buffer
+    (positive_ratio in [per]). When the positive buffer is empty or too small,
+    we fall back to sampling only from main (no error).
 
-    update_priorities() aktualizuje wyłącznie main buffer — indeksy z positive buffer
-    są enkodowane jako idx + capacity, co pozwala je odróżnić i pominąć.
+    update_priorities() updates the main buffer only — positive-buffer indices are
+    encoded as idx + capacity so they can be identified and skipped.
     """
 
     def __init__(self, config):
@@ -467,20 +478,22 @@ class DualPrioritizedBuffer:
 
         self.main = PrioritizedReplayBuffer(config)
 
-        # Pozytywny bufor: 1/4 pojemności, bez PER (uniform)
+        # Positive buffer: 1/4 capacity, no PER (uniform sampling)
         pos_config = copy.deepcopy(config)
         pos_config['training']['buffer_capacity'] = max(1, self.capacity // 4)
-        # Importujemy tutaj, żeby uniknąć cyklicznych importów na poziomie modułu
+        # Import here to avoid circular imports at module load time
         from training.replay_buffer import ReplayBuffer
         self.positive = ReplayBuffer(pos_config)
         self._pos_capacity = pos_config['training']['buffer_capacity']
 
-        # Kierunkowe bufory PER: osobny PER dla LONG (action=0) i SHORT (action=1).
-        # Pojemność = capacity/2, bo każdy kierunek to ~50% wszystkich doświadczeń.
-        # Enkodowanie indeksów w update_priorities:
-        #   main:  idx <  capacity
-        #   long:  idx >= capacity  (idx - capacity)
-        #   short: idx >= 2*capacity (idx - 2*capacity)
+        # Directional PER buffers: separate PER for LONG (action=0) and SHORT (action=1).
+        # Capacity = capacity/4 — each direction is roughly half of the experience stream,
+        # but a smaller buffer keeps the directional PER responsive to recent samples.
+        # Index encoding in update_priorities:
+        #   main:     idx <  capacity
+        #   positive: idx ∈ [capacity,   2*capacity)  — uniform, no priority update
+        #   long:     idx ∈ [2*capacity, 3*capacity)  (idx - 2*capacity)
+        #   short:    idx ∈ [3*capacity, 4*capacity)  (idx - 3*capacity)
         self.long_buf = None
         self.short_buf = None
         if self.long_short_balance > 0.0:
@@ -490,7 +503,7 @@ class DualPrioritizedBuffer:
             self.short_buf = PrioritizedReplayBuffer(dir_config)
             self._dir_capacity = dir_config['training']['buffer_capacity']
 
-    # ── Delegaty do main ──────────────────────────────────────────────────────
+    # ── Delegates to main ─────────────────────────────────────────────────────
     @property
     def beta(self):
         return self.main.beta
@@ -505,7 +518,7 @@ class DualPrioritizedBuffer:
 
     @property
     def tree(self):
-        """Dostęp do drzewa SumTree dla logowania TensorBoard (delegacja do main)."""
+        """SumTree access for TensorBoard logging (delegates to main)."""
         return self.main.tree
 
     def update_beta(self, fraction):
@@ -546,7 +559,7 @@ class DualPrioritizedBuffer:
 
     # ── Sample ────────────────────────────────────────────────────────────────
     def sample(self, batch_size):
-        # ── Oblicz podział próbek ──────────────────────────────────────────
+        # ── Compute sample split ───────────────────────────────────────────
         n_pos = 0
         if len(self.positive) > 0 and self.positive_ratio > 0:
             n_pos = min(int(batch_size * self.positive_ratio), len(self.positive))
@@ -564,7 +577,7 @@ class DualPrioritizedBuffer:
             n_pos = n_long = n_short = 0
             n_main = batch_size
 
-        # ── Próbkowanie z main (PER) ──────────────────────────────────────
+        # ── Sample from main (PER) ─────────────────────────────────────────
         (states_m, actions_m, rewards_m, next_states_m, dones_m,
          masks_m, pf_m, npf_m, idx_m, iw_m) = self.main.sample(n_main)
 
@@ -583,7 +596,7 @@ class DualPrioritizedBuffer:
         parts_iw  = [iw_m]
         parts_idx = [idx_m]
 
-        # ── Positive buffer (uniform, brak PER) ───────────────────────────
+        # ── Positive buffer (uniform, no PER) ──────────────────────────────
         if n_pos > 0:
             (states_p, actions_p, rewards_p, next_states_p, dones_p,
              masks_p, pf_p, npf_p, idx_p) = self.positive.sample(n_pos)
@@ -613,7 +626,7 @@ class DualPrioritizedBuffer:
             parts_iw.append(iw_sh)
             parts_idx.append(idx_sh + 3 * self.capacity)
 
-        # ── Scala ─────────────────────────────────────────────────────────
+        # ── Merge ──────────────────────────────────────────────────────────
         states      = {k: torch.cat(parts_s[k],   dim=0) for k in parts_s}
         next_states = {k: torch.cat(parts_ns[k],  dim=0) for k in parts_ns}
         actions      = torch.cat(parts_a,   dim=0)
@@ -631,15 +644,15 @@ class DualPrioritizedBuffer:
 
     # ── Priority updates ──────────────────────────────────────────────────────
     def update_priorities(self, indices, td_errors):
-        """Aktualizuje priorytety we wszystkich aktywnych buforach PER.
-        Enkodowanie: main < capacity, positive [capacity, 2*cap),
-                     long [2*cap, 3*cap), short [3*cap, 4*cap)."""
+        """Updates priorities in all active PER buffers.
+        Encoding: main < capacity, positive [capacity, 2*cap),
+                  long [2*cap, 3*cap), short [3*cap, 4*cap)."""
         main_mask = indices < self.capacity
         if main_mask.any():
             self.main.update_priorities(indices[main_mask], td_errors[main_mask])
         if self.long_buf is not None:
             long_mask  = (indices >= 2 * self.capacity) & (indices < 3 * self.capacity)
-            short_mask = (indices >= 3 * self.capacity)
+            short_mask = (indices >= 3 * self.capacity) & (indices < 4 * self.capacity)
             if long_mask.any():
                 self.long_buf.update_priorities(indices[long_mask] - 2 * self.capacity, td_errors[long_mask])
             if short_mask.any():
@@ -661,7 +674,7 @@ class DualPrioritizedBuffer:
             self.main.load_state(state['main'])
         if 'positive' in state:
             self.positive.load_state(state['positive'])
-        # Backwards-compat: old checkpoint jest stanem main (bez zagnieżdżenia)
+        # Backwards-compat: old checkpoint was main state directly (no nesting)
         elif 'size' in state:
             self.main.load_state(state)
         if self.long_buf is not None and 'long' in state:

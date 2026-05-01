@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from python.config           import load_config, get_device
 from python.backtest         import find_best_checkpoint, load_model
-from python.server.live_writer import write_live_predictions, LIVE_JSON_PATH
+from python.server.live.loop import write_live_predictions, LIVE_JSON_PATH
 
 
 def main():

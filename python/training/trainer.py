@@ -937,18 +937,24 @@ class Trainer:
         for key in tf_keys:
             tf_name = key.replace('candles_', '')
             if tf_name in state:
-                tensor = torch.tensor(state[tf_name], dtype=torch.float32).unsqueeze(0).to(self.device)
+                tensor = torch.tensor(state[tf_name], dtype=torch.float32).unsqueeze(0).to(self.device, non_blocking=True)
             else:
                 seq_len = self.config['timeframes'][key]
-                tensor = torch.zeros(1, seq_len, self.config['features']['num_features']).to(self.device)
+                tensor = torch.zeros(1, seq_len, self.config['features']['num_features'], device=self.device)
             state_tensors.append(tensor)
 
         mask_tensor = None
         if action_mask is not None:
-            mask_tensor = torch.tensor([action_mask], dtype=torch.float32).to(self.device)
+            mask_tensor = torch.tensor([action_mask], dtype=torch.float32).to(self.device, non_blocking=True)
 
         pos_data = state.get('position') if isinstance(state, dict) else None
-        pos_tensor = torch.tensor([pos_data], dtype=torch.float32).to(self.device) if pos_data is not None else None
+        pos_tensor = None
+        if pos_data is not None:
+            # Pad/truncate to exactly 10 elements — matches pos_fc input size and buffer allocation.
+            padded = [0.0] * 10
+            n = min(len(pos_data), 10)
+            padded[:n] = list(pos_data[:n])
+            pos_tensor = torch.tensor([padded], dtype=torch.float32).to(self.device, non_blocking=True)
 
         q_values = self.main_network(state_tensors, action_mask=mask_tensor, position_features=pos_tensor)
         action = q_values.argmax(dim=1).item()

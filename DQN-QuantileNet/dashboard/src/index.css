@@ -1,0 +1,25 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; }
+body {
+  background: #080910;
+  color: #c5c9d6;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1e2230; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #2a2f3d; }
+button { font-family: inherit; }
+input, select, textarea { font-family: inherit; }
+code { font-family: inherit; background: #111318; padding: 1px 5px; border-radius: 3px; }
+
+#fatal-error {
+  display: none;
+  position: fixed; inset: 0;
+  background: #0a0a0f; color: #ef4444;
+  font-family: monospace; font-size: 13px;
+  padding: 40px; white-space: pre-wrap;
+  z-index: 9999; overflow: auto;
+}

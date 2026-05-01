@@ -1,7 +1,32 @@
-// OHLCVChart — TradingView Lightweight Charts wrapper
-// Fetches OHLCV from Binance REST API, supports markers, price lines, fan overlays
+import { useEffect, useRef, useState } from 'react';
+import { createChart, CrosshairMode, LineStyle } from 'lightweight-charts';
 
-const OHLCVChart = ({
+const TF_SECONDS = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
+const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
+const PROGRESS_THRESHOLD = 1000;     // show % only when fetching > this many candles
+
+// Single call to /api/klines — backend handles pagination, retries, rate limits.
+async function fetchAllKlines(symbol, tf, maxCandles, onProgress) {
+  onProgress?.(10);
+  const url = `/api/klines?symbol=${symbol}&interval=${tf}&limit=${maxCandles}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('klines ' + r.status);
+  const data = await r.json();
+  onProgress?.(100);
+  return data;
+}
+
+const QUANTILES = [
+  ['p90', 2, LineStyle.Dotted, 0.90],
+  ['p75', 2, LineStyle.Dotted, 0.90],
+  ['p50', 2, LineStyle.Solid,  0.90],
+  ['p25', 2, LineStyle.Dotted, 0.90],
+  ['p10', 2, LineStyle.Dotted, 0.90],
+];
+
+const ALL_QUANTILE_KEYS = ['p10', 'p25', 'p50', 'p75', 'p90'];
+
+export default function OHLCVChart({
   symbol = 'BTCUSDT',
   interval: initialInterval = '15m',
   height = 380,
@@ -11,37 +36,40 @@ const OHLCVChart = ({
   showVolume = true,
   showIntervalPicker = true,
   onLastPrice = null,
-}) => {
-  const containerRef  = React.useRef(null);
-  const chartRef      = React.useRef(null);
-  const candleBaseRef = React.useRef(null);
-  const fanSeriesRef  = React.useRef([]);
+  maxCandles = 500,
+}) {
+  const containerRef = useRef(null);
+  const chartRef     = useRef(null);
+  const candleSeriesRef = useRef(null);
+  const candleBaseRef   = useRef(null);
+  const candlesRef      = useRef([]);   // all fetched candles, for historical fans
+  const fanSeriesRef    = useRef([]);
 
-  const [tf, setTf]               = React.useState(initialInterval);
-  const [loading, setLoading]     = React.useState(true);
-  const [error, setError]         = React.useState(null);
-  const [lastPrice, setLastPrice] = React.useState(null);
-  const [priceDir, setPriceDir]   = React.useState(1);
-  const [candleReady, setCandleReady] = React.useState(0);
+  const [tf, setTf] = useState(initialInterval);
+  const [loading, setLoading] = useState(true);
+  const [loadingPct, setLoadingPct] = useState(0);
+  const [error, setError] = useState(null);
+  const [lastPrice, setLastPrice] = useState(null);
+  const [priceDir, setPriceDir] = useState(1);
+  const [candleReady, setCandleReady] = useState(0);
 
-  const INTERVALS = ['1m','5m','15m','1h','4h','1d'];
+  useEffect(() => { setTf(initialInterval); }, [initialInterval]);
 
-  React.useEffect(() => { setTf(initialInterval); }, [initialInterval]);
-
-  React.useEffect(() => {
+  useEffect(() => {
     if (!containerRef.current) return;
     const el = containerRef.current;
     candleBaseRef.current = null;
-    fanSeriesRef.current  = [];
+    candlesRef.current = [];
+    fanSeriesRef.current = [];
 
-    const chart = LightweightCharts.createChart(el, {
+    const chart = createChart(el, {
       layout: { background: { color: 'transparent' }, textColor: '#8890a4' },
       grid: { vertLines: { color: '#181b26' }, horzLines: { color: '#181b26' } },
-      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      crosshair: { mode: CrosshairMode.Normal },
       rightPriceScale: { borderColor: '#1e2230' },
       timeScale: { borderColor: '#1e2230', timeVisible: true, secondsVisible: false },
       width: el.clientWidth,
-      height: height,
+      height,
     });
     chartRef.current = chart;
 
@@ -50,6 +78,7 @@ const OHLCVChart = ({
       borderUpColor: '#22c55e', borderDownColor: '#ef4444',
       wickUpColor: '#22c55e', wickDownColor: '#ef4444',
     });
+    candleSeriesRef.current = candleSeries;
 
     let volSeries = null;
     if (showVolume) {
@@ -58,26 +87,33 @@ const OHLCVChart = ({
     }
 
     const ro = new ResizeObserver(() => {
-      if (el && chartRef.current) chartRef.current.applyOptions({ width: el.clientWidth });
+      if (chartRef.current) chartRef.current.applyOptions({ width: el.clientWidth });
     });
     ro.observe(el);
 
     let cancelled = false;
-    const load = async () => {
-      setLoading(true); setError(null);
+    (async () => {
+      setLoading(true); setLoadingPct(0); setError(null);
       try {
-        const r = await fetch(
-          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=500`
-        );
-        if (!r.ok) throw new Error('Binance ' + r.status);
+        const raw = await fetchAllKlines(symbol, tf, maxCandles, pct => {
+          if (!cancelled) setLoadingPct(pct);
+        });
         if (cancelled) return;
-        const raw = await r.json();
+
         const candles = raw.map(k => ({
           time: Math.floor(k[0] / 1000),
           open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5],
         }));
+        candlesRef.current = candles;
 
-        candleSeries.setData(candles);
+        const tfSecs = TF_SECONDS[tf] || 3600;
+        const futureHours = fanData ? Math.max(8, ...fanData.horizons.map(h => h.h)) : 4;
+        const futureBars = Math.ceil((futureHours * 3600) / tfSecs);
+        const lastT = candles[candles.length - 1].time;
+        const whitespace = Array.from({ length: futureBars }, (_, i) => ({
+          time: lastT + (i + 1) * tfSecs,
+        }));
+        candleSeries.setData([...candles, ...whitespace]);
 
         if (volSeries) {
           volSeries.setData(candles.map(c => ({
@@ -86,35 +122,36 @@ const OHLCVChart = ({
           })));
         }
 
-        if (markers && markers.length) {
-          const sorted = [...markers].filter(m => m.time_ms).sort((a,b) => a.time_ms - b.time_ms);
+        if (markers?.length) {
+          const sorted = [...markers].filter(m => m.time_ms).sort((a, b) => a.time_ms - b.time_ms);
           candleSeries.setMarkers(sorted.map(m => ({
             time: Math.floor(m.time_ms / 1000),
-            position: m.type === 'sl' ? 'aboveBar' : 'belowBar',
-            color: m.type === 'tp' ? '#22c55e' : m.type === 'sl' ? '#ef4444' : '#6b7280',
-            shape: m.type === 'tp' ? 'arrowUp' : m.type === 'sl' ? 'arrowDown' : 'circle',
-            text: m.type.toUpperCase(), size: 1,
+            position: m.position ?? (m.type === 'sl' ? 'aboveBar' : 'belowBar'),
+            color: m.color ?? (m.type === 'tp' ? '#22c55e' : m.type === 'sl' ? '#ef4444' : '#6b7280'),
+            shape: m.shape ?? (m.type === 'tp' ? 'arrowUp' : m.type === 'sl' ? 'arrowDown' : 'circle'),
+            text: m.text ?? (m.type ? m.type.toUpperCase() : ''),
+            size: m.size ?? 1,
           })));
         }
 
         priceLines.forEach(pl => {
           candleSeries.createPriceLine({
             price: pl.price, color: pl.color || '#3b82f6',
-            lineStyle: LightweightCharts.LineStyle.Dashed, lineWidth: 1, title: pl.title || '',
+            lineStyle: LineStyle.Dashed, lineWidth: 1, title: pl.title || '',
           });
         });
 
-        const lc   = candles[candles.length - 1];
+        const lc = candles[candles.length - 1];
         const prev = candles[candles.length - 2];
         setLastPrice(lc.close);
-        setPriceDir(lc.close >= prev?.close ? 1 : -1);
-        if (onLastPrice) onLastPrice(lc.close);
+        setPriceDir(lc.close >= (prev?.close ?? lc.close) ? 1 : -1);
+        onLastPrice?.(lc.close);
 
-        const RECENT  = 120;
+        const RECENT = 120;
         const fromIdx = Math.max(0, candles.length - RECENT);
         chart.timeScale().setVisibleRange({
           from: candles[fromIdx].time,
-          to:   lc.time + 3600 * 4,
+          to: lastT + futureBars * tfSecs,
         });
 
         candleBaseRef.current = { time: lc.time, close: lc.close };
@@ -123,109 +160,135 @@ const OHLCVChart = ({
       } catch (e) {
         if (!cancelled) { setError(e.message); setLoading(false); }
       }
-    };
+    })();
 
-    load();
     return () => {
       cancelled = true;
       ro.disconnect();
       chart.remove();
       chartRef.current = null;
+      candleSeriesRef.current = null;
     };
-  }, [symbol, tf, height]);
+  }, [symbol, tf, height, showVolume, maxCandles]);
 
-  React.useEffect(() => {
+  // Fan overlay: current prediction + historical verification fans
+  useEffect(() => {
     const chart = chartRef.current;
     const base  = candleBaseRef.current;
     if (!chart || !fanData || !base) return;
 
-    fanSeriesRef.current.forEach(s => { try { chart.removeSeries(s); } catch(_) {} });
+    fanSeriesRef.current.forEach(s => { try { chart.removeSeries(s); } catch { /* noop */ } });
     fanSeriesRef.current = [];
 
-    const { time: baseTime, close: basePrice } = base;
-    const horizons = (fanData.horizons || []).filter(h => h.long && h.short);
+    const sel = fanData.selectedHorizon ?? null;  // null = all horizons
+    const allHorizons = (fanData.horizons || []).filter(h => h.long && h.short);
+    const horizons = sel ? allHorizons.filter(h => h.h === sel) : allHorizons;
     if (!horizons.length) return;
 
-    const ptsOf = (dir, q) => [
-      { time: baseTime, value: basePrice },
-      ...horizons.map(h => ({
-        time: baseTime + h.h * 3600,
-        value: dir === 'long'
-          ? basePrice * (1 + (h.long[q] ?? 0) / 100)
-          : basePrice * (1 - (h.short[q] ?? 0) / 100),
-      })),
-    ];
+    const allowedQ = Array.isArray(fanData.enabledQuantiles)
+      ? fanData.enabledQuantiles
+      : ALL_QUANTILE_KEYS;
+    const activeQuantiles = QUANTILES.filter(([q]) => allowedQ.includes(q));
 
-    const addLine = (color, width, style, lastVis, data) => {
+    const addLine = (color, width, style, t0, t1, value) => {
+      if (t1 <= t0) return;
       const s = chart.addLineSeries({
         color, lineWidth: width, lineStyle: style,
-        priceLineVisible: false, lastValueVisible: lastVis, crosshairMarkerVisible: lastVis,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
       });
-      s.setData(data);
+      s.setData([{ time: t0, value }, { time: t1, value }]);
       fanSeriesRef.current.push(s);
     };
 
-    addLine('rgba(34,197,94,0.18)', 1, 2, false, ptsOf('long','p90'));
-    addLine('rgba(34,197,94,0.09)', 1, 2, false, ptsOf('long','p75'));
-    addLine('rgba(34,197,94,0.92)', 2, 0, true,  ptsOf('long','p50'));
-    addLine('rgba(34,197,94,0.09)', 1, 2, false, ptsOf('long','p25'));
-    addLine('rgba(34,197,94,0.18)', 1, 2, false, ptsOf('long','p10'));
-    addLine('rgba(239,68,68,0.18)', 1, 2, false, ptsOf('short','p90'));
-    addLine('rgba(239,68,68,0.09)', 1, 2, false, ptsOf('short','p75'));
-    addLine('rgba(239,68,68,0.92)', 2, 0, true,  ptsOf('short','p50'));
-    addLine('rgba(239,68,68,0.09)', 1, 2, false, ptsOf('short','p25'));
-    addLine('rgba(239,68,68,0.18)', 1, 2, false, ptsOf('short','p10'));
+    // ── Current (future) fan ─────────────────────────────────────────────────
+    const baseTime  = base.time;
+    const basePrice = base.close;
 
-    const maxH = Math.max(...horizons.map(h => h.h));
-    try {
-      const visible = chart.timeScale().getVisibleRange();
-      if (visible) {
-        chart.timeScale().setVisibleRange({ from: visible.from, to: baseTime + (maxH + 24) * 3600 });
-      }
-    } catch(_) {}
-  }, [fanData, candleReady]);
+    horizons.forEach(h => {
+      const tEnd = baseTime + h.h * 3600;
+      activeQuantiles.forEach(([q, w, st, alpha]) => {
+        addLine(`rgba(34,197,94,${alpha})`, w, st, baseTime, tEnd, basePrice * (1 + (h.long[q]  ?? 0) / 100));
+        addLine(`rgba(239,68,68,${alpha})`, w, st, baseTime, tEnd, basePrice * (1 - (h.short[q] ?? 0) / 100));
+      });
+    });
+
+    // ── Historical verification fans (real model inference per anchor) ────────
+    const histFans = fanData.historicalFans;
+    if (histFans?.length) {
+      histFans.forEach((fan, idx) => {
+        const aTime  = fan.anchorTime;
+        const aPrice = fan.anchorPrice;
+        const allAH  = (fan.horizons || []).filter(h => h.long && h.short);
+        const aHorizons = sel ? allAH.filter(h => h.h === sel) : allAH;
+        if (!aTime || !aPrice || !aHorizons.length) return;
+
+        aHorizons.forEach(h => {
+          const tEnd = Math.min(aTime + h.h * 3600, baseTime);
+          if (tEnd <= aTime) return;
+          activeQuantiles.forEach(([q, w, , alpha]) => {
+            const a = (alpha * 0.5).toFixed(3);
+            addLine(`rgba(34,197,94,${a})`, w, LineStyle.Dashed,
+              aTime, tEnd, aPrice * (1 + (h.long[q]  ?? 0) / 100));
+            addLine(`rgba(239,68,68,${a})`, w, LineStyle.Dashed,
+              aTime, tEnd, aPrice * (1 - (h.short[q] ?? 0) / 100));
+          });
+        });
+      });
+    }
+  }, [fanData, candleReady, tf]);
 
   const fmt = p => p
     ? (p > 1000 ? p.toLocaleString('en-US', { maximumFractionDigits: 2 }) : p.toFixed(4))
     : '—';
 
   return (
-    <div style={{ position:'relative', background:'#0c0d11', borderRadius:6, overflow:'hidden', border:'1px solid #1e2230' }}>
-      <div style={{ display:'flex', alignItems:'center', gap:10, padding:'6px 12px', borderBottom:'1px solid #1e2230', background:'#0b0c0f' }}>
-        <span style={{ fontFamily:'IBM Plex Mono,monospace', fontWeight:700, color:'#e2e4ea', fontSize:13 }}>{symbol}</span>
+    <div style={{ position: 'relative', background: '#0c0d11', borderRadius: 6, overflow: 'hidden', border: '1px solid #1e2230' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 12px', borderBottom: '1px solid #1e2230', background: '#0b0c0f' }}>
+        <span style={{ fontFamily: 'IBM Plex Mono,monospace', fontWeight: 700, color: '#e2e4ea', fontSize: 13 }}>{symbol}</span>
         {lastPrice != null && (
-          <span style={{ fontFamily:'IBM Plex Mono,monospace', color:priceDir>=0?'#22c55e':'#ef4444', fontSize:12 }}>
+          <span style={{ fontFamily: 'IBM Plex Mono,monospace', color: priceDir >= 0 ? '#22c55e' : '#ef4444', fontSize: 12 }}>
             {fmt(lastPrice)}
           </span>
         )}
+        {!loading && (
+          <span style={{ fontFamily: 'IBM Plex Mono,monospace', color: '#3a3f52', fontSize: 10, marginLeft: 4 }}>
+            {maxCandles.toLocaleString()} candles
+          </span>
+        )}
         {showIntervalPicker && (
-          <div style={{ display:'flex', gap:3, marginLeft:'auto' }}>
+          <div style={{ display: 'flex', gap: 3, marginLeft: 'auto' }}>
             {INTERVALS.map(iv => (
               <button key={iv} onClick={() => setTf(iv)} style={{
-                padding:'2px 7px', fontSize:10, fontFamily:'IBM Plex Mono,monospace',
-                background: tf===iv ? '#3b82f6' : 'transparent',
-                color: tf===iv ? '#fff' : '#505870',
-                border:'1px solid '+(tf===iv?'#3b82f6':'#1e2230'),
-                borderRadius:3, cursor:'pointer', transition:'all 0.15s',
+                padding: '2px 7px', fontSize: 10, fontFamily: 'IBM Plex Mono,monospace',
+                background: tf === iv ? '#3b82f6' : 'transparent',
+                color: tf === iv ? '#fff' : '#505870',
+                border: '1px solid ' + (tf === iv ? '#3b82f6' : '#1e2230'),
+                borderRadius: 3, cursor: 'pointer', transition: 'all 0.15s',
               }}>{iv}</button>
             ))}
           </div>
         )}
       </div>
-      <div ref={containerRef} style={{ width:'100%', height }} />
+      <div ref={containerRef} style={{ width: '100%', height }} />
       {loading && (
-        <div style={{ position:'absolute', inset:0, top:33, display:'flex', alignItems:'center', justifyContent:'center', background:'rgba(11,12,15,0.72)', color:'#8890a4', fontSize:12, fontFamily:'IBM Plex Mono,monospace' }}>
-          Loading {symbol}...
+        <div style={{ position: 'absolute', inset: 0, top: 33, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, background: 'rgba(11,12,15,0.82)', color: '#8890a4', fontSize: 12, fontFamily: 'IBM Plex Mono,monospace' }}>
+          <span>Loading {symbol}…</span>
+          {maxCandles > PROGRESS_THRESHOLD && (
+            <div style={{ width: 160, height: 3, background: '#1e2230', borderRadius: 2 }}>
+              <div style={{ width: `${loadingPct}%`, height: '100%', background: '#3b82f6', borderRadius: 2, transition: 'width 0.2s' }} />
+            </div>
+          )}
+          {maxCandles > PROGRESS_THRESHOLD && (
+            <span style={{ fontSize: 10, color: '#3a3f52' }}>{loadingPct}%</span>
+          )}
         </div>
       )}
       {error && (
-        <div style={{ position:'absolute', inset:0, top:33, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:6, background:'rgba(11,12,15,0.9)', color:'#ef4444', fontSize:12 }}>
+        <div style={{ position: 'absolute', inset: 0, top: 33, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 6, background: 'rgba(11,12,15,0.9)', color: '#ef4444', fontSize: 12 }}>
           <span>&#9888; {error}</span>
-          <span style={{ color:'#505870', fontSize:11 }}>Check CORS / network</span>
+          <span style={{ color: '#505870', fontSize: 11 }}>Check CORS / network</span>
         </div>
       )}
     </div>
   );
-};
-
-Object.assign(window, { OHLCVChart });
+}

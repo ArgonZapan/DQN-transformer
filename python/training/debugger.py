@@ -1,17 +1,17 @@
 """
 TensorBoard Debugger v2 — diagnostic metrics for DQN training.
 
-Metric namespaces (nowe, oddzielne od podstawowych):
-  GradFlow/{layer}         — L2 norm gradientu per warstwa po backward()
-  DeadNeurons/{layer}      — % aktywacji ReLU == 0 w batchu
-  UpdateRatio/{layer}      — ||Δw|| / ||w|| po optimizer.step()
-  RL/action_entropy_bits   — entropia polityki z softmax(Q) [bits]
-  RL/q_spread              — mean(max(Q) - min(Q)) per próbka
-  RL/value_mean            — średnia z value stream
-  RL/advantage_std         — std z advantage stream
-  Dist/q_values            — histogram Q-value z ostatniego batcha
-  Dist/rewards             — histogram nagród z ostatniego batcha
-  Dist/td_errors           — histogram błędów TD z ostatniego batcha
+Metric namespaces (new, separate from the basic ones):
+  GradFlow/{layer}         — L2 gradient norm per layer after backward()
+  DeadNeurons/{layer}      — % of ReLU activations == 0 in the batch
+  UpdateRatio/{layer}      — ||Δw|| / ||w|| after optimizer.step()
+  RL/action_entropy_bits   — policy entropy from softmax(Q) [bits]
+  RL/q_spread              — mean(max(Q) - min(Q)) per sample
+  RL/value_mean            — mean of value stream
+  RL/advantage_std         — std of advantage stream
+  Dist/q_values            — histogram of Q-values from the last batch
+  Dist/rewards             — histogram of rewards from the last batch
+  Dist/td_errors           — histogram of TD errors from the last batch
 """
 
 import torch
@@ -31,7 +31,7 @@ class TensorBoardDebugger:
 
     # ── Gradient flow ─────────────────────────────────────────────────────
     def log_gradient_flow(self, model: nn.Module, step: int) -> None:
-        """Per-layer gradient L2 norm — wykrywa vanishing/exploding gradients."""
+        """Per-layer gradient L2 norm — detects vanishing/exploding gradients."""
         for name, param in model.named_parameters():
             if param.grad is None:
                 continue
@@ -40,7 +40,7 @@ class TensorBoardDebugger:
 
     # ── Dead neurons via forward hooks ────────────────────────────────────
     def register_hooks(self, model: nn.Module) -> None:
-        """Podpina forward hooks do wszystkich warstw ReLU."""
+        """Attach forward hooks to all ReLU layers."""
         self._remove_hooks()
         for name, module in model.named_modules():
             if isinstance(module, nn.ReLU):
@@ -59,7 +59,7 @@ class TensorBoardDebugger:
         self._hooks.clear()
 
     def log_dead_neurons(self, step: int) -> None:
-        """% neuronów z wyjściem == 0 w batchu (martwe ReLU)."""
+        """% of neurons with output == 0 in the batch (dead ReLU)."""
         for name, act in self._activations.items():
             dead_pct = (act == 0).float().mean().item() * 100.0
             self.writer.add_scalar(

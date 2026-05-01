@@ -1,0 +1,16 @@
+{
+  "name": "quantilenet-actors",
+  "version": "1.0.0",
+  "description": "DQN-QuantileNet - Node.js Data Actors",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "binance-api-node": "^0.12.0",
+    "msgpack5": "^6.0.2",
+    "toml": "^3.0.0",
+    "winston": "^3.11.0",
+    "zeromq": "^6.0.0-beta.19"
+  }
+}

@@ -4,9 +4,9 @@ import numpy as np
 
 class ReplayBuffer:
     """
-    Pre-alokowany replay buffer z pinned memory.
-    Zamiast listy obiektów Python, bufor to jeden duży blok pamięci per pole.
-    Pinned memory umożliwia szybszy asynchroniczny transfer CPU→GPU przez DMA.
+    Pre-allocated replay buffer with pinned memory.
+    Instead of a list of Python objects, the buffer is one large memory block per field.
+    Pinned memory enables faster asynchronous CPU→GPU transfer via DMA.
     """
 
     def __init__(self, config):
@@ -14,9 +14,10 @@ class ReplayBuffer:
         self.num_features = config['features']['num_features']
         self.num_actions = config['model']['num_actions']
         self.device = config['learner']['device']
-        # Pinned memory — nie może być swapowana na dysk,
-        # umożliwia szybszy transfer CPU→GPU przez DMA (tylko z GPU)
+        # Pinned memory — cannot be swapped to disk,
+        # enables faster CPU→GPU transfer via DMA (GPU-only)
         self.use_pin = torch.cuda.is_available()
+        pin = (lambda t: t.pin_memory()) if self.use_pin else (lambda t: t)
 
         tf_cfg = config['timeframes']
         self.timeframe_keys = [k for k in sorted(tf_cfg.keys()) if tf_cfg[k] > 0]
@@ -26,90 +27,45 @@ class ReplayBuffer:
         self.next_states = {}
         for key in self.timeframe_keys:
             seq_len = self.timeframe_sizes[key]
-            s = torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32)
-            ns = torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32)
-            self.states[key] = s.pin_memory() if self.use_pin else s
-            self.next_states[key] = ns.pin_memory() if self.use_pin else ns
+            self.states[key] = pin(torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32))
+            self.next_states[key] = pin(torch.zeros(self.capacity, seq_len, self.num_features, dtype=torch.float32))
 
-        a = torch.zeros(self.capacity, dtype=torch.long)
-        r = torch.zeros(self.capacity, dtype=torch.float32)
-        d = torch.zeros(self.capacity, dtype=torch.float32)
-        m = torch.zeros(self.capacity, self.num_actions, dtype=torch.float32)
-        pf  = torch.zeros(self.capacity, 10, dtype=torch.float32)
-        npf = torch.zeros(self.capacity, 10, dtype=torch.float32)
-        self.actions = a.pin_memory() if self.use_pin else a
-        self.rewards = r.pin_memory() if self.use_pin else r
-        self.dones = d.pin_memory() if self.use_pin else d
-        self.action_masks = m.pin_memory() if self.use_pin else m
-        self.pos_features      = pf.pin_memory()  if self.use_pin else pf
-        self.next_pos_features = npf.pin_memory() if self.use_pin else npf
+        self.actions = pin(torch.zeros(self.capacity, dtype=torch.long))
+        self.rewards = pin(torch.zeros(self.capacity, dtype=torch.float32))
+        self.dones = pin(torch.zeros(self.capacity, dtype=torch.float32))
+        self.action_masks = pin(torch.zeros(self.capacity, self.num_actions, dtype=torch.float32))
+        self.pos_features      = pin(torch.zeros(self.capacity, 10, dtype=torch.float32))
+        self.next_pos_features = pin(torch.zeros(self.capacity, 10, dtype=torch.float32))
 
         self.position = 0
         self.size = 0
+
+    def _to_seq_tensor(self, state, key, tf_name, seq_len):
+        """Extracts the sequence for a timeframe and normalizes shape to [seq_len, num_features]."""
+        if state is None:
+            return torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+        data = state.get(key) if key in state else state.get(tf_name)
+        if not data:
+            return torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+        t = torch.tensor(data, dtype=torch.float32)
+        if t.shape == torch.Size([seq_len, self.num_features]):
+            return t
+        if t.ndim == 2 and t.shape[1] == self.num_features:
+            out = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+            n = min(t.shape[0], seq_len)
+            out[:n] = t[:n]
+            return out
+        return torch.zeros(seq_len, self.num_features, dtype=torch.float32)
 
     def add(self, state, action, reward, next_state, done, action_mask=None):
         idx = self.position
 
         for key in self.timeframe_keys:
-            # Obsługuj oba formaty kluczy:
-            # 1. Bez przedrostka: '1m', '15m' (z Node.js)
-            # 2. Z przedrostkiem: 'candles_1m', 'candles_15m'
+            # Keys may arrive as '1m' or 'candles_1m'
             tf_name = key.replace('candles_', '')
             seq_len = self.timeframe_sizes[key]
-            
-            # Pobierz state dla tego timeframe'a
-            state_data = None
-            if key in state:
-                state_data = state[key]
-            elif tf_name in state:
-                state_data = state[tf_name]
-            
-            # Waliduj i konwertuj state
-            if state_data is None or len(state_data) == 0:
-                # Pusty lub None state - użyj zer
-                self.states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
-            else:
-                state_tensor = torch.tensor(state_data, dtype=torch.float32)
-                # Sprawdź wymiary
-                if state_tensor.shape != torch.Size([seq_len, self.num_features]):
-                    # Nieprawidłowe wymiary - użyj zer lub dostosuj
-                    if state_tensor.ndim == 2 and state_tensor.shape[1] == self.num_features:
-                        # Pierwszy wymiar się nie zgadza (paddowanie?)
-                        actual_len = min(state_tensor.shape[0], seq_len)
-                        zeros = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
-                        zeros[:actual_len] = state_tensor[:actual_len]
-                        self.states[key][idx] = zeros
-                    else:
-                        # Całkowicie nieprawidłowe wymiary
-                        self.states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
-                else:
-                    self.states[key][idx] = state_tensor
-            
-            # Pobierz next_state dla tego timeframe'a
-            if next_state is not None:
-                next_state_data = None
-                if key in next_state:
-                    next_state_data = next_state[key]
-                elif tf_name in next_state:
-                    next_state_data = next_state[tf_name]
-                
-                if next_state_data is None or len(next_state_data) == 0:
-                    self.next_states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
-                else:
-                    next_tensor = torch.tensor(next_state_data, dtype=torch.float32)
-                    if next_tensor.shape != torch.Size([seq_len, self.num_features]):
-                        if next_tensor.ndim == 2 and next_tensor.shape[1] == self.num_features:
-                            actual_len = min(next_tensor.shape[0], seq_len)
-                            zeros = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
-                            zeros[:actual_len] = next_tensor[:actual_len]
-                            self.next_states[key][idx] = zeros
-                        else:
-                            self.next_states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
-                    else:
-                        self.next_states[key][idx] = next_tensor
-            else:
-                # next_state=None - zapisz zera
-                self.next_states[key][idx] = torch.zeros(seq_len, self.num_features, dtype=torch.float32)
+            self.states[key][idx] = self._to_seq_tensor(state, key, tf_name, seq_len)
+            self.next_states[key][idx] = self._to_seq_tensor(next_state, key, tf_name, seq_len)
 
         self.actions[idx] = action
         self.rewards[idx] = reward
@@ -120,16 +76,28 @@ class ReplayBuffer:
             if mask_tensor.shape[0] == self.num_actions:
                 self.action_masks[idx] = mask_tensor
             else:
-                # Nieprawidłowy rozmiar maski - wyczyść
+                # Invalid mask size — reset to all-ones
                 self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
         else:
             self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
 
         pf = state.get('position') if isinstance(state, dict) else None
-        self.pos_features[idx] = torch.tensor(pf[:4], dtype=torch.float32) if pf is not None else torch.zeros(4)
+        if pf is not None:
+            arr = torch.zeros(10, dtype=torch.float32)
+            src = torch.tensor(pf[:10], dtype=torch.float32)
+            arr[:src.shape[0]] = src
+            self.pos_features[idx] = arr
+        else:
+            self.pos_features[idx] = torch.zeros(10, dtype=torch.float32)
 
         npf = next_state.get('position') if isinstance(next_state, dict) else None
-        self.next_pos_features[idx] = torch.tensor(npf[:4], dtype=torch.float32) if npf is not None else torch.zeros(4)
+        if npf is not None:
+            arr = torch.zeros(10, dtype=torch.float32)
+            src = torch.tensor(npf[:10], dtype=torch.float32)
+            arr[:src.shape[0]] = src
+            self.next_pos_features[idx] = arr
+        else:
+            self.next_pos_features[idx] = torch.zeros(10, dtype=torch.float32)
 
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -182,10 +150,12 @@ class ReplayBuffer:
         for i, (state, _, _, next_state, _, _) in enumerate(experiences):
             p = state.get('position') if isinstance(state, dict) else None
             if p is not None:
-                pf[i] = np.asarray(p[:10], dtype=np.float32)
-            np_ = next_state.get('position') if isinstance(next_state, dict) else None
-            if np_ is not None:
-                npf[i] = np.asarray(np_[:10], dtype=np.float32)
+                arr = np.asarray(p[:10], dtype=np.float32)
+                pf[i, :arr.shape[0]] = arr
+            next_pos = next_state.get('position') if isinstance(next_state, dict) else None
+            if next_pos is not None:
+                arr = np.asarray(next_pos[:10], dtype=np.float32)
+                npf[i, :arr.shape[0]] = arr
         self.pos_features[positions] = torch.from_numpy(pf)
         self.next_pos_features[positions] = torch.from_numpy(npf)
 
@@ -198,7 +168,7 @@ class ReplayBuffer:
         states_batch = {}
         next_states_batch = {}
         for key in self.timeframe_keys:
-            # non_blocking=True — transfer asynchroniczny, CPU może kontynuować pracę
+            # non_blocking=True — asynchronous transfer, CPU can keep working
             states_batch[key] = self.states[key][indices].to(self.device, non_blocking=True)
             next_states_batch[key] = self.next_states[key][indices].to(self.device, non_blocking=True)
 
@@ -218,7 +188,7 @@ class ReplayBuffer:
         return self.size >= min_size
 
     def get_state(self):
-        """Zwraca serializowalny stan bufora (tylko wypełniona część)."""
+        """Returns a serializable buffer state (only the filled portion)."""
         n = self.size
         return {
             'size': self.size,
@@ -234,7 +204,7 @@ class ReplayBuffer:
         }
 
     def get_reward_stats(self, recent_n: int = 10_000) -> dict:
-        """Rozkład nagród w buforze — globalnie i z ostatnich recent_n wpisów."""
+        """Reward distribution in the buffer — globally and over the last recent_n entries."""
         n = self.size
         if n == 0:
             return {}
@@ -254,15 +224,15 @@ class ReplayBuffer:
             'std':            rewards.std().item() if total > 1 else 0.0,
         }
 
-        # Ostatnie recent_n wpisów (koniec kołowego bufora)
+        # Last recent_n entries (end of the circular buffer)
         rn = min(recent_n, n)
         if self.size < self.capacity:
-            # Bufor niepełny — ostatnie wpisy kończą się na position-1
+            # Buffer not full — most recent entries end at position-1
             start = max(0, self.position - rn)
             recent = self.rewards[start:self.position].cpu().float()
         else:
-            # Bufor pełny — position wskazuje na najstarszy wpis
-            end = self.position        # najstarszy; ostatnie rn to end-rn … end (wrap)
+            # Buffer full — position points to the oldest entry
+            end = self.position        # oldest; last rn entries are end-rn … end (with wrap)
             if end >= rn:
                 recent = self.rewards[end - rn:end].cpu().float()
             else:
@@ -284,7 +254,7 @@ class ReplayBuffer:
         return stats
 
     def load_state(self, state):
-        """Przywraca bufor z zapisanego stanu."""
+        """Restores the buffer from a saved state."""
         n = min(state['size'], self.capacity)
         self.size = n
         self.position = state['position'] % self.capacity

@@ -6,9 +6,9 @@ import torch.nn.functional as F
 
 class NoisyLinear(nn.Module):
     """
-    NoisyLinear — warstwy z parametrycznym szumem dodawanym do wag.
-    Zastępuje epsilon-greedy eksploracje automatycznym szumem
-    który maleje w miarę treningu gdy sieć staje się pewniejsza.
+    NoisyLinear — layers with parametric noise added to the weights.
+    Replaces epsilon-greedy exploration with automatic noise
+    that decays during training as the network becomes more confident.
     """
 
     def __init__(self, in_features, out_features, sigma_init=0.5):
