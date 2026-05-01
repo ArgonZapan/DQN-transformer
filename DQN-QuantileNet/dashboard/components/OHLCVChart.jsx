@@ -17,11 +17,11 @@ async function fetchAllKlines(symbol, tf, maxCandles, onProgress) {
 }
 
 const QUANTILES = [
-  ['p90', 2, LineStyle.Dotted, 0.90],
-  ['p75', 2, LineStyle.Dotted, 0.90],
-  ['p50', 2, LineStyle.Solid,  0.90],
-  ['p25', 2, LineStyle.Dotted, 0.90],
-  ['p10', 2, LineStyle.Dotted, 0.90],
+  ['p90', 3, LineStyle.Dotted, 0.90],
+  ['p75', 3, LineStyle.Dotted, 0.90],
+  ['p50', 3, LineStyle.Solid,  0.90],
+  ['p25', 3, LineStyle.Dotted, 0.90],
+  ['p10', 3, LineStyle.Dotted, 0.90],
 ];
 
 const ALL_QUANTILE_KEYS = ['p10', 'p25', 'p50', 'p75', 'p90'];
@@ -44,6 +44,7 @@ export default function OHLCVChart({
   const candleBaseRef   = useRef(null);
   const candlesRef      = useRef([]);   // all fetched candles, for historical fans
   const fanSeriesRef    = useRef([]);
+  const priceLineRefs   = useRef([]);
 
   const [tf, setTf] = useState(initialInterval);
   const [loading, setLoading] = useState(true);
@@ -134,12 +135,7 @@ export default function OHLCVChart({
           })));
         }
 
-        priceLines.forEach(pl => {
-          candleSeries.createPriceLine({
-            price: pl.price, color: pl.color || '#3b82f6',
-            lineStyle: LineStyle.Dashed, lineWidth: 1, title: pl.title || '',
-          });
-        });
+        // priceLines applied via dedicated effect below.
 
         const lc = candles[candles.length - 1];
         const prev = candles[candles.length - 2];
@@ -204,11 +200,18 @@ export default function OHLCVChart({
     const baseTime  = base.time;
     const basePrice = base.close;
 
+    const maxHorizonEnd = baseTime + Math.max(...horizons.map(h => h.h)) * 3600;
+    addLine('rgba(255,255,255,0.55)', 1, LineStyle.Solid, baseTime, maxHorizonEnd, basePrice);
+
     horizons.forEach(h => {
       const tEnd = baseTime + h.h * 3600;
       activeQuantiles.forEach(([q, w, st, alpha]) => {
-        addLine(`rgba(34,197,94,${alpha})`, w, st, baseTime, tEnd, basePrice * (1 + (h.long[q]  ?? 0) / 100));
-        addLine(`rgba(239,68,68,${alpha})`, w, st, baseTime, tEnd, basePrice * (1 - (h.short[q] ?? 0) / 100));
+        const extreme = q === 'p10' || q === 'p90';
+        const longColor  = extreme ? `rgba(134,239,172,${alpha})` : `rgba(34,197,94,${alpha})`;
+        const shortColor = extreme ? `rgba(251,146,60,${alpha})`  : `rgba(239,68,68,${alpha})`;
+        const lw = 3;
+        addLine(longColor,  lw, st, baseTime, tEnd, basePrice * (1 + (h.long[q]  ?? 0) / 100));
+        addLine(shortColor, lw, st, baseTime, tEnd, basePrice * (1 - (h.short[q] ?? 0) / 100));
       });
     });
 
@@ -222,20 +225,48 @@ export default function OHLCVChart({
         const aHorizons = sel ? allAH.filter(h => h.h === sel) : allAH;
         if (!aTime || !aPrice || !aHorizons.length) return;
 
+        const maxAEnd = Math.min(aTime + Math.max(...aHorizons.map(h => h.h)) * 3600, baseTime);
+        if (maxAEnd > aTime) {
+          addLine('rgba(255,255,255,0.55)', 1, LineStyle.Solid, aTime, maxAEnd, aPrice);
+        }
+
         aHorizons.forEach(h => {
           const tEnd = Math.min(aTime + h.h * 3600, baseTime);
           if (tEnd <= aTime) return;
           activeQuantiles.forEach(([q, w, , alpha]) => {
             const a = (alpha * 0.5).toFixed(3);
-            addLine(`rgba(34,197,94,${a})`, w, LineStyle.Dashed,
+            const extreme = q === 'p10' || q === 'p90';
+            const longColor  = extreme ? `rgba(134,239,172,${a})` : `rgba(34,197,94,${a})`;
+            const shortColor = extreme ? `rgba(251,146,60,${a})`  : `rgba(239,68,68,${a})`;
+            const lw = 3;
+            addLine(longColor,  lw, LineStyle.Dashed,
               aTime, tEnd, aPrice * (1 + (h.long[q]  ?? 0) / 100));
-            addLine(`rgba(239,68,68,${a})`, w, LineStyle.Dashed,
+            addLine(shortColor, lw, LineStyle.Dashed,
               aTime, tEnd, aPrice * (1 - (h.short[q] ?? 0) / 100));
           });
         });
       });
     }
   }, [fanData, candleReady, tf]);
+
+  // Reactive price lines (EP / TP / SL).
+  useEffect(() => {
+    const series = candleSeriesRef.current;
+    if (!series) return;
+    priceLineRefs.current.forEach(pl => { try { series.removePriceLine(pl); } catch { /* noop */ } });
+    priceLineRefs.current = [];
+    (priceLines || []).forEach(pl => {
+      const line = series.createPriceLine({
+        price: pl.price,
+        color: pl.color || '#3b82f6',
+        lineStyle: LineStyle.Dashed,
+        lineWidth: 1,
+        title: pl.title || '',
+        axisLabelVisible: true,
+      });
+      priceLineRefs.current.push(line);
+    });
+  }, [priceLines, candleReady]);
 
   const fmt = p => p
     ? (p > 1000 ? p.toLocaleString('en-US', { maximumFractionDigits: 2 }) : p.toFixed(4))

@@ -202,8 +202,9 @@ export default function LiveSection({ bestCombo }) {
 
   const [selected, setSelected] = useState(null);
   const [selectedHorizon, setSelectedHorizon] = useState(null);
-  const [fanHorizon, setFanHorizon]     = useState(null);
-  const [enabledQuantiles, setEnabledQuantiles] = useState(() => new Set(['p50']));
+  const [fanHorizon, setFanHorizon]     = useState(72);
+  const [enabledQuantiles, setEnabledQuantiles] = useState(() => new Set(['p75', 'p90']));
+  const [rrCombo, setRrCombo] = useState(null);  // { symbol, dir, horizon, threshold }
   const toggleQuantile = (q) => setEnabledQuantiles(prev => {
     const next = new Set(prev);
     if (next.has(q)) next.delete(q); else next.add(q);
@@ -257,6 +258,61 @@ export default function LiveSection({ bestCombo }) {
     symbol: p.symbol, signal: detectSignal(p, bestCombo),
   }));
 
+  // Option 4: scan all (horizon, dir, qTP, qSL) combos using quantile predictions.
+  // Quantiles are independent distributions for long/short tails so p_TP and p_SL
+  // don't double-count joint touches (unlike threshold_probs).
+  // pXX quantile → P(magnitude ≥ this value) = 1 − XX/100.
+  const MIN_P_TP   = 0.10;
+  const MIN_SL_PCT = 0.5;   // ignore stops tighter than 0.5% (degenerate huge R)
+  const SKIP_QUANTILES = new Set(['p10']);  // tail magnitudes too small / unreliable
+  const parseQ = (k) => {
+    const n = parseInt(k.replace(/^p/, ''), 10);
+    return isFinite(n) ? n / 100 : null;
+  };
+  const bestERR = (liveData?.predictions || []).map(p => {
+    let best = null;
+    for (const h of p.horizons || []) {
+      const longQ  = h.long?.quantiles  || {};
+      const shortQ = h.short?.quantiles || {};
+      const tryDir = (dir, winQ, lossQ) => {
+        for (const tpKey of Object.keys(winQ)) {
+          if (SKIP_QUANTILES.has(tpKey)) continue;
+          const qTP = parseQ(tpKey);
+          if (qTP == null) continue;
+          const pTP = 1 - qTP;
+          if (pTP < MIN_P_TP) continue;
+          const TP = winQ[tpKey];
+          if (!isFinite(TP) || TP <= 0) continue;
+          for (const slKey of Object.keys(lossQ)) {
+            if (SKIP_QUANTILES.has(slKey)) continue;
+            const qSL = parseQ(slKey);
+            if (qSL == null) continue;
+            const pSL = 1 - qSL;
+            const SL = lossQ[slKey];
+            if (!isFinite(SL) || SL < MIN_SL_PCT) continue;
+            const evPct = pTP * TP - pSL * SL;
+            if (evPct <= 0) continue;
+            const rMult  = evPct / SL;
+            const b      = TP / SL;
+            const pTotal = pTP + pSL;
+            const pCond  = pTotal > 0 ? pTP / pTotal : 0;
+            const kelly  = b > 0 ? (b * pCond - (1 - pCond)) / b : 0;
+            if (!best || rMult > best.rMult) {
+              best = {
+                dir, horizon: h.horizon_h,
+                tp: TP, sl: SL, qTP: tpKey, qSL: slKey,
+                pTP, pSL, evPct, rMult, kelly,
+              };
+            }
+          }
+        }
+      };
+      tryDir('long',  longQ,  shortQ);
+      tryDir('short', shortQ, longQ);
+    }
+    return { symbol: p.symbol, best };
+  });
+
   const statusColor = { connected: '#22c55e', connecting: '#f59e0b', error: '#ef4444' };
   const cardS  = { background: '#111318', border: '1px solid #1e2230', borderRadius: 8, padding: 14 };
   const titleS = { fontSize: 10, color: '#505870', fontFamily: FONT, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10 };
@@ -289,20 +345,49 @@ export default function LiveSection({ bestCombo }) {
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 14, overflow: 'auto' }}>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          {signals.map(({ symbol, signal }) => (
-            <div key={symbol} style={{
-              padding: '5px 12px', borderRadius: 5, fontFamily: FONT, fontSize: 11,
-              border: signal ? `1px solid ${signal.dir === 'long' ? 'rgba(34,197,94,0.4)' : 'rgba(239,68,68,0.4)'}` : '1px solid #1e2230',
-              background: signal ? (signal.dir === 'long' ? 'rgba(34,197,94,0.08)' : 'rgba(239,68,68,0.08)') : '#111318',
-              color: signal ? (signal.dir === 'long' ? '#22c55e' : '#ef4444') : '#3a3f52',
-            }}>
-              <span style={{ fontWeight: 700 }}>{symbol.replace('USDT', '')}</span>
-              {signal
-                ? <span style={{ marginLeft: 8 }}>{signal.dir.toUpperCase()} · {signal.horizon}h · {signal.threshold}% · {((signal.prob || 0) * 100).toFixed(0)}%</span>
-                : <span style={{ marginLeft: 8, color: '#2a2f3d' }}>NO SIGNAL</span>
-              }
-            </div>
-          ))}
+          {bestERR.map(({ symbol, best }) => {
+            const active = best && rrCombo?.symbol === symbol
+              && rrCombo.dir === best.dir && rrCombo.horizon === best.horizon
+              && rrCombo.tp === best.tp && rrCombo.sl === best.sl;
+            const onClickBadge = () => {
+              if (!best) return;
+              setSelected(symbol);
+              const pred = liveData?.predictions?.find(x => x.symbol === symbol);
+              const entryPrice = pred?.current_price ?? null;
+              setRrCombo(active ? null : {
+                symbol, dir: best.dir, horizon: best.horizon,
+                tp: best.tp, sl: best.sl, entryPrice,
+              });
+            };
+            return (
+              <div key={symbol}
+                onClick={onClickBadge}
+                style={{
+                  padding: '5px 12px', borderRadius: 5, fontFamily: FONT, fontSize: 11,
+                  cursor: best ? 'pointer' : 'default',
+                  border: best
+                    ? `1px solid ${best.dir === 'long' ? 'rgba(34,197,94,0.4)' : 'rgba(239,68,68,0.4)'}`
+                    : '1px solid #1e2230',
+                  background: active
+                    ? (best.dir === 'long' ? 'rgba(34,197,94,0.20)' : 'rgba(239,68,68,0.20)')
+                    : best ? (best.dir === 'long' ? 'rgba(34,197,94,0.08)' : 'rgba(239,68,68,0.08)') : '#111318',
+                  color: best ? (best.dir === 'long' ? '#22c55e' : '#ef4444') : '#3a3f52',
+                  boxShadow: active ? `0 0 0 1px ${best.dir === 'long' ? '#22c55e' : '#ef4444'}` : 'none',
+                  transition: 'background 0.12s, box-shadow 0.12s',
+                }}>
+                <span style={{ fontWeight: 700 }}>{symbol.replace('USDT', '')}</span>
+                {best
+                  ? <span style={{ marginLeft: 8 }}>
+                      {best.dir.toUpperCase()} · {best.horizon}h · TP{best.tp.toFixed(1)}({best.qTP})/SL{best.sl.toFixed(1)}({best.qSL}) · {best.rMult.toFixed(2)}R
+                      <span style={{ marginLeft: 6, color: best.dir === 'long' ? 'rgba(34,197,94,0.55)' : 'rgba(239,68,68,0.55)' }}>
+                        K{(best.kelly * 100).toFixed(0)}%
+                      </span>
+                    </span>
+                  : <span style={{ marginLeft: 8, color: '#2a2f3d' }}>NO EDGE</span>
+                }
+              </div>
+            );
+          })}
           {!liveData && (
             <div style={{ padding: '5px 12px', borderRadius: 5, border: '1px solid #1e2230', color: '#505870', fontFamily: FONT, fontSize: 11 }}>
               No live data — run: python -m python.live_predict --loop
@@ -335,10 +420,28 @@ export default function LiveSection({ bestCombo }) {
             );
           })}
         </div>
-        {selected && (
-          <OHLCVChart symbol={selected} interval="1h" height={700}
-                      fanData={fanData} showVolume showIntervalPicker maxCandles={10000} />
-        )}
+        {selected && (() => {
+          const rrLines = (rrCombo && rrCombo.symbol === selected && rrCombo.entryPrice)
+            ? (() => {
+                const ep = rrCombo.entryPrice;
+                const tpPct = rrCombo.tp / 100;
+                const slPct = rrCombo.sl / 100;
+                const isLong = rrCombo.dir === 'long';
+                const tp = ep * (1 + (isLong ? tpPct : -tpPct));
+                const sl = ep * (1 + (isLong ? -slPct : slPct));
+                return [
+                  { price: ep, color: '#e2e4ea', title: 'EP' },
+                  { price: tp, color: '#22c55e', title: `TP ${isLong ? '+' : '-'}${rrCombo.tp.toFixed(1)}%` },
+                  { price: sl, color: '#ef4444', title: `SL ${isLong ? '-' : '+'}${rrCombo.sl.toFixed(1)}%` },
+                ];
+              })()
+            : [];
+          return (
+            <OHLCVChart symbol={selected} interval="15m" height={700}
+                        fanData={fanData} priceLines={rrLines}
+                        showVolume showIntervalPicker maxCandles={10000} />
+          );
+        })()}
 
         <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 14 }}>
           <div style={{ ...cardS, minWidth: 120 }}>
