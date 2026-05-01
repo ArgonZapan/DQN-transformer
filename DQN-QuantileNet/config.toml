@@ -1,0 +1,182 @@
+# ── Aktywne symbole ────────────────────────────────────────────────────────────
+[[actors]]
+symbol = "BTCUSDT"
+exchange = "binance"
+
+[[actors]]
+symbol = "ETHUSDT"
+exchange = "binance"
+
+[[actors]]
+symbol = "SOLUSDT"
+exchange = "binance"
+
+[[actors]]
+symbol = "BNBUSDT"
+exchange = "binance"
+
+#[[actors]]
+#symbol = "XRPUSDT"
+#exchange = "binance"
+
+# ── ZMQ ────────────────────────────────────────────────────────────────────────
+[zmq]
+host = "tcp://127.0.0.1"
+port = 6555   # offset from DQN-OPUS (5555) to allow both to run simultaneously
+
+# ── Okna czasowe ───────────────────────────────────────────────────────────────
+# Liczba świec na każdy timeframe w oknie wejściowym. 0 = wyłączony TF.
+[timeframes]
+candles_1m  = 0
+candles_15m = 8
+candles_1h  = 48
+candles_4h  = 0
+candles_1d  = 4
+candles_1w  = 0
+
+# ── Predykcja ──────────────────────────────────────────────────────────────────
+[prediction]
+mode      = "both"    # "quantile" | "threshold" | "both"
+direction = "both"    # "long" | "short" | "both"
+
+# Horyzonty prognoz w godzinach (dowolna liczba, dowolne wartości)
+horizons_hours = [8, 12, 24, 48, 72]
+
+# Tryb "quantile": stały kwantyl → zmienny próg cenowy
+quantiles = [ 0.10, 0.25, 0.50, 0.75, 0.90 ]
+
+# Tryb "threshold": stały próg procentowy → zmienne prawdopodobieństwo
+thresholds_pct = [ 1.0, 1.5, 2.0, 3.0, 5.0, 8.0]
+
+# Wagi strat przy mode = "both"
+quantile_loss_weight  = 0.5
+threshold_loss_weight = 0.5
+
+# ── Architektura modelu (TFT) ──────────────────────────────────────────────────
+[model]
+d_model             = 64    # wymiar ukryty we wszystkich warstwach
+n_attention_heads   = 4     # głowice uwagi
+lstm_layers         = 2     # głębokość kodera LSTM
+lstm_hidden         = 64   # rozmiar stanu ukrytego LSTM
+grn_dropout         = 0.1   # dropout wewnątrz GRN
+vsn_dropout         = 0.1   # dropout wewnątrz VSN
+ff_dim              = 128   # wymiar feed-forward
+n_transformer_blocks = 2    # liczba bloków atencji TFT
+
+# ── Trening ────────────────────────────────────────────────────────────────────
+[training]
+lr            = 1.0e-4       # base LR — transformer-friendly (1e-5 was 10× too low)
+betas         = [0.9, 0.95]  # AdamW betas — (0.9, 0.95) standard for transformers
+weight_decay  = 0.05         # decoupled WD; applied only to Linear/Conv weights
+batch_size    = 512
+epochs        = 32          # maksymalna liczba epok
+patience      = 8           # early stopping: stop po N epokach bez poprawy
+seed          = 4245        # >0 = deterministic run, <=0 = random seed each start
+device        = "cuda"       # "cuda" | "cpu" | "auto"
+num_threads   = 64
+
+train_months = 8             # IS window size per fold (months)
+val_months   = 2             # OOS window size per fold (months)
+test_months  = 6             # held-out test block at the end (months)
+
+checkpoint_interval     = 5  # zapis checkpointu co N epok
+keep_last_n_checkpoints = 10
+resume_from_checkpoint  = "" # ścieżka do .pt lub "" dla treningu od zera
+
+compile_model = false        # torch.compile (PyTorch 2+)
+
+backtest_every_n_epochs = 1  # run TP/SL backtest after every N epochs; 0 = disabled
+
+# Stride between consecutive training windows, in base-TF candles.
+# 1 = co-bar (default; max samples, but adjacent windows share most of their
+# label horizon → high autocorrelation).
+# Set to e.g. min(horizons_hours) * 60 / base_tf_minutes for non-overlapping
+# labels (fewer samples, statistically independent).
+window_stride = 1
+
+# LR schedule: linear warmup → cosine decay, stepped per BATCH (not per epoch).
+lr_scheduler  = "cosine"     # "none" | "cosine"
+warmup_steps  = 500          # linear warmup duration (in optimizer steps)
+lr_min        = 1.0e-7       # cosine floor
+
+# Gradient clipping (global L2 norm). 1.0 is the transformer default.
+grad_clip     = 1.0
+
+# Mixed precision: "none" | "bf16" | "fp16". bf16 needs Ampere+ GPU but is
+# numerically safer than fp16 (no GradScaler required).
+amp_dtype     = "bf16"
+
+# Exponential moving average of weights, used for OOS eval and backtest.
+# 0.0 disables EMA. Typical: 0.999 (slow drift) — 0.9999 (very slow).
+ema_decay     = 0.999
+
+# Validation selector for early stopping / "best" checkpoint.
+#   "mean_oos"  — mean of OOS losses across all folds (recommended).
+#   "last_fold" — only the final, most-recent fold (legacy).
+val_selector  = "mean_oos"
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+[loss]
+# Pinball (quantile) loss operates on % returns (~0.001-0.05); BCE on logits
+# is in nats (~0.5). Without scaling, BCE dominates gradients ~100×.
+pinball_scale          = 100.0   # multiplier on quantile loss when uncertainty_weighting=false
+uncertainty_weighting  = false   # learn task weights via Kendall et al. log-variance
+                                  #   when true, pinball_scale and the manual q/t weights are ignored.
+noncrossing_weight     = 0.1     # soft penalty on q_k > q_{k+1} crossings
+bce_label_smoothing    = 0.05    # smooth BCE targets toward 0.5 (label-noise robust)
+bce_use_pos_weight     = true    # auto-balance positive/negative for rare thresholds (e.g. 8% target)
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+[augmentation]
+# Gaussian noise added to (already-normalized) input features during training only.
+# Tiny regularizer; 0.0 disables. Sensible range: 0.001–0.01.
+feature_noise_std = 0.0
+
+# ── Cechy wejściowe ────────────────────────────────────────────────────────────
+[features]
+num_features         = 11
+normalization_window = 60
+
+# ── Dane historyczne ────────────────────────────────────────────────────────────
+[data]
+source     = "file"                 # "file" | "api"
+path       = "../node/data/historical/"
+cache_path = "../node/data/cache/"
+binance_rate_limit     = 1000       # ms między żądaniami API
+allow_partial_history  = false
+api_retry_interval_sec = 60
+
+# ── Backtest ───────────────────────────────────────────────────────────────────
+[backtest]
+commission           = 0.00075   # per side (Binance taker default)
+slippage_bps         = 1.0       # extra cost per fill in basis points (0.01% = 1 bps)
+min_trades_valid    = 20         # combos with fewer trades flagged as low-confidence
+sequential_lock     = true       # block new entries until previous trade closes
+same_bar_priority   = "sl"       # "sl" | "tp" — when both hit in same bar
+tp_quantile         = 0.90       # config['prediction'].quantiles value used for TP
+sl_quantile         = 0.10       # config['prediction'].quantiles value used for SL
+sl_min_pct          = 0.5        # minimum SL distance (%) to cap quantile output
+tp_max_pct          = 50.0       # maximum TP distance (%)
+sl_max_pct          = 50.0       # maximum SL distance (%)
+
+# ── Logowanie ──────────────────────────────────────────────────────────────────
+[logging]
+level            = "INFO"   # DEBUG | INFO | WARNING | ERROR
+max_file_size_mb = 10
+max_files        = 5
+log_dir          = "logs"
+
+# ── TensorBoard ────────────────────────────────────────────────────────────────
+[tensorboard]
+log_dir                = "runs"
+log_interval_sec       = 60    # jak często zapisywać metryki skalarne
+histogram_interval_sec = 300   # jak często zapisywać histogramy wag
+
+# ── Alerty Telegram (opcjonalne) ───────────────────────────────────────────────
+[alerts]
+enabled          = false
+telegram_token   = ""
+telegram_chat_id = ""
+cooldown_sec     = 300
+grad_explode_threshold = 5.0
+loss_plateau_steps     = 500

@@ -1,13 +1,15 @@
+import math
 import os
 import logging
 from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from ..model.tft              import QuantileNet
 from ..training.dataset       import QuantileDataset, collate_fn
-from ..training.losses        import combined_loss
+from ..training.losses        import LossModule, compute_pos_freq
 from ..training.walk_forward  import build_walk_forward_folds
 from ..utils.tensorboard      import TBLogger
 from ..backtest               import (load_ohlcv, run_inference, brute_force_tp_sl_top20,
@@ -22,6 +24,46 @@ def sort_windows_chronologically(windows: list) -> list:
         windows,
         key=lambda w: (int(w['current_close_time']), str(w.get('symbol', ''))),
     )
+
+
+def _split_decay_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
+    """Param groups: weight_decay only on Linear/Conv weights; 0 for LayerNorm/biases.
+
+    Standard recipe for transformer training — keeps norm/bias parameters
+    unregularized to avoid biasing toward zero scale, which hurts attention.
+    """
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or name.endswith('.bias') or 'norm' in name.lower() or 'bn' in name.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    groups = [
+        {'params': decay,    'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.0},
+    ]
+    return groups
+
+
+def _build_lr_lambda(warmup_steps: int, total_steps: int, lr_min_ratio: float):
+    """Linear warmup → cosine decay per-step.
+
+    Returns multiplier ∈ [lr_min_ratio, 1.0] applied to base LR by LambdaLR.
+    """
+    warmup_steps = max(1, int(warmup_steps))
+    total_steps  = max(warmup_steps + 1, int(total_steps))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / float(warmup_steps)
+        progress = (step - warmup_steps) / float(total_steps - warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return lr_min_ratio + (1.0 - lr_min_ratio) * cosine
+
+    return lr_lambda
 
 
 class Trainer:
@@ -44,20 +86,66 @@ class Trainer:
         self.val_months   = train_cfg['val_months']
         self.test_months  = train_cfg['test_months']
 
-        self.q_weight  = pred_cfg.get('quantile_loss_weight',  0.5)
-        self.t_weight  = pred_cfg.get('threshold_loss_weight', 0.5)
         self.mode      = pred_cfg['mode']
-        self.quantiles = torch.tensor(pred_cfg.get('quantiles', []), dtype=torch.float32).to(device)
 
-        self.model     = QuantileNet(config).to(device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=train_cfg['lr'])
+        # ── Model ────────────────────────────────────────────────────────────
+        self.model = QuantileNet(config).to(device)
 
-        lr_sched = train_cfg.get('lr_scheduler', 'none')
-        self.scheduler = (
-            torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=train_cfg['epochs'], eta_min=train_cfg.get('lr_min', 1e-5)
-            ) if lr_sched == 'cosine' else None
+        # ── Loss module (owns quantiles, log_var params, pos_weight buffer) ──
+        n_h = self.model.n_horizons
+        n_t = self.model.n_thresholds
+        n_d = self.model.n_directions
+        self.loss_module = LossModule(config, n_horizons=n_h, n_thresholds=n_t, n_directions=n_d).to(device)
+
+        # ── Optimizer (param groups + transformer-style betas/wd) ────────────
+        wd       = float(train_cfg.get('weight_decay', 0.05))
+        betas    = tuple(train_cfg.get('betas', [0.9, 0.95]))
+        base_lr  = float(train_cfg['lr'])
+
+        param_groups = _split_decay_param_groups(self.model, wd)
+        # Loss-module learnable params (log_var) — never decayed.
+        loss_params = [p for p in self.loss_module.parameters() if p.requires_grad]
+        if loss_params:
+            param_groups.append({'params': loss_params, 'weight_decay': 0.0})
+
+        self.optimizer = torch.optim.AdamW(param_groups, lr=base_lr, betas=betas)
+
+        # ── LR scheduler: linear warmup + cosine, stepped per batch ──────────
+        # `T_max`/total_steps is finalized in `train()` once the loader is built.
+        self.lr_scheduler_kind = train_cfg.get('lr_scheduler', 'cosine')
+        self.warmup_steps      = int(train_cfg.get('warmup_steps', 500))
+        self.lr_min            = float(train_cfg.get('lr_min', 1e-7))
+        self.scheduler         = None  # built inside `train()`
+
+        # ── Mixed precision ──────────────────────────────────────────────────
+        self.amp_dtype = str(train_cfg.get('amp_dtype', 'bf16')).lower()
+        self._amp_enabled = self.amp_dtype in ('bf16', 'fp16') and device.type == 'cuda'
+        self._amp_torch_dtype = {
+            'bf16': torch.bfloat16, 'fp16': torch.float16,
+        }.get(self.amp_dtype, torch.float32)
+        # GradScaler only needed for fp16 (bf16 has fp32 dynamic range).
+        self.scaler = (
+            torch.amp.GradScaler('cuda')
+            if (self._amp_enabled and self.amp_dtype == 'fp16') else None
         )
+
+        # ── Gradient clipping ────────────────────────────────────────────────
+        self.grad_clip = float(train_cfg.get('grad_clip', 1.0))
+
+        # ── EMA wrapper (for OOS eval / backtest) ────────────────────────────
+        ema_decay = float(train_cfg.get('ema_decay', 0.0))
+        self.ema_enabled = ema_decay > 0.0
+        if self.ema_enabled:
+            self.ema = AveragedModel(
+                self.model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay),
+                device=device,
+            )
+            logger.info(f'[Trainer] EMA enabled (decay={ema_decay}).')
+        else:
+            self.ema = None
+
+        # ── Validation selector ──────────────────────────────────────────────
+        self.val_selector = str(train_cfg.get('val_selector', 'mean_oos')).lower()
 
         if train_cfg.get('compile_model', False):
             self.model = torch.compile(self.model)
@@ -75,13 +163,14 @@ class Trainer:
         self._ohlcv_by_symbol: dict = {}
         self._base_tf_min: int = 1
 
+    # ─────────────────────────────────────────────────────────────────────────
     def train(self, windows: list):
-        active_tfs  = self.model.active_tfs
-        tf_seq_lens = self.model.tf_seq_lens
+        active_tfs  = self.model.active_tfs if not hasattr(self.model, '_orig_mod') else self.model._orig_mod.active_tfs
+        tf_seq_lens = self.model.tf_seq_lens if not hasattr(self.model, '_orig_mod') else self.model._orig_mod.tf_seq_lens
         num_workers = min(4, os.cpu_count() or 1)
         pin = self.device.type == 'cuda'
 
-        # ── Walk-forward split ───────────────────────────────────────────────────
+        # ── Walk-forward split ───────────────────────────────────────────────
         folds, test_windows = build_walk_forward_folds(
             windows, self.train_months, self.val_months, self.test_months
         )
@@ -89,21 +178,21 @@ class Trainer:
             logger.error('[Trainer] No folds built — check walk_forward config.')
             return
 
-        # ── IS dataset: all train blocks from all folds combined ─────────────────
+        # ── IS dataset: all train blocks combined, augmented ─────────────────
         is_windows = []
         for f in folds:
             is_windows.extend(f['train'])
         is_windows = sort_windows_chronologically(is_windows)
 
-        is_ds     = QuantileDataset(is_windows, self.cfg, active_tfs, tf_seq_lens)
+        is_ds     = QuantileDataset(is_windows, self.cfg, active_tfs, tf_seq_lens, train_augment=True)
         is_loader = DataLoader(is_ds, batch_size=self.batch_size, shuffle=True,
                                collate_fn=collate_fn, num_workers=num_workers,
                                pin_memory=pin)
 
-        # ── OOS loaders: one per fold (val block) ────────────────────────────────
+        # ── OOS loaders: one per fold (val block, no augmentation) ───────────
         oos_loaders: list[DataLoader] = []
         for f in folds:
-            ds = QuantileDataset(f['val'], self.cfg, active_tfs, tf_seq_lens)
+            ds = QuantileDataset(f['val'], self.cfg, active_tfs, tf_seq_lens, train_augment=False)
             oos_loaders.append(DataLoader(ds, batch_size=self.batch_size, shuffle=False,
                                           collate_fn=collate_fn, num_workers=num_workers,
                                           pin_memory=pin))
@@ -115,13 +204,40 @@ class Trainer:
             f'Test={len(test_windows)}'
         )
 
-        # ── Per-epoch backtest setup (reuses already-built test_windows) ─────────
+        # ── Build per-step scheduler now that we know steps/epoch ────────────
+        if self.lr_scheduler_kind == 'cosine':
+            total_steps = max(1, len(is_loader) * self.epochs)
+            base_lr = self.optimizer.param_groups[0]['lr']
+            lr_min_ratio = self.lr_min / base_lr if base_lr > 0 else 0.0
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=_build_lr_lambda(self.warmup_steps, total_steps, lr_min_ratio),
+            )
+            logger.info(
+                f'[Trainer] LR schedule: warmup={self.warmup_steps} steps -> cosine '
+                f'over {total_steps} total steps (base_lr={base_lr:.2e}, lr_min={self.lr_min:.2e}).'
+            )
+
+        # ── Compute pos_weight for BCE from training data ────────────────────
+        if self.mode in ('threshold', 'both') and self.loss_module.bce_use_pos_weight:
+            # Use the IS loader directly, capping at a reasonable number of batches
+            # to keep startup fast on huge datasets.
+            max_batches = min(len(is_loader), 200)
+            pos_freq = compute_pos_freq(is_loader, self.device, max_batches=max_batches)
+            if pos_freq is not None:
+                self.loss_module.set_pos_weight(pos_freq)
+                logger.info(
+                    f'[Trainer] BCE pos_weight set from {max_batches} batches: '
+                    f'pos_freq mean={pos_freq.mean().item():.3f} '
+                    f'min={pos_freq.min().item():.3f} max={pos_freq.max().item():.3f}'
+                )
+
+        # ── Per-epoch backtest setup ─────────────────────────────────────────
         if self.backtest_interval > 0:
             self._test_windows = test_windows
             self._ohlcv_by_symbol, self._base_tf_min = load_ohlcv(self.cfg)
             logger.info(f'[Trainer] Backtest ready: {len(self._test_windows)} test windows.')
 
-        # Use OOS[last fold] as the model-selection signal (closest to test)
         best_val   = float('inf')
         no_improve = 0
         global_step = 0
@@ -129,22 +245,20 @@ class Trainer:
         n_folds = len(folds)
 
         for epoch in range(1, self.epochs + 1):
-            # ── IS training pass ─────────────────────────────────────────────────
+            # ── IS training pass ─────────────────────────────────────────────
             is_loss = self._run_epoch(is_loader, training=True, step=global_step)
             global_step += len(is_loader)
 
-            # ── OOS evaluation (no grad) — one loss per fold ─────────────────────
+            # ── OOS evaluation (uses EMA weights when available) ─────────────
+            eval_model = self.ema if self.ema_enabled else None
             oos_losses = [
-                self._run_epoch(loader, training=False, step=global_step)
+                self._run_epoch(loader, training=False, step=global_step, eval_model=eval_model)
                 for loader in oos_loaders
             ]
 
-            if self.scheduler:
-                self.scheduler.step()
-
             lr_now = self.optimizer.param_groups[0]['lr']
 
-            # ── Logging ──────────────────────────────────────────────────────────
+            # ── Logging ──────────────────────────────────────────────────────
             oos_str = '  '.join(f'OOS[{i+1}]={v:.5f}' for i, v in enumerate(oos_losses))
             logger.info(
                 f'Epoch {epoch}/{self.epochs} | IS={is_loss:.5f}  {oos_str} | lr={lr_now:.2e}'
@@ -155,9 +269,13 @@ class Trainer:
                 tb_scalars[f'loss/OOS_fold{i+1}'] = v
             self.tb.log_scalars_immediate(tb_scalars, global_step)
 
-            # ── Checkpoint & early stopping (based on last fold OOS) ─────────────
-            val_loss  = oos_losses[-1]
-            is_best   = val_loss < best_val
+            # ── Validation selector ──────────────────────────────────────────
+            if self.val_selector == 'mean_oos':
+                val_loss = float(sum(oos_losses) / max(len(oos_losses), 1))
+            else:
+                val_loss = float(oos_losses[-1])
+
+            is_best = val_loss < best_val
 
             if epoch % self.ckpt_interval == 0:
                 self._save_checkpoint(epoch, val_loss)
@@ -182,10 +300,27 @@ class Trainer:
                 self._run_epoch_backtest(epoch)
 
         self.tb.close()
-        logger.info(f'[Trainer] Done. Best val loss (OOS last fold): {best_val:.5f}')
+        logger.info(f'[Trainer] Done. Best val loss ({self.val_selector}): {best_val:.5f}')
 
-    def _run_epoch(self, loader: DataLoader, training: bool, step: int) -> float:
-        self.model.train(training)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _run_epoch(
+        self, loader: DataLoader, training: bool, step: int,
+        eval_model: nn.Module | None = None,
+    ) -> float:
+        """Single epoch over a loader.
+
+        When `training=False` and `eval_model` is provided (e.g. EMA), the
+        forward pass goes through that model instead of `self.model`.
+        """
+        if training:
+            self.model.train()
+            forward_model = self.model
+        else:
+            self.model.eval()
+            forward_model = eval_model if eval_model is not None else self.model
+            if hasattr(forward_model, 'eval'):
+                forward_model.eval()
+
         total, n = 0.0, 0
 
         with torch.set_grad_enabled(training):
@@ -199,15 +334,34 @@ class Trainer:
                 if t_label is not None:
                     t_label = t_label.to(self.device, non_blocking=True)
 
-                outputs = self.model(tf_inputs)
-                loss, components = combined_loss(
-                    outputs, q_label, t_label, self.quantiles, self.q_weight, self.t_weight)
+                if self._amp_enabled:
+                    with torch.amp.autocast('cuda', dtype=self._amp_torch_dtype):
+                        outputs = forward_model(tf_inputs)
+                        loss, components = self.loss_module(outputs, q_label, t_label)
+                else:
+                    outputs = forward_model(tf_inputs)
+                    loss, components = self.loss_module(outputs, q_label, t_label)
 
                 if training:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                        self.scaler.unscale_(self.optimizer)
+                        if self.grad_clip > 0:
+                            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        loss.backward()
+                        if self.grad_clip > 0:
+                            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        self.optimizer.step()
+
+                    if self.scheduler is not None:
+                        self.scheduler.step()
+                    if self.ema_enabled:
+                        self.ema.update_parameters(self.model)
 
                 total += components['loss/total']
                 n     += 1
@@ -220,9 +374,8 @@ class Trainer:
     @staticmethod
     def _print_epoch_table(history: list[dict], n_folds: int, max_epochs: int):
         ep_w   = max(5, len(str(max_epochs)) + 1)
-        col_w  = 9  # width for each loss column
+        col_w  = 9
 
-        # Header
         header = f"{'Epoch':>{ep_w}} | {'IS':>{col_w}}"
         for i in range(n_folds):
             header += f" | {f'OOS[{i+1}]':>{col_w}}"
@@ -244,9 +397,17 @@ class Trainer:
     def _save_checkpoint(self, epoch: int, val_loss: float, tag: str = ''):
         name = f'ckpt_epoch{epoch}{"_" + tag if tag else ""}_val{val_loss:.4f}.pt'
         path = os.path.join(self.ckpt_dir, name)
-        torch.save({'epoch': epoch, 'model': self.model.state_dict(),
-                    'optimizer': self.optimizer.state_dict(),
-                    'val_loss': val_loss, 'config': self.cfg}, path)
+        state = {
+            'epoch':     epoch,
+            'model':     self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'loss':      self.loss_module.state_dict(),
+            'val_loss':  val_loss,
+            'config':    self.cfg,
+        }
+        if self.ema_enabled:
+            state['ema'] = self.ema.state_dict()
+        torch.save(state, path)
         logger.info(f'[Trainer] Saved: {name}')
         if tag != 'best':
             self._saved_ckpts.append(path)
@@ -259,21 +420,27 @@ class Trainer:
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt['model'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
+        if 'loss' in ckpt:
+            self.loss_module.load_state_dict(ckpt['loss'])
+        if 'ema' in ckpt and self.ema_enabled:
+            self.ema.load_state_dict(ckpt['ema'])
         logger.info(f'[Trainer] Resumed from: {path}')
 
     def _run_epoch_backtest(self, epoch: int):
-        logger.info(f'[Trainer] Running backtest after epoch {epoch} on current model state...')
+        # Backtest uses EMA weights when available — they generalize better.
+        bt_model = self.ema.module if self.ema_enabled else self.model
+        logger.info(f'[Trainer] Running backtest after epoch {epoch} (model={"EMA" if self.ema_enabled else "raw"})...')
         was_training = self.model.training
-        self.model.eval()
+        bt_model.eval()
         with torch.no_grad():
-            first_param = next(self.model.parameters(), None)
+            first_param = next(bt_model.parameters(), None)
             if first_param is not None:
                 logger.info(
                     f'[Trainer] Model fingerprint before backtest: '
                     f'mean={first_param.detach().float().mean().item():.8f} '
                     f'std={first_param.detach().float().std().item():.8f}'
                 )
-        results = run_inference(self.model, self._test_windows, self.cfg, self.device)
+        results = run_inference(bt_model, self._test_windows, self.cfg, self.device)
         calibration_json = os.path.join(self.ckpt_dir, f'calibration_epoch{epoch}.json')
         calibration_report(results, self.cfg, save_path=calibration_json)
         bt_result = brute_force_tp_sl_top20(
