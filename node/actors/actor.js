@@ -46,6 +46,7 @@ class Actor {
             .filter(k => globalConfig.timeframes[k] > 0)
             .sort();
         this._numFeatures = globalConfig.features.num_features;
+        this._positionDim = 10 + this._quantileFeatureDim(globalConfig);
     }
 
     /**
@@ -387,6 +388,7 @@ class Actor {
         const mirrored = {};
         for (const [tf, rows] of Object.entries(state)) {
             if (tf === 'position') continue;
+            if (!Array.isArray(rows)) { mirrored[tf] = rows; continue; }
             mirrored[tf] = rows.map(row => {
                 const r = [...row];
                 // [0]=normalizedClose negate, [1]=relativeRange unchanged,
@@ -692,6 +694,12 @@ class Actor {
     async _inferOnnx(state, actionMask) {
         const session = await this._getOnnxSession();
         if (!session) return null;
+        if (this.config.quantilenet && this.config.quantilenet.enabled) {
+            // Python RPC augments states with prerolled QuantileNet features.
+            // The JS actor does not load parquet files, so local ONNX would see
+            // zero quantile features and diverge from training/inference.
+            return null;
+        }
 
         try {
             const tfKeys      = this._tfKeysSorted;
@@ -716,15 +724,16 @@ class Actor {
                 feeds[`tf_${i}`] = new ort.Tensor('float32', arr, [1, seqLen, numFeatures]);
             }
 
-            // pos_features has 10 dimensions (matching ONNX export in trainer.py);
-            // Float32Array(10) zeros by default — length mismatch with [1,10] tensor breaks ONNX.
-            const posArr = new Float32Array(10);
+            // pos_features is 10 base fields plus configured QuantileNet slots.
+            // The network shape is stable even when QuantileNet is disabled, so
+            // the extra slots stay zero in that mode.
+            const posArr = new Float32Array(this._positionDim);
             const posData = state && state.position;
             if (posData) {
                 const n = Math.min(posData.length, 10);
                 for (let k = 0; k < n; k++) posArr[k] = posData[k];
             }
-            feeds['pos_features'] = new ort.Tensor('float32', posArr, [1, 10]);
+            feeds['pos_features'] = new ort.Tensor('float32', posArr, [1, this._positionDim]);
             feeds['action_mask']  = new ort.Tensor('float32', new Float32Array(actionMask), [1, 4]);
 
             const results = await session.run(feeds);
@@ -747,6 +756,13 @@ class Actor {
             this._onnxSession = null;  // force reload on next attempt
             return null;
         }
+    }
+
+    _quantileFeatureDim(config) {
+        const qn = config.quantilenet || {};
+        const horizons = Array.isArray(qn.horizons_hours) ? qn.horizons_hours : [24, 48, 72];
+        const quantiles = Array.isArray(qn.quantiles) ? qn.quantiles : [0.10, 0.25, 0.50, 0.75, 0.90];
+        return horizons.length * quantiles.length * 2;
     }
 
     stop() {

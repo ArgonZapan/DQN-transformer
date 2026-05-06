@@ -22,11 +22,6 @@ symbol = "BNBUSDT"
 exchange = "binance"
 leverage = 1
 
-[[actors]]
-symbol = "XRPUSDT"
-exchange = "binance"
-leverage = 1
-
 # ── Learner (Python / GPU) ─────────────────────────────────────────────────────
 [learner]
 host = "tcp://127.0.0.1"
@@ -224,6 +219,33 @@ device = "cpu"  # eksport zawsze na CPU żeby nie blokować GPU
 # ── API / tryb symulacji ────────────────────────────────────────────────────────
 [api]
 simulation_mode = true  # true = dane historyczne, false = real-time Binance API
+
+# ── QuantileNet (probabilistic price forecasts injected into state) ────────────
+# Position vector grows from 10 → 40 dims when enabled; the extra 30 features
+# are quantile predictions [3 horizons × 5 quantiles × 2 directions]. When
+# disabled, the 30 slots are filled with zeros (network input shape unchanged).
+#
+# Workflow:
+#   1. Train QuantileNet in DQN-QuantileNet/.
+#   2. Run DQN-QuantileNet/python/preroll_for_dqn.py --output-dir python/data/quantile_predictions
+#      to materialise <symbol>.parquet files indexed by close_time_ms.
+#   3. Set enabled = true here.
+#
+# The actor must include `timestamp` (close_time_ms of the current base-TF
+# candle) in the state payload. Missing timestamps fall back to zeros. By
+# default, if the exact DQN timestamp is absent from parquet, the loader uses
+# the latest earlier QuantileNet row within max_staleness_ms; this handles 1m
+# DQN steps consuming 15m QuantileNet rows without using future data.
+[quantilenet]
+enabled = false
+predictions_dir = "python/data/quantile_predictions"  # parquet files written by preroll
+horizons_hours  = [24, 48, 72]   # must match preroll --horizons
+quantiles       = [0.10, 0.25, 0.50, 0.75, 0.90]  # must match QN config [prediction].quantiles
+feature_scale   = 0.10           # divide raw fractional excursion by this (0.10 = 10% -> 1.0)
+feature_clip    = 3.0            # clip normalized features to [-clip, +clip]
+lookup_mode     = "previous"     # "exact" | "previous" (latest <= timestamp, no future lookup)
+max_staleness_ms = 900000        # 15 minutes; set 0 to disable staleness limit
+miss_warn_limit = 5              # how many "timestamp not found" warnings to log per symbol
 
 # ── TensorBoard ────────────────────────────────────────────────────────────────
 [tensorboard]
