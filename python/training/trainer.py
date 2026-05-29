@@ -835,10 +835,19 @@ class Trainer:
 
         # ── Forward Double DQN (no grad, with autocast) ──────────────────────
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.use_amp):
-            next_masks = action_masks.clone()
-            next_masks[actions == 0] = self._mask_in_pos  # po LONG
-            next_masks[actions == 1] = self._mask_in_pos  # po SHORT
-            next_masks[actions == 3] = self._mask_no_pos  # po CLOSE
+            # Derive the next-state action mask from the ACTUAL next-state position
+            # (is_long = pos[:,0], is_short = pos[:,1]), not by reconstructing it from
+            # the current action. The action-based reconstruction is wrong for n-step
+            # returns: next_state is s_{t+n}, whose position depends on the intermediate
+            # actions, not just a_t (e.g. a HOLD whose n-step window crosses a later
+            # open would be mis-masked as flat). next_pos_features always reflects
+            # s_{t+n}, so a position there means HOLD/CLOSE are legal, otherwise
+            # LONG/SHORT/HOLD are. When done=True the bootstrap is zeroed, so the
+            # mask for terminal transitions is irrelevant.
+            in_position = (next_pos_features[:, 0] + next_pos_features[:, 1]) > 0.5
+            next_masks = torch.where(
+                in_position.unsqueeze(1), self._mask_in_pos, self._mask_no_pos
+            )
 
             # Double DQN: main network selects action, target network evaluates value
             self.main_network.eval()
@@ -990,36 +999,43 @@ class Trainer:
 
     @torch.no_grad()
     def predict(self, state, action_mask=None):
+        # Inference must run with dropout off, but predict() may be invoked from the
+        # ZMQ thread concurrently with train_step(). Restore the previous mode on exit
+        # so a stray prediction never leaves the shared network stuck in eval().
+        was_training = self.main_network.training
         self.main_network.eval()
+        try:
+            tf_keys = [k for k in sorted(self.config['timeframes'].keys()) if self.config['timeframes'][k] > 0]
+            state_tensors = []
+            for key in tf_keys:
+                tf_name = key.replace('candles_', '')
+                if tf_name in state:
+                    tensor = torch.tensor(state[tf_name], dtype=torch.float32).unsqueeze(0).to(self.device, non_blocking=True)
+                else:
+                    seq_len = self.config['timeframes'][key]
+                    tensor = torch.zeros(1, seq_len, self.config['features']['num_features'], device=self.device)
+                state_tensors.append(tensor)
 
-        tf_keys = [k for k in sorted(self.config['timeframes'].keys()) if self.config['timeframes'][k] > 0]
-        state_tensors = []
-        for key in tf_keys:
-            tf_name = key.replace('candles_', '')
-            if tf_name in state:
-                tensor = torch.tensor(state[tf_name], dtype=torch.float32).unsqueeze(0).to(self.device, non_blocking=True)
-            else:
-                seq_len = self.config['timeframes'][key]
-                tensor = torch.zeros(1, seq_len, self.config['features']['num_features'], device=self.device)
-            state_tensors.append(tensor)
+            mask_tensor = None
+            if action_mask is not None:
+                mask_tensor = torch.tensor([action_mask], dtype=torch.float32).to(self.device, non_blocking=True)
 
-        mask_tensor = None
-        if action_mask is not None:
-            mask_tensor = torch.tensor([action_mask], dtype=torch.float32).to(self.device, non_blocking=True)
+            pos_tensor = None
+            if isinstance(state, dict):
+                # Build the full position vector: 10 base + quantile features.
+                self._augment_with_quantiles(state)
+                from training.replay_buffer import _extract_pos_vector
+                quantile_dim = self.position_dim - 10
+                vec = _extract_pos_vector(state, self.position_dim, quantile_dim)
+                pos_tensor = torch.from_numpy(vec).unsqueeze(0).to(self.device, non_blocking=True)
 
-        pos_tensor = None
-        if isinstance(state, dict):
-            # Build the full position vector: 10 base + quantile features.
-            self._augment_with_quantiles(state)
-            from training.replay_buffer import _extract_pos_vector
-            quantile_dim = self.position_dim - 10
-            vec = _extract_pos_vector(state, self.position_dim, quantile_dim)
-            pos_tensor = torch.from_numpy(vec).unsqueeze(0).to(self.device, non_blocking=True)
+            q_values = self.main_network(state_tensors, action_mask=mask_tensor, position_features=pos_tensor)
+            action = q_values.argmax(dim=1).item()
 
-        q_values = self.main_network(state_tensors, action_mask=mask_tensor, position_features=pos_tensor)
-        action = q_values.argmax(dim=1).item()
-
-        return action, q_values.squeeze(0).cpu().numpy()
+            return action, q_values.squeeze(0).cpu().numpy()
+        finally:
+            if was_training:
+                self.main_network.train()
 
     @torch.no_grad()
     def predict_action(self, state, action_mask=None):
