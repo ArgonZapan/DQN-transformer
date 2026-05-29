@@ -1,12 +1,14 @@
 """
-AttentionMonitor — forward hooks na blokach transformera.
+AttentionMonitor — forward hooks on the transformer blocks.
 
-Mierzy per-head:
-  - entropię attention (0 = skupiona na 1 tokenie, log(n_tokens) = uniform/losowa)
-  - dywergencję KL między głowami (niska = głowy identyczne = redundancja)
-  - max weight per row (koncentracja uwagi)
+Per-head metrics:
+  - attention entropy (0 = focused on a single token, log(n_tokens) = uniform/random)
+  - KL divergence between heads (low = identical heads = redundancy)
+  - max weight per row (attention concentration)
 
-Wymaga network.py z average_attn_weights=False w MultiheadAttention.
+register() flips each block to per-head weight output (need_weights=True,
+average_attn_weights=False) for the capture window; the fast attention path
+(need_weights=False) is restored on remove().
 """
 
 import logging
@@ -25,11 +27,14 @@ class AttentionMonitor:
         self._attn_cache: dict[int, torch.Tensor] = {}   # block_idx → [B, heads, seq, seq]
 
     def register(self) -> None:
-        """Podpina hooki na wszystkie bloki TransformerEncoderBlock."""
+        """Attach forward hooks to every TransformerEncoderBlock and enable per-head
+        attention weights on those blocks for the duration of the capture window."""
         self._remove_hooks()
         for name, module in self.network.named_modules():
             if type(module).__name__ == 'TransformerEncoderBlock':
-                # Wyciągnij numer bloku z nazwy (np. transformer_blocks.0)
+                # Enable per-head weight output so the hook below can read it.
+                module.capture_attn = True
+                # Extract the block index from the module name (e.g. transformer_blocks.0)
                 parts = name.split('.')
                 try:
                     idx = int(parts[-1])
@@ -56,6 +61,10 @@ class AttentionMonitor:
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+        # Restore the fast attention path (no weight materialization) on all blocks.
+        for module in self.network.modules():
+            if type(module).__name__ == 'TransformerEncoderBlock':
+                module.capture_attn = False
 
     def log_diagnostics(self, step: int) -> dict:
         """Oblicza i loguje metryki attention. Wywołać po forward passie."""
