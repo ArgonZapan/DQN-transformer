@@ -392,11 +392,14 @@ def build_state_fast(precomp: dict, idx_1m: int, config: dict) -> dict:
             end_idx = int(precomp['alignment'][tf_name][idx_1m])
 
         start_idx = max(0, end_idx - num)
-        actual = feats[start_idx:end_idx]  # shape [K, 8]
+        actual = feats[start_idx:end_idx]  # shape [K, num_features]
 
         pad = num - len(actual)
         if pad > 0:
-            actual = np.concatenate([np.zeros((pad, 8), dtype=np.float32), actual], axis=0)
+            # Front-pad with zeros to the configured window. Width must match the
+            # precomputed feature count (11), not the legacy 8 — otherwise this
+            # concatenate raises a shape error near the start of the data.
+            actual = np.concatenate([np.zeros((pad, feats.shape[1]), dtype=np.float32), actual], axis=0)
 
         state[tf_name] = actual
     return state
@@ -422,12 +425,13 @@ def predict(model: TradingDQN, state_dict: dict, action_mask: list,
     sorted active config keys → ['candles_15m', 'candles_1d', 'candles_1h', 'candles_1m']
     position_features: [is_long, is_short, unrealized_pnl, bars_norm] or None
     """
+    nf = config['features']['num_features']
     tf_keys = sorted(k for k, v in config['timeframes'].items() if v > 0)
     tensors = []
     for key in tf_keys:
         tf_name = key.replace('candles_', '')
         num = config['timeframes'][key]
-        arr = state_dict.get(tf_name, np.zeros((num, 8), dtype=np.float32))
+        arr = state_dict.get(tf_name, np.zeros((num, nf), dtype=np.float32))
         tensors.append(torch.tensor(arr, dtype=torch.float32).unsqueeze(0).to(device))
 
     mask = torch.tensor([action_mask], dtype=torch.float32).to(device)
