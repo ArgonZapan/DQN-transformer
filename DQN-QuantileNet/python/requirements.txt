@@ -7,3 +7,9 @@ fastapi>=0.110.0
 uvicorn>=0.27.0
 sse-starlette>=2.0.0
 pydantic>=2.5.0
+
+# Kronos foundation model (NeoQuasar/Kronos-mini)
+einops>=0.8.0
+huggingface_hub>=0.20.0
+safetensors>=0.4.0
+pandas>=2.0.0

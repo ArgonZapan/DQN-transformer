@@ -19,6 +19,7 @@ from diagnostics.metric_logger import MetricLogger
 from diagnostics.alert_system import AlertSystem
 from diagnostics.attention_monitor import AttentionMonitor
 from diagnostics.training_report import TrainingReport
+from quantilenet import QuantileFeatureLoader, extended_position_dim
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,12 @@ class Trainer:
         # Experience queue: ZMQ thread only enqueues (fast), training thread
         # drains at the start of each train_step — eliminates GIL contention
         self._experience_queue: queue.Queue = queue.Queue(maxsize=50000)
+
+        # QuantileNet feature loader — must be built before the buffer because
+        # the buffer's pos_features dim depends on the configured quantile dim
+        # (extended_position_dim reads the same config keys).
+        self.quantile_loader = QuantileFeatureLoader(config)
+        self.position_dim = extended_position_dim(config)
 
         per_cfg = config.get('per', {})
         self.use_per = per_cfg.get('alpha', 0) > 0
@@ -267,15 +274,46 @@ class Trainer:
             logger.info(f"[Checkpoint] Loading replay buffer from: {buf_path} (step {buffer_candidates[0][0]})")
             self._load_buffer(buf_path)
 
+    def _upgrade_pos_fc_for_quantiles(self, state_dict):
+        target = self.main_network.state_dict().get('pos_fc.0.weight')
+        ckpt_w = state_dict.get('pos_fc.0.weight')
+        if target is None or ckpt_w is None:
+            return None
+        if target.shape[0] != ckpt_w.shape[0] or target.shape[1] <= ckpt_w.shape[1]:
+            return None
+        new_w = torch.zeros_like(target)
+        new_w[:, :ckpt_w.shape[1]] = ckpt_w
+        upgraded = dict(state_dict)
+        upgraded['pos_fc.0.weight'] = new_w
+        return upgraded
+
     def _load_checkpoint(self, path, load_buffer=True):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         try:
             self.main_network.load_state_dict(checkpoint['model_state_dict'])
             self.target_network.load_state_dict(checkpoint['model_state_dict'])
         except RuntimeError as e:
-            logger.warning(f"[Checkpoint] Architecture mismatch — starting with fresh weights. ({e})")
-            return
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # Common case: pre-quantilenet checkpoint has pos_fc.0.weight
+            # of shape [32, 10]; current network expects [32, 10+quantile_dim].
+            # Pad the input dim with zeros so legacy base weights are kept and
+            # quantile contribution starts at zero, then retry.
+            patched = self._upgrade_pos_fc_for_quantiles(checkpoint['model_state_dict'])
+            if patched is not None:
+                try:
+                    self.main_network.load_state_dict(patched)
+                    self.target_network.load_state_dict(patched)
+                    # Optimizer Adam state (m, v) was tied to old pos_fc shape;
+                    # discard it so the new param starts with fresh momentum.
+                    checkpoint.pop('optimizer_state_dict', None)
+                    logger.info("[Checkpoint] Upgraded legacy pos_fc weights for quantile features (zero-padded). Optimizer state reset.")
+                except RuntimeError as e2:
+                    logger.warning(f"[Checkpoint] Architecture mismatch — starting with fresh weights. ({e2})")
+                    return
+            else:
+                logger.warning(f"[Checkpoint] Architecture mismatch — starting with fresh weights. ({e})")
+                return
+        if 'optimizer_state_dict' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.step_count = checkpoint.get('step', 0)
         self.epsilon = checkpoint.get('epsilon', self.epsilon_start)
         self.last_loss = checkpoint.get('loss', 0.0)
@@ -415,7 +453,29 @@ class Trainer:
         Each read = one GPU→CPU sync. Do NOT call in the hot path."""
         return self._snapshot_gpu_accumulator()
 
+    def _augment_with_quantiles(self, state, default_symbol=None):
+        """Inject normalized prerolled QuantileNet features into a state dict.
+
+        Reads symbol/timestamp from the state itself (preferred) or falls back
+        to default_symbol (e.g. actor_id when state was built before symbol
+        was available). Mutates the dict in place and returns it.
+        Loader misses fall back to zeros (and warn once per symbol).
+        """
+        if not isinstance(state, dict):
+            return state
+        symbol = state.get('symbol') or default_symbol
+        ts = state.get('timestamp')
+        state['quantile_features'] = self.quantile_loader.lookup(symbol, ts)
+        return state
+
     def add_experience(self, state, action, reward, next_state, done, action_mask=None, actor_id=None):
+        # Augment state with quantile features here (one lookup per experience)
+        # rather than at training-step time (which would repeat lookups for every
+        # PER sample). actor_id doubles as the symbol for ONNX actors.
+        self._augment_with_quantiles(state, default_symbol=actor_id)
+        if next_state is not None:
+            self._augment_with_quantiles(next_state, default_symbol=actor_id)
+
         # Do not block ZMQ thread — if queue is full, skip (safe with PER)
         try:
             self._experience_queue.put_nowait((state, action, reward, next_state, done, action_mask))
@@ -947,14 +1007,14 @@ class Trainer:
         if action_mask is not None:
             mask_tensor = torch.tensor([action_mask], dtype=torch.float32).to(self.device, non_blocking=True)
 
-        pos_data = state.get('position') if isinstance(state, dict) else None
         pos_tensor = None
-        if pos_data is not None:
-            # Pad/truncate to exactly 10 elements — matches pos_fc input size and buffer allocation.
-            padded = [0.0] * 10
-            n = min(len(pos_data), 10)
-            padded[:n] = list(pos_data[:n])
-            pos_tensor = torch.tensor([padded], dtype=torch.float32).to(self.device, non_blocking=True)
+        if isinstance(state, dict):
+            # Build the full position vector: 10 base + quantile features.
+            self._augment_with_quantiles(state)
+            from training.replay_buffer import _extract_pos_vector
+            quantile_dim = self.position_dim - 10
+            vec = _extract_pos_vector(state, self.position_dim, quantile_dim)
+            pos_tensor = torch.from_numpy(vec).unsqueeze(0).to(self.device, non_blocking=True)
 
         q_values = self.main_network(state_tensors, action_mask=mask_tensor, position_features=pos_tensor)
         action = q_values.argmax(dim=1).item()
@@ -1037,7 +1097,7 @@ class Trainer:
             for key in tf_keys:
                 seq_len = self.config['timeframes'][key]
                 dummy_inputs.append(torch.zeros(1, seq_len, num_features, device=self.device))
-            dummy_inputs.append(torch.zeros(1, 10, device=self.device))  # pos_features
+            dummy_inputs.append(torch.zeros(1, self.position_dim, device=self.device))  # pos_features (10 base + quantile)
             dummy_inputs.append(torch.ones(1, 4, device=self.device))    # action_mask
 
             input_names  = [f'tf_{i}' for i in range(len(tf_keys))] + ['pos_features', 'action_mask']

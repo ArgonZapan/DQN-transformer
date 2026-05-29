@@ -4,11 +4,11 @@ import logging
 from datetime import datetime
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from ..model.tft              import QuantileNet
-from ..training.dataset       import QuantileDataset, collate_fn
+from ..training.dataset       import QuantileDataset, GPUWindowDataset, collate_fn
 from ..training.losses        import LossModule, compute_pos_freq
 from ..training.walk_forward  import build_walk_forward_folds
 from ..utils.tensorboard      import TBLogger
@@ -152,13 +152,18 @@ class Trainer:
 
         self.tb = TBLogger(config)
         self._saved_ckpts: list[str] = []
+        # Best checkpoints rotate independently of regular ones — keep only the
+        # latest, since each is the full model+optimizer+EMA state (~hundreds of
+        # MB) and val_loss is preserved in the filename for audit.
+        self._saved_best_ckpts: list[str] = []
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
         resume = train_cfg.get('resume_from_checkpoint', '')
         if resume:
             self._load_checkpoint(resume)
 
-        self.backtest_interval = train_cfg.get('backtest_every_n_epochs', 1)
+        self.backtest_interval      = int(train_cfg.get('backtest_every_n_epochs', 1))
+        self.backtest_warmup_epochs = int(train_cfg.get('backtest_warmup_epochs', 0))
         self._test_windows: list = []
         self._ohlcv_by_symbol: dict = {}
         self._base_tf_min: int = 1
@@ -167,8 +172,19 @@ class Trainer:
     def train(self, windows: list):
         active_tfs  = self.model.active_tfs if not hasattr(self.model, '_orig_mod') else self.model._orig_mod.active_tfs
         tf_seq_lens = self.model.tf_seq_lens if not hasattr(self.model, '_orig_mod') else self.model._orig_mod.tf_seq_lens
-        num_workers = min(4, os.cpu_count() or 1)
+        train_cfg = self.cfg.get('training', {})
+        data_in_vram = bool(train_cfg.get('data_in_vram', False)) and self.device.type == 'cuda'
+        cpu_cap = max(1, (os.cpu_count() or 1) // 2)
+        num_workers = int(train_cfg.get('dataloader_workers', min(8, cpu_cap)))
+        prefetch_factor = int(train_cfg.get('dataloader_prefetch_factor', 4))
+        persistent_workers = bool(train_cfg.get('dataloader_persistent_workers', True))
         pin = self.device.type == 'cuda'
+
+        # DataLoader kwargs that only apply when num_workers > 0.
+        worker_kwargs = (
+            {'persistent_workers': persistent_workers, 'prefetch_factor': prefetch_factor}
+            if num_workers > 0 else {}
+        )
 
         # ── Walk-forward split ───────────────────────────────────────────────
         folds, test_windows = build_walk_forward_folds(
@@ -184,23 +200,69 @@ class Trainer:
             is_windows.extend(f['train'])
         is_windows = sort_windows_chronologically(is_windows)
 
-        is_ds     = QuantileDataset(is_windows, self.cfg, active_tfs, tf_seq_lens, train_augment=True)
-        is_loader = DataLoader(is_ds, batch_size=self.batch_size, shuffle=True,
-                               collate_fn=collate_fn, num_workers=num_workers,
-                               pin_memory=pin)
+        # Capture sizes up-front so we can free the source lists in the VRAM branch.
+        n_is_windows  = len(is_windows)
+        n_oos_per_fold = [len(f['val']) for f in folds]
+        n_folds        = len(folds)
 
-        # ── OOS loaders: one per fold (val block, no augmentation) ───────────
-        oos_loaders: list[DataLoader] = []
-        for f in folds:
-            ds = QuantileDataset(f['val'], self.cfg, active_tfs, tf_seq_lens, train_augment=False)
-            oos_loaders.append(DataLoader(ds, batch_size=self.batch_size, shuffle=False,
-                                          collate_fn=collate_fn, num_workers=num_workers,
-                                          pin_memory=pin))
+        if data_in_vram:
+            logger.info('[Trainer] data_in_vram=true — staging IS+OOS windows to GPU.')
+            is_loader = GPUWindowDataset(
+                is_windows, self.cfg, active_tfs, tf_seq_lens, self.device,
+                batch_size=self.batch_size, shuffle=True, train_augment=True,
+            )
+            oos_loaders = [
+                GPUWindowDataset(
+                    f['val'], self.cfg, active_tfs, tf_seq_lens, self.device,
+                    batch_size=self.batch_size, shuffle=False, train_augment=False,
+                )
+                for f in folds
+            ]
+            # Drop CPU-side window refs now that everything's staged to GPU —
+            # otherwise we'd pay 2× memory (RAM + VRAM) for the entire dataset.
+            # `test_windows` stays alive for per-epoch backtest; `windows`
+            # (function arg) and `folds` train/val lists no longer needed.
+            import gc
+            del is_windows
+            for f in folds:
+                f['train'] = None
+                f['val']   = None
+            windows.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                vram_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
+                logger.info(f'[Trainer] GPU memory after staging: {vram_mb:.1f} MB allocated.')
+        else:
+            is_ds = QuantileDataset(is_windows, self.cfg, active_tfs, tf_seq_lens, train_augment=True)
+
+            # Vol-stratified sampler is mutually exclusive with shuffle=True
+            # (PyTorch raises if both are set). Sampler already randomizes order.
+            if is_ds.sample_weights is not None:
+                sampler = WeightedRandomSampler(
+                    is_ds.sample_weights.tolist(),
+                    num_samples=len(is_ds),
+                    replacement=True,
+                )
+                is_loader = DataLoader(is_ds, batch_size=self.batch_size, sampler=sampler,
+                                       collate_fn=collate_fn, num_workers=num_workers,
+                                       pin_memory=pin, **worker_kwargs)
+            else:
+                is_loader = DataLoader(is_ds, batch_size=self.batch_size, shuffle=True,
+                                       collate_fn=collate_fn, num_workers=num_workers,
+                                       pin_memory=pin, **worker_kwargs)
+
+            # ── OOS loaders: one per fold (val block, no augmentation) ───────
+            oos_loaders: list = []
+            for f in folds:
+                ds = QuantileDataset(f['val'], self.cfg, active_tfs, tf_seq_lens, train_augment=False)
+                oos_loaders.append(DataLoader(ds, batch_size=self.batch_size, shuffle=False,
+                                              collate_fn=collate_fn, num_workers=num_workers,
+                                              pin_memory=pin, **worker_kwargs))
 
         logger.info(
-            f'[Trainer] Walk-forward: {len(folds)} fold(s) | '
-            f'IS={len(is_windows)} windows | '
-            f'OOS per fold: {[len(f["val"]) for f in folds]} | '
+            f'[Trainer] Walk-forward: {n_folds} fold(s) | '
+            f'IS={n_is_windows} windows | '
+            f'OOS per fold: {n_oos_per_fold} | '
             f'Test={len(test_windows)}'
         )
 
@@ -242,7 +304,6 @@ class Trainer:
         no_improve = 0
         global_step = 0
         epoch_history: list[dict] = []
-        n_folds = len(folds)
 
         for epoch in range(1, self.epochs + 1):
             # ── IS training pass ─────────────────────────────────────────────
@@ -296,7 +357,11 @@ class Trainer:
             })
             self._print_epoch_table(epoch_history, n_folds, self.epochs)
 
-            if self.backtest_interval > 0 and epoch % self.backtest_interval == 0:
+            if (
+                self.backtest_interval > 0
+                and epoch > self.backtest_warmup_epochs
+                and (epoch - self.backtest_warmup_epochs) % self.backtest_interval == 0
+            ):
                 self._run_epoch_backtest(epoch)
 
         self.tb.close()
@@ -321,7 +386,11 @@ class Trainer:
             if hasattr(forward_model, 'eval'):
                 forward_model.eval()
 
-        total, n = 0.0, 0
+        # Accumulate loss as a GPU tensor and sync once at epoch end (avoids
+        # per-batch .item() which forces cudaStreamSynchronize and stalls the
+        # forward/backward pipeline).
+        total = torch.zeros((), device=self.device)
+        n = 0
 
         with torch.set_grad_enabled(training):
             for batch in loader:
@@ -363,13 +432,13 @@ class Trainer:
                     if self.ema_enabled:
                         self.ema.update_parameters(self.model)
 
-                total += components['loss/total']
+                total = total + components['loss/total'].detach()
                 n     += 1
 
         if training:
             self.tb.log_histograms(self.model, step)
 
-        return total / max(n, 1)
+        return (total / max(n, 1)).item()
 
     @staticmethod
     def _print_epoch_table(history: list[dict], n_folds: int, max_epochs: int):
@@ -409,7 +478,13 @@ class Trainer:
             state['ema'] = self.ema.state_dict()
         torch.save(state, path)
         logger.info(f'[Trainer] Saved: {name}')
-        if tag != 'best':
+        if tag == 'best':
+            self._saved_best_ckpts.append(path)
+            while len(self._saved_best_ckpts) > 1:
+                old = self._saved_best_ckpts.pop(0)
+                if os.path.exists(old):
+                    os.remove(old)
+        else:
             self._saved_ckpts.append(path)
             while len(self._saved_ckpts) > self.keep_n_ckpts:
                 old = self._saved_ckpts.pop(0)

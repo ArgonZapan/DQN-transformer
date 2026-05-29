@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from quantilenet import POSITION_BASE_DIM, extended_position_dim
+
 
 class Conv1DBlock(nn.Module):
     """Convolutional block for a single timeframe.
@@ -136,10 +138,13 @@ class TradingDQN(nn.Module):
             nn.Dropout(self.dropout)
         )
 
-        # Position branch: [is_long, is_short, unrealized_pnl, hold_6h, hold_48h,
-        #                    sin_hour, cos_hour, sin_week, cos_week, is_weekend] → 32
+        # Position branch: 10 base features (position state + time encodings) plus
+        # optional prerolled QuantileNet features (e.g. 30 = 3 horizons × 5 quantiles × 2 dirs).
+        # When [quantilenet].enabled is false the extra slots are zeros, so the
+        # input shape stays constant and checkpoints remain valid across toggles.
+        self.position_dim = extended_position_dim(config)
         self.pos_fc = nn.Sequential(
-            nn.Linear(10, 32),
+            nn.Linear(self.position_dim, 32),
             nn.GELU(),
         )
 

@@ -118,6 +118,66 @@ def build_window_at(symbol: str, raw: dict, config: dict,
     }
 
 
+def build_all_windows_vectorized(symbol: str, raw: dict, config: dict) -> list[dict]:
+    """Build a window for EVERY base-TF candle, vectorised.
+
+    Computes per-TF features once on the full array, then slices per candle.
+    Replaces N calls to build_window_at (each recomputing features) — the loop
+    is now O(N) instead of O(N²). Used by /api/live/predict-range startup.
+    """
+    from ...data.loader import _active_tfs, _base_tf, _align_tf, TF_CFG_KEY
+    from ...data.indicators import compute_features
+
+    active_tfs = _active_tfs(config)
+    base_tf    = _base_tf(config)
+    norm_win   = config['features']['normalization_window']
+    seq_lens   = {tf: config['timeframes'][TF_CFG_KEY[tf]] for tf in active_tfs}
+    n_horizons = len(config['prediction']['horizons_hours'])
+
+    # Compute features ONCE for the full per-TF arrays.
+    features = {}
+    for tf in active_tfs:
+        d = raw[tf]
+        features[tf] = compute_features(d['open'], d['high'], d['low'],
+                                         d['close'], d['volume'], norm_win)
+
+    base_closes      = raw[base_tf]['close']
+    base_close_times = raw[base_tf]['close_time']
+    n_base           = len(base_close_times)
+    if n_base == 0:
+        return []
+
+    alignments = {tf: _align_tf(base_close_times, raw[tf]['close_time'])
+                  for tf in active_tfs if tf != base_tf}
+
+    windows: list[dict] = []
+    for i in range(n_base):
+        tf_data = {}
+        ok = True
+        for tf in active_tfs:
+            seq_len = seq_lens[tf]
+            end     = i + 1 if tf == base_tf else int(alignments[tf][i])
+            start   = max(0, end - seq_len)
+            chunk   = features[tf][start:end].astype(np.float32)
+            if len(chunk) < seq_len:
+                ok = False
+                break
+            tf_data[tf] = chunk
+        if not ok:
+            continue
+        windows.append({
+            'symbol':             symbol,
+            'tf_data':            tf_data,
+            'future_closes':      np.zeros(n_horizons, dtype=np.float32),
+            'future_close_times': np.zeros(n_horizons, dtype=np.int64),
+            'future_highs':       np.zeros(n_horizons, dtype=np.float32),
+            'future_lows':        np.zeros(n_horizons, dtype=np.float32),
+            'current_close':      float(base_closes[i]),
+            'current_close_time': int(base_close_times[i]),
+        })
+    return windows
+
+
 def build_all_windows(symbol: str, raw: dict, config: dict,
                       hist_days_back: int = HIST_ANCHOR_DAYS_BACK
                       ) -> tuple[list[dict], int]:

@@ -19,6 +19,7 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 from model.network import TradingDQN
 from config import load_config
+from quantilenet import QuantileFeatureLoader
 from utils.metrics import (
     sharpe_ratio, max_drawdown, win_rate,
     profit_factor, avg_win_loss, max_consecutive_losses,
@@ -430,7 +431,15 @@ def predict(model: TradingDQN, state_dict: dict, action_mask: list,
         tensors.append(torch.tensor(arr, dtype=torch.float32).unsqueeze(0).to(device))
 
     mask = torch.tensor([action_mask], dtype=torch.float32).to(device)
-    pos_tensor = torch.tensor([position_features], dtype=torch.float32).to(device) if position_features is not None else None
+    pos_tensor = None
+    if position_features is not None:
+        # Pad to the network's expected position dim (10 base + quantile features).
+        # Backtest doesn't yet feed prerolled quantiles — extra slots are zeros.
+        target_dim = getattr(model, 'position_dim', len(position_features))
+        padded = list(position_features)[:target_dim]
+        if len(padded) < target_dim:
+            padded.extend([0.0] * (target_dim - len(padded)))
+        pos_tensor = torch.tensor([padded], dtype=torch.float32).to(device)
     q = model(tensors, action_mask=mask, position_features=pos_tensor)
     return q.argmax(dim=1).item()
 
@@ -530,7 +539,8 @@ def _fmt_time(ms: int) -> str:
 
 
 def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: str,
-                        last_n: int | None = None) -> dict:
+                        last_n: int | None = None,
+                        qloader: QuantileFeatureLoader | None = None) -> dict:
     """Sequential OOS backtest for one symbol. Uses _DATA_CACHE when available."""
     key = _cache_key(symbol, config)
     cached = _DATA_CACHE.get(key)
@@ -615,7 +625,14 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
 
         state = build_state_fast(precomp, abs_idx, config)
         mask = action_mask_for(position)
-        action = predict(model, state, mask, config, device, position_features=pos_feat)
+        # Inject prerolled QuantileNet features for this (symbol, close_time_ms).
+        # Loader misses fall back to zeros — same shape as without preroll.
+        if qloader is not None:
+            q_feats = qloader.lookup(symbol, t_ms)
+            pos_feat_full = list(pos_feat) + [float(x) for x in q_feats]
+        else:
+            pos_feat_full = pos_feat
+        action = predict(model, state, mask, config, device, position_features=pos_feat_full)
 
         if action == ACTION_LONG and position is None:
             if hold_minutes:
@@ -746,6 +763,8 @@ def main():
     print(f"[Backtest] Model: {model_path}")
     model = load_model(model_path, config, args.device)
 
+    qloader = QuantileFeatureLoader(config)
+
     try:
         raw = input("\nHow many most recent 1m candles to test? (Enter = all OOS): ").strip()
         last_n = int(raw) if raw else None
@@ -761,7 +780,7 @@ def main():
 
     for symbol in symbols:
         print(f"\n[Backtest] ── {symbol} ──")
-        res = run_symbol_backtest(symbol, config, model, args.device, last_n=last_n)
+        res = run_symbol_backtest(symbol, config, model, args.device, last_n=last_n, qloader=qloader)
         m = calc_metrics(res['trades'], res['equity_curve'], res['daily_pnl'])
         per_symbol[symbol] = {**m, 'equity_curve': res['equity_curve']}
         all_trades.extend(res['trades'])

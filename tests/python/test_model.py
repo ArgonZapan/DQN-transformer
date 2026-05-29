@@ -1,19 +1,31 @@
+"""Model tests for the current TradingDQN architecture.
+
+Architecture notes that shaped these tests:
+- Conv1DBlock keeps the full causal sequence ([B, T, filters]); GAP happens
+  later, after the Transformer.
+- The position branch is only exercised when ``position_features`` is supplied;
+  otherwise a zero vector bypasses ``pos_fc`` (so it receives no gradient).
+- The position vector is ``model.position_dim`` wide (10 base + quantile slots).
+"""
+
 import os
 import sys
+
 import pytest
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'python'))
 
-from config import load_config
-from model.network import TradingDQN, Conv1DBlock, TransformerEncoderBlock
-from model.noisy_linear import NoisyLinear
+from config import load_config  # noqa: E402
+from model.network import TradingDQN, Conv1DBlock, TransformerEncoderBlock  # noqa: E402
+from model.noisy_linear import NoisyLinear  # noqa: E402
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'config.toml')
 
 
 @pytest.fixture
 def config():
-    config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config.toml')
-    return load_config(config_path)
+    return load_config(CONFIG_PATH)
 
 
 @pytest.fixture
@@ -21,99 +33,83 @@ def model(config):
     return TradingDQN(config)
 
 
+def enabled_timeframes(config):
+    return [k for k, v in config['timeframes'].items() if v > 0]
+
+
 def make_dummy_states(config, batch_size=4):
-    tf_cfg = config['timeframes']
     num_features = config['features']['num_features']
     states = {}
-    for key in sorted(tf_cfg.keys()):
-        seq_len = tf_cfg[key]
-        states[key] = torch.randn(batch_size, seq_len, num_features)
+    for key in enabled_timeframes(config):
+        states[key] = torch.randn(batch_size, config['timeframes'][key], num_features)
     return states
 
 
 class TestConv1DBlock:
-    def test_output_shape(self):
-        block = Conv1DBlock(num_features=8, conv_filters=128, kernel_size=3, dropout=0.1)
+    def test_keeps_sequence(self):
+        block = Conv1DBlock(num_features=8, conv_filters=64, kernel_size=3, dropout=0.1)
         x = torch.randn(4, 15, 8)
         out = block(x)
-        assert out.shape == (4, 128)
+        assert out.shape == (4, 15, 64)  # causal conv preserves length, no GAP
 
     def test_different_seq_lengths(self):
-        block = Conv1DBlock(num_features=8, conv_filters=128, kernel_size=3, dropout=0.1)
-        for seq_len in [15, 20, 30, 54]:
-            x = torch.randn(2, seq_len, 8)
-            out = block(x)
-            assert out.shape == (2, 128)
+        block = Conv1DBlock(num_features=8, conv_filters=64, kernel_size=3, dropout=0.1)
+        for seq_len in [14, 32, 48, 60]:
+            out = block(torch.randn(2, seq_len, 8))
+            assert out.shape == (2, seq_len, 64)
 
 
 class TestTransformerBlock:
     def test_output_shape(self):
-        block = TransformerEncoderBlock(d_model=128, n_heads=8, ff_dim=512, dropout=0.1)
-        x = torch.randn(4, 5, 128)
-        out = block(x)
-        assert out.shape == (4, 5, 128)
-
-    def test_residual_connection(self):
-        block = TransformerEncoderBlock(d_model=128, n_heads=8, ff_dim=512, dropout=0.0)
-        block.eval()
-        x = torch.randn(1, 5, 128)
-        out = block(x)
-        assert out.shape == x.shape
+        block = TransformerEncoderBlock(d_model=64, n_heads=4, ff_dim=128, dropout=0.1)
+        x = torch.randn(4, 7, 64)
+        assert block(x).shape == (4, 7, 64)
 
 
 class TestTradingDQN:
     def test_output_shape(self, config, model):
         model.eval()
-        batch_size = 4
-        states = make_dummy_states(config, batch_size)
-        q_values = model(states)
-        assert q_values.shape == (batch_size, config['model']['num_actions'])
+        q = model(make_dummy_states(config, 4))
+        assert q.shape == (4, config['model']['num_actions'])
 
     def test_output_shape_list_input(self, config, model):
         model.eval()
-        batch_size = 2
-        tf_cfg = config['timeframes']
         num_features = config['features']['num_features']
-        states = []
-        for key in sorted(tf_cfg.keys()):
-            seq_len = tf_cfg[key]
-            states.append(torch.randn(batch_size, seq_len, num_features))
-        q_values = model(states)
-        assert q_values.shape == (batch_size, config['model']['num_actions'])
+        states = [torch.randn(2, config['timeframes'][k], num_features)
+                  for k in enabled_timeframes(config)]
+        q = model(states)
+        assert q.shape == (2, config['model']['num_actions'])
 
-    def test_action_mask(self, config, model):
+    def test_action_mask_blocks_actions(self, config, model):
         model.eval()
-        batch_size = 2
-        states = make_dummy_states(config, batch_size)
+        states = make_dummy_states(config, 2)
         mask = torch.tensor([[1, 1, 1, 0], [0, 0, 1, 1]], dtype=torch.float32)
-        q_values = model(states, action_mask=mask)
-        assert q_values[0, 3] == float('-inf')
-        assert q_values[1, 0] == float('-inf')
-        assert q_values[1, 1] == float('-inf')
+        q = model(states, action_mask=mask)
+        assert q[0, 3] == float('-inf')
+        assert q[1, 0] == float('-inf')
+        assert q[1, 1] == float('-inf')
 
-    def test_confidence_score(self, config, model):
+    def test_position_features_shape(self, config, model):
         model.eval()
-        states = make_dummy_states(config, batch_size=4)
-        q_values = model(states)
-        confidence = model.get_confidence(q_values)
-        assert confidence.shape == (4,)
-        assert (confidence >= 0).all()
-        assert (confidence <= 1).all()
+        states = make_dummy_states(config, 3)
+        pos = torch.randn(3, model.position_dim)
+        q = model(states, position_features=pos)
+        assert q.shape == (3, config['model']['num_actions'])
 
     def test_no_transformer(self, config):
-        config_copy = {k: dict(v) if isinstance(v, dict) else v for k, v in config.items()}
-        config_copy['model'] = dict(config['model'])
-        config_copy['model']['n_transformer_blocks'] = 0
-        model = TradingDQN(config_copy)
-        model.eval()
-        states = make_dummy_states(config_copy, batch_size=2)
-        q_values = model(states)
-        assert q_values.shape == (2, config_copy['model']['num_actions'])
+        cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in config.items()}
+        cfg['model'] = dict(config['model'])
+        cfg['model']['n_transformer_blocks'] = 0
+        m = TradingDQN(cfg)
+        m.eval()
+        q = m(make_dummy_states(cfg, 2))
+        assert q.shape == (2, cfg['model']['num_actions'])
 
     def test_gradient_flow(self, config, model):
-        states = make_dummy_states(config, batch_size=4)
-        q_values = model(states)
-        loss = q_values.sum()
+        model.train()
+        states = make_dummy_states(config, 4)
+        pos = torch.randn(4, model.position_dim)  # exercise the pos_fc branch too
+        loss = model(states, position_features=pos).sum()
         loss.backward()
         for name, param in model.named_parameters():
             if param.requires_grad:
@@ -123,11 +119,9 @@ class TestTradingDQN:
 class TestNoisyLinear:
     def test_output_shape(self):
         layer = NoisyLinear(64, 32)
-        x = torch.randn(4, 64)
-        out = layer(x)
-        assert out.shape == (4, 32)
+        assert layer(torch.randn(4, 64)).shape == (4, 32)
 
-    def test_noise_changes_output(self):
+    def test_noise_changes_output_in_train(self):
         layer = NoisyLinear(64, 32)
         layer.train()
         x = torch.randn(1, 64)
@@ -136,7 +130,7 @@ class TestNoisyLinear:
         out2 = layer(x).detach()
         assert not torch.allclose(out1, out2)
 
-    def test_eval_mode_no_noise(self):
+    def test_eval_mode_is_deterministic(self):
         layer = NoisyLinear(64, 32)
         layer.eval()
         x = torch.randn(1, 64)

@@ -172,7 +172,7 @@ export function LineChart({ width = 480, height = 180, points = [], color = '#22
 }
 
 // ── Histogram ───────────────────────────────────────────────────────────────
-export function Histogram({ width = 480, height = 180, values = [], bins = 12 }) {
+export function Histogram({ width = 480, height = 180, values = [], bins = 12, logY = false }) {
   const stats = useMemo(() => {
     if (!values.length) return null;
     const min = Math.min(...values);
@@ -191,11 +191,17 @@ export function Histogram({ width = 480, height = 180, values = [], bins = 12 })
   const H = height - pad.t - pad.b;
   const slot = W / bins;
   const yMax = Math.max(...stats.counts) || 1;
-  const yOf = v => pad.t + H - (v / yMax) * H;
+  // log1p compresses tall bars while keeping zero at zero (log(1+0)=0).
+  const scale = v => (logY ? Math.log1p(v) : v);
+  const sMax = scale(yMax) || 1;
+  const yOf = v => pad.t + H - (scale(v) / sMax) * H;
+  const ticks = logY
+    ? [0, 1, 10, 100, 1000].filter(t => t <= yMax).concat(yMax > 1 ? [yMax] : [])
+    : [0, yMax / 2, yMax];
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" style={{ width: '100%', height }}>
-      {[0, yMax / 2, yMax].map((t, i) => (
+      {ticks.map((t, i) => (
         <g key={i}>
           <line x1={pad.l} x2={pad.l + W} y1={yOf(t)} y2={yOf(t)} stroke={GRID} strokeWidth={1} />
           <text x={pad.l - 4} y={yOf(t) + 3} textAnchor="end" fontSize={9} fill={AXIS} fontFamily={FONT}>{Math.round(t)}</text>

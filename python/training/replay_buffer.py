@@ -1,6 +1,32 @@
 import torch
 import numpy as np
 
+from quantilenet import POSITION_BASE_DIM, extended_position_dim
+
+
+def _extract_pos_vector(state, total_dim: int, quantile_dim: int) -> np.ndarray:
+    """Build the [position(10) || quantile_features(quantile_dim)] vector from a state dict.
+
+    Missing components fall back to zeros — the network sees the same shape
+    regardless of whether the actor sent quantile features or whether the
+    QuantileNet loader is enabled.
+    """
+    out = np.zeros(total_dim, dtype=np.float32)
+    if not isinstance(state, dict):
+        return out
+    p = state.get('position')
+    if p is not None:
+        arr = np.asarray(p, dtype=np.float32)
+        n = min(len(arr), POSITION_BASE_DIM)
+        out[:n] = arr[:n]
+    if quantile_dim > 0:
+        q = state.get('quantile_features')
+        if q is not None:
+            arr = np.asarray(q, dtype=np.float32)
+            n = min(len(arr), quantile_dim)
+            out[POSITION_BASE_DIM:POSITION_BASE_DIM + n] = arr[:n]
+    return out
+
 
 class ReplayBuffer:
     """
@@ -34,8 +60,13 @@ class ReplayBuffer:
         self.rewards = pin(torch.zeros(self.capacity, dtype=torch.float32))
         self.dones = pin(torch.zeros(self.capacity, dtype=torch.float32))
         self.action_masks = pin(torch.zeros(self.capacity, self.num_actions, dtype=torch.float32))
-        self.pos_features      = pin(torch.zeros(self.capacity, 10, dtype=torch.float32))
-        self.next_pos_features = pin(torch.zeros(self.capacity, 10, dtype=torch.float32))
+
+        # pos_features = base position vector (10) || prerolled quantile features (0 or N).
+        # Total dim derived from config so the network and buffer stay in sync.
+        self.pos_dim = extended_position_dim(config)
+        self.quantile_dim = self.pos_dim - POSITION_BASE_DIM
+        self.pos_features      = pin(torch.zeros(self.capacity, self.pos_dim, dtype=torch.float32))
+        self.next_pos_features = pin(torch.zeros(self.capacity, self.pos_dim, dtype=torch.float32))
 
         self.position = 0
         self.size = 0
@@ -81,23 +112,10 @@ class ReplayBuffer:
         else:
             self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
 
-        pf = state.get('position') if isinstance(state, dict) else None
-        if pf is not None:
-            arr = torch.zeros(10, dtype=torch.float32)
-            src = torch.tensor(pf[:10], dtype=torch.float32)
-            arr[:src.shape[0]] = src
-            self.pos_features[idx] = arr
-        else:
-            self.pos_features[idx] = torch.zeros(10, dtype=torch.float32)
-
-        npf = next_state.get('position') if isinstance(next_state, dict) else None
-        if npf is not None:
-            arr = torch.zeros(10, dtype=torch.float32)
-            src = torch.tensor(npf[:10], dtype=torch.float32)
-            arr[:src.shape[0]] = src
-            self.next_pos_features[idx] = arr
-        else:
-            self.next_pos_features[idx] = torch.zeros(10, dtype=torch.float32)
+        self.pos_features[idx] = torch.from_numpy(
+            _extract_pos_vector(state, self.pos_dim, self.quantile_dim))
+        self.next_pos_features[idx] = torch.from_numpy(
+            _extract_pos_vector(next_state, self.pos_dim, self.quantile_dim))
 
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -145,17 +163,11 @@ class ReplayBuffer:
                     masks[i] = arr
         self.action_masks[positions] = torch.from_numpy(masks)
 
-        pf = np.zeros((n, 10), dtype=np.float32)
-        npf = np.zeros((n, 10), dtype=np.float32)
+        pf = np.zeros((n, self.pos_dim), dtype=np.float32)
+        npf = np.zeros((n, self.pos_dim), dtype=np.float32)
         for i, (state, _, _, next_state, _, _) in enumerate(experiences):
-            p = state.get('position') if isinstance(state, dict) else None
-            if p is not None:
-                arr = np.asarray(p[:10], dtype=np.float32)
-                pf[i, :arr.shape[0]] = arr
-            next_pos = next_state.get('position') if isinstance(next_state, dict) else None
-            if next_pos is not None:
-                arr = np.asarray(next_pos[:10], dtype=np.float32)
-                npf[i, :arr.shape[0]] = arr
+            pf[i] = _extract_pos_vector(state, self.pos_dim, self.quantile_dim)
+            npf[i] = _extract_pos_vector(next_state, self.pos_dim, self.quantile_dim)
         self.pos_features[positions] = torch.from_numpy(pf)
         self.next_pos_features[positions] = torch.from_numpy(npf)
 
@@ -266,7 +278,17 @@ class ReplayBuffer:
         self.rewards[:n] = state['rewards'][:n]
         self.dones[:n] = state['dones'][:n]
         self.action_masks[:n] = state['action_masks'][:n]
+        # Backward-compat: old checkpoints stored 10-D pos_features. New
+        # buffer is wider (10 + quantile_dim) — pad with zeros and warn.
+        def _restore_pos(target: torch.Tensor, saved: torch.Tensor) -> None:
+            sd = saved.shape[1] if saved.ndim == 2 else 0
+            td = target.shape[1]
+            cols = min(sd, td)
+            target[:n, :cols] = saved[:n, :cols]
+            if sd < td:
+                target[:n, sd:] = 0.0
+
         if 'pos_features' in state:
-            self.pos_features[:n] = state['pos_features'][:n]
+            _restore_pos(self.pos_features, state['pos_features'])
         if 'next_pos_features' in state:
-            self.next_pos_features[:n] = state['next_pos_features'][:n]
+            _restore_pos(self.next_pos_features, state['next_pos_features'])

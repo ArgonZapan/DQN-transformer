@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 # Defaults — overridden by [backtest] section of config.toml.
 _BACKTEST_DEFAULTS = {
+    'strategy':           'ev_threshold',
+    'asymmetry_ratio':    1.5,
     'commission':         0.00075,
     'slippage_bps':       1.0,
     'min_trades_valid':   20,
@@ -276,14 +278,20 @@ def run_inference(model: QuantileNet, windows: list, config: dict,
                 loader_workers = min(8, os.cpu_count() or 1)
             else:
                 loader_workers = max(1, min(4, os.cpu_count() or 1))
-    loader      = DataLoader(dataset, batch_size=256, shuffle=False,
+    # `persistent_workers=False` — backtest iterates the loader exactly once,
+    # so persistent workers add no benefit and on Windows (spawn) leave 8
+    # processes pinning a fork-copy of `windows` until GC eventually triggers.
+    # When called repeatedly from per-epoch backtest, that pile-up was a real
+    # RAM peak.
+    infer_bs = int(train_cfg.get('inference_batch_size', 256))
+    loader   = DataLoader(dataset, batch_size=infer_bs, shuffle=False,
                              collate_fn=collate_fn,
                              num_workers=loader_workers,
                              pin_memory=device.type == 'cuda',
-                             persistent_workers=loader_workers > 0)
+                             persistent_workers=False)
 
     logger.info(
-        f'[Backtest] Inference loader: batch_size=256 num_workers={loader_workers} '
+        f'[Backtest] Inference loader: batch_size={infer_bs} num_workers={loader_workers} '
         f'device={device.type}'
     )
 
@@ -467,6 +475,113 @@ def _timeline_stats(trades: list[dict]) -> tuple[float, float, float, float, flo
     return wins, avg, float(total), sharpe, sqn, max_dd, tp_rate, sl_rate, hz_rate
 
 
+def compute_q_score(rows: list[dict], test_start_ms: int, test_end_ms: int) -> dict:
+    """Compute Q-score for a family of strategy parameterizations.
+
+    Q = clip(Y³ × min(√freq, 10) × tanh(mean_Sharpe), -10, 10)
+
+    Y          — fraction of combos with total_return > 0
+    freq       — mean_N_tx × 3 / period_months  (saturates: √100 = 10)
+    mean_Sharpe — mean Sharpe across all combos (tanh-dampened)
+    """
+    if not rows:
+        return {'q_score': 0.0, 'Y': 0.0, 'freq': 0.0, 'mean_sharpe': 0.0,
+                'mean_n_trades': 0.0, 'period_months': 0.0, 'n_combos': 0}
+
+    ms_per_month  = 30.4375 * 24 * 3600 * 1000
+    period_months = max((test_end_ms - test_start_ms) / ms_per_month, 1e-6)
+
+    Y            = float(sum(1 for r in rows if r['total'] > 0) / len(rows))
+    mean_n_tx    = float(np.mean([r['n_trades'] for r in rows]))
+    freq         = mean_n_tx * 3.0 / period_months
+    mean_sharpe  = float(np.mean([r['sharpe'] for r in rows]))
+
+    freq_factor  = min(float(np.sqrt(freq)), 10.0)
+    sharpe_factor = float(np.tanh(mean_sharpe))
+    raw          = (Y ** 3) * freq_factor * sharpe_factor
+    q_score      = float(np.clip(raw, -10.0, 10.0))
+
+    return {
+        'q_score':      q_score,
+        'Y':            Y,
+        'freq':         freq,
+        'freq_factor':  freq_factor,
+        'mean_sharpe':  mean_sharpe,
+        'mean_n_trades': mean_n_tx,
+        'period_months': period_months,
+        'n_combos':     len(rows),
+    }
+
+
+def print_q_score_report(qs: dict, label: str = ''):
+    """Print a formatted Q-score summary."""
+    tag = f' [{label}]' if label else ''
+    bar_len = max(0, min(40, int(round((qs['q_score'] + 10) / 20 * 40))))
+    bar = '#' * bar_len + '.' * (40 - bar_len)
+    print(f'\n{"=" * 70}')
+    print(f'Q-SCORE{tag}')
+    print(f'{"=" * 70}')
+    print(f'  Q = {qs["q_score"]:+.3f}  [{bar}]  (range -10 … +10)')
+    print(f'  Y (profitable combos) : {qs["Y"] * 100:.1f}%  of {qs["n_combos"]} combos  →  Y³ = {qs["Y"]**3:.4f}')
+    print(f'  freq                  : {qs["freq"]:.1f} tx/3mo  →  √freq factor = {qs["freq_factor"]:.2f} (cap 10)')
+    print(f'  mean Sharpe           : {qs["mean_sharpe"]:.3f}  →  tanh = {np.tanh(qs["mean_sharpe"]):.4f}')
+    print(f'  period                : {qs["period_months"]:.1f} months  |  mean trades/combo = {qs["mean_n_trades"]:.0f}')
+    print(f'{"=" * 70}')
+
+
+def _simulate_exit(
+    trade_dir: int,
+    entry_px: float,
+    tp_pct: float,
+    sl_pct: float,
+    h_time: int,
+    h_close: float,
+    start: int,
+    o_times: np.ndarray,
+    o_highs: np.ndarray,
+    o_lows: np.ndarray,
+    cost: float,
+    sl_first_on_tie: bool,
+) -> tuple[str, int, float]:
+    """Walk forward bar-by-bar from `start` until h_time, deciding TP/SL/horizon exit.
+
+    Returns (exit_type, exit_time_ms, return_after_cost).
+    """
+    tp_mult = tp_pct / 100.0
+    sl_mult = sl_pct / 100.0
+    end = int(np.searchsorted(o_times, h_time, side='right'))
+
+    if end > start:
+        highs = o_highs[start:end]
+        lows  = o_lows[start:end]
+        if trade_dir > 0:  # long
+            sl_lvl = entry_px * (1.0 - sl_mult)
+            tp_lvl = entry_px * (1.0 + tp_mult)
+            sl_hits = lows  <= sl_lvl
+            tp_hits = highs >= tp_lvl
+        else:  # short
+            sl_lvl = entry_px * (1.0 + sl_mult)
+            tp_lvl = entry_px * (1.0 - tp_mult)
+            sl_hits = highs >= sl_lvl
+            tp_hits = lows  <= tp_lvl
+
+        sl_any = sl_hits.any()
+        tp_any = tp_hits.any()
+        sl_i = int(sl_hits.argmax()) if sl_any else -1
+        tp_i = int(tp_hits.argmax()) if tp_any else -1
+        sl_wins = sl_any and (not tp_any
+                              or (sl_i < tp_i)
+                              or (sl_i == tp_i and sl_first_on_tie))
+        if sl_wins:
+            return 'sl', int(o_times[start + sl_i]), -sl_mult - cost
+        if tp_any:
+            return 'tp', int(o_times[start + tp_i]), tp_mult - cost
+
+    ret = ((h_close - entry_px) / entry_px if trade_dir > 0
+           else (entry_px - h_close) / entry_px) - cost
+    return 'hz', int(h_time), ret
+
+
 def _collect_ev_based_trades(
     sd: dict,
     hi: int,
@@ -545,54 +660,11 @@ def _collect_ev_based_trades(
         sl_pct = min(max(sl_pct, sl_min), sl_max)
         tp_pct = min(tp_pct, tp_max)
 
-        tp_mult = tp_pct / 100.0
-        sl_mult = sl_pct / 100.0
-
         start = int(entry_idx_all[idx])
-        end = int(np.searchsorted(o_times, h_time, side='right'))
-
-        if end > start:
-            highs = o_highs[start:end]
-            lows = o_lows[start:end]
-            if trade_dir > 0:  # long
-                sl_lvl = entry_px * (1.0 - sl_mult)
-                tp_lvl = entry_px * (1.0 + tp_mult)
-                sl_hits = lows <= sl_lvl
-                tp_hits = highs >= tp_lvl
-            else:  # short
-                sl_lvl = entry_px * (1.0 + sl_mult)
-                tp_lvl = entry_px * (1.0 - tp_mult)
-                sl_hits = highs >= sl_lvl
-                tp_hits = lows <= tp_lvl
-
-            sl_any = sl_hits.any()
-            tp_any = tp_hits.any()
-            sl_i = int(sl_hits.argmax()) if sl_any else -1
-            tp_i = int(tp_hits.argmax()) if tp_any else -1
-
-            # Same-bar tie: sl wins if pessimistic (default), tp wins if optimistic
-            sl_wins = sl_any and (not tp_any
-                                  or (sl_i < tp_i)
-                                  or (sl_i == tp_i and sl_first_on_tie))
-
-            if sl_wins:
-                exit_type = 'sl'
-                exit_t = int(o_times[start + sl_i])
-                ret = -sl_mult - cost
-            elif tp_any:
-                exit_type = 'tp'
-                exit_t = int(o_times[start + tp_i])
-                ret = tp_mult - cost
-            else:
-                exit_type = 'hz'
-                exit_t = int(h_time)
-                ret = ((h_close - entry_px) / entry_px if trade_dir > 0
-                       else (entry_px - h_close) / entry_px) - cost
-        else:
-            exit_type = 'hz'
-            exit_t = int(h_time)
-            ret = ((h_close - entry_px) / entry_px if trade_dir > 0
-                   else (entry_px - h_close) / entry_px) - cost
+        exit_type, exit_t, ret = _simulate_exit(
+            trade_dir, entry_px, tp_pct, sl_pct, h_time, h_close,
+            start, o_times, o_highs, o_lows, cost, sl_first_on_tie,
+        )
 
         trades.append({
             'symbol':     sd['symbol'],
@@ -698,6 +770,162 @@ def _simulate_combo_ev(
     }
 
 
+def _collect_quantile_asymmetry_trades(
+    sd: dict,
+    hi: int,
+    q_idx: int,
+    asymmetry_ratio: float,
+    direction: str,
+    pred_quantile: np.ndarray,
+    bt_cfg: dict,
+) -> list[dict]:
+    """Quantile-asymmetry strategy.
+
+    For the given quantile q (q_idx), compare predicted up-excursion (MFE) and
+    down-excursion (MAE):
+      - if up >= ratio * down → LONG: TP=up (farther), SL=down (nearer)
+      - if down >= ratio * up → SHORT: TP=down (farther), SL=up (nearer)
+      - else                  → no trade
+    `direction` filter: 'long' / 'short' / 'both' restricts which side may fire.
+    """
+    pred_q          = pred_quantile      # [N, H, n_quantiles, D]
+    current_times   = sd['current_times']
+    entry_prices    = sd['entry_prices']
+    horizon_times   = sd['horizon_times']
+    horizon_closes  = sd['horizon_closes']
+    entry_idx_all   = sd['entry_idx']
+    o_times         = sd['ohlcv_times']
+    o_highs         = sd['ohlcv_highs']
+    o_lows          = sd['ohlcv_lows']
+
+    up_q   = pred_q[:, hi, q_idx, 0]   # MFE (up), positive %
+    down_q = pred_q[:, hi, q_idx, 1]   # MAE (down), positive %
+
+    # ratio >= 1 → mutually exclusive by construction; require both sides to
+    # be non-degenerate so we don't fire on (0, 0) noise.
+    valid = np.maximum(up_q, down_q) > 1e-9
+    long_mask  = valid & (up_q   >= asymmetry_ratio * down_q) & (up_q   > down_q)
+    short_mask = valid & (down_q >= asymmetry_ratio * up_q  ) & (down_q > up_q)
+
+    if direction == 'long':
+        short_mask[:] = False
+    elif direction == 'short':
+        long_mask[:] = False
+
+    signal_mask = long_mask | short_mask
+    dirs_all = np.where(long_mask, 1, np.where(short_mask, -1, 0)).astype(np.int8)
+
+    sig_indices = np.nonzero(signal_mask)[0]
+    if sig_indices.size == 0:
+        return []
+
+    commission       = float(bt_cfg['commission'])
+    slippage         = float(bt_cfg['slippage_bps']) / 10000.0
+    cost             = 2.0 * (commission + slippage)
+    sl_min           = float(bt_cfg['sl_min_pct'])
+    tp_max           = float(bt_cfg['tp_max_pct'])
+    sl_max           = float(bt_cfg['sl_max_pct'])
+    sequential_lock  = bool(bt_cfg['sequential_lock'])
+    same_bar_pri     = str(bt_cfg['same_bar_priority']).lower()
+    sl_first_on_tie  = same_bar_pri != 'tp'
+
+    trades: list[dict] = []
+    next_entry_time = -1
+
+    for idx in sig_indices:
+        ct = current_times[idx]
+        if sequential_lock and ct < next_entry_time:
+            continue
+        trade_dir = int(dirs_all[idx])
+        entry_px  = entry_prices[idx]
+        h_time    = horizon_times[idx, hi]
+        h_close   = horizon_closes[idx, hi]
+
+        u = float(up_q[idx])   * 100.0
+        d = float(down_q[idx]) * 100.0
+        if trade_dir > 0:   # long: TP=up (farther), SL=down (nearer)
+            tp_pct, sl_pct = u, d
+        else:               # short: TP=down (farther), SL=up (nearer)
+            tp_pct, sl_pct = d, u
+
+        sl_pct = min(max(sl_pct, sl_min), sl_max)
+        tp_pct = min(tp_pct, tp_max)
+
+        start = int(entry_idx_all[idx])
+        exit_type, exit_t, ret = _simulate_exit(
+            trade_dir, entry_px, tp_pct, sl_pct, h_time, h_close,
+            start, o_times, o_highs, o_lows, cost, sl_first_on_tie,
+        )
+
+        trades.append({
+            'symbol':     sd['symbol'],
+            'entry_time': int(ct),
+            'exit_time':  exit_t,
+            'return':     float(ret),
+            'exit_type':  exit_type,
+            'tp_pct':     float(tp_pct),
+            'sl_pct':     float(sl_pct),
+        })
+        next_entry_time = exit_t
+
+    return trades
+
+
+def _simulate_combo_quantile_asymmetry(
+    sd: dict,
+    symbol: str,
+    hi: int,
+    q_idx: int,
+    quantile_value: float,
+    asymmetry_ratio: float,
+    direction: str,
+    horizon_hours: float,
+    pred_quantile: np.ndarray,
+    bt_cfg: dict,
+) -> dict | None:
+    trades = _collect_quantile_asymmetry_trades(
+        sd, hi, q_idx, asymmetry_ratio, direction, pred_quantile, bt_cfg,
+    )
+    metrics = _compute_combo_metrics(trades)
+    if metrics is None:
+        return None
+
+    return {
+        'symbol':          symbol,
+        'horizon':         horizon_hours,
+        'quantile':        quantile_value,
+        'asymmetry_ratio': asymmetry_ratio,
+        'direction':       direction,
+        **metrics,
+        'trades':          trades,
+    }
+
+
+def _print_top100_quantile_asymmetry(rows: list[dict], title: str, min_trades_valid: int) -> list[dict]:
+    any_valid = any(r['n_trades'] >= min_trades_valid for r in rows)
+    display   = [r for r in rows if r['n_trades'] >= min_trades_valid] if any_valid else rows
+    top100    = sorted(display, key=lambda r: r['sqn'], reverse=True)[:100]
+
+    print(f'\n{"=" * 122}')
+    print(f'{title}')
+    print(f'{"=" * 122}')
+    print(f'{"#":>3} {"Symbol":>8} {"H":>5} {"Q":>5} {"Dir":>5} {"N":>6} {"P(Win)":>7} {"Avg+%":>7} {"Avg-%":>7} '
+          f'{"Total%":>8} {"Sharpe":>7} {"SQN":>7} {"EV%":>7} {"Kelly":>7} {"TP%":>5} {"SL%":>5}')
+    print('-' * 122)
+
+    for rank, row in enumerate(top100, 1):
+        low_flag = ' *' if row['n_trades'] < min_trades_valid else '  '
+        print(
+            f'{rank:>3} {row["symbol"]:>8} {row["horizon"]:>4}h {row["quantile"]:>4.2f} '
+            f'{row["direction"]:>5} {row["n_trades"]:>5}{low_flag} '
+            f'{row["p_win"] * 100:>6.1f}% {row["avg_win"]:>6.2f}% {row["avg_loss"]:>6.2f}% '
+            f'{row["total_return"]:>7.2f}% {row["sharpe"]:>7.2f} {row["sqn"]:>7.2f} '
+            f'{row["ev"]:>6.2f}% {row["kelly"]:>6.3f} '
+            f'{row["tp_pct"]:>4.1f}% {row["sl_pct"]:>4.1f}%'
+        )
+    return top100
+
+
 def _print_top100_ev(rows: list[dict], title: str, min_trades_valid: int) -> list[dict]:
     """Print top 100 by SQN across all symbols."""
     any_valid = any(r['n_trades'] >= min_trades_valid for r in rows)
@@ -725,27 +953,68 @@ def _print_top100_ev(rows: list[dict], title: str, min_trades_valid: int) -> lis
     return top100
 
 
-def brute_force_tp_sl_top20(
-    results: dict,
+def _build_sym_data(
+    symbols: list[str],
     windows: list,
-    config: dict,
+    pred_threshold: np.ndarray | None,
+    pred_quantile: np.ndarray | None,
     ohlcv_by_symbol: dict[str, dict],
     base_tf_min: int,
+) -> dict[str, dict]:
+    """Build per-symbol precomputed arrays. Windows sorted by entry time so
+    the sequential lock in the inner loop sees true chronological order."""
+    step_ms = base_tf_min * 60_000
+    sym_data: dict[str, dict] = {}
+    for sym in symbols:
+        sym_idx = [i for i, w in enumerate(windows) if w['symbol'] == sym]
+        sym_windows = [windows[i] for i in sym_idx]
+        order = sorted(range(len(sym_windows)),
+                       key=lambda k: int(sym_windows[k]['current_close_time']))
+        sym_windows = [sym_windows[k] for k in order]
+        order_arr = np.asarray(order, dtype=np.int64)
+        idx_arr   = np.asarray(sym_idx, dtype=np.int64)
+
+        sym_pred   = pred_threshold[idx_arr][order_arr] if pred_threshold is not None else None
+        sym_pred_q = pred_quantile [idx_arr][order_arr] if pred_quantile  is not None else None
+
+        current_times  = np.asarray([int(w['current_close_time']) for w in sym_windows], dtype=np.int64)
+        entry_prices   = np.asarray([float(w['current_close'])    for w in sym_windows], dtype=np.float64)
+        horizon_times  = np.asarray([w['future_close_times'] for w in sym_windows], dtype=np.int64)
+        horizon_closes = np.asarray([w['future_closes']      for w in sym_windows], dtype=np.float64)
+
+        ohlcv   = ohlcv_by_symbol[sym]
+        o_times = ohlcv['times']
+        entry_idx = np.searchsorted(o_times, current_times + step_ms, side='left').astype(np.int64)
+
+        sym_data[sym] = {
+            'symbol':         sym,
+            'current_times':  current_times,
+            'entry_prices':   entry_prices,
+            'horizon_times':  horizon_times,
+            'horizon_closes': horizon_closes,
+            'pred':           np.ascontiguousarray(sym_pred)   if sym_pred   is not None else None,
+            'pred_q':         np.ascontiguousarray(sym_pred_q) if sym_pred_q is not None else None,
+            'ohlcv_times':    o_times,
+            'ohlcv_highs':    ohlcv['highs'],
+            'ohlcv_lows':     ohlcv['lows'],
+            'entry_idx':      entry_idx,
+        }
+    return sym_data
+
+
+def _run_ev_threshold_strategy(
+    results: dict, windows: list, config: dict,
+    ohlcv_by_symbol: dict, base_tf_min: int, bt_cfg: dict, timer: StageTimer,
 ):
-    """Brute-force every (symbol × horizon × threshold × entry_prob) combination
-    using dynamic TP/SL from quantile predictions. Prints top-100 by SQN.
-
-    Behaviour is configurable via [backtest] in config.toml: commission,
-    slippage, sequential vs parallel entries, same-bar TP/SL priority,
-    SL/TP caps, and which quantile values map to TP/SL.
-    """
     if 'pred_threshold' not in results:
-        print('\n[Backtest] Threshold predictions not available — skipping TP/SL simulation.')
-        return
+        print('\n[Backtest] Threshold predictions not available — ev_threshold strategy needs them.')
+        return None
+    pred_q = results.get('pred_quantile')
+    if pred_q is None:
+        logger.error('[Backtest] Quantile predictions not available for ev_threshold strategy.')
+        return None
 
-    timer      = StageTimer('Backtest')
     pred_cfg   = config['prediction']
-    bt_cfg     = _backtest_cfg(config)
     horizons   = pred_cfg['horizons_hours']
     thresholds = pred_cfg.get('thresholds_pct', [])
     quantiles  = pred_cfg.get('quantiles', [])
@@ -758,13 +1027,12 @@ def brute_force_tp_sl_top20(
         quantiles, float(bt_cfg['tp_quantile']), float(bt_cfg['sl_quantile'])
     )
 
-    pred = results['pred_threshold']   # [N, n_horizons, n_thr, n_dir]
+    pred = results['pred_threshold']
 
     print(f'\nPred threshold stats: min={pred.min():.4f}  max={pred.max():.4f}'
           f'  mean={pred.mean():.4f}  p50={np.median(pred):.4f}'
           f'  p90={np.percentile(pred, 90):.4f}  p95={np.percentile(pred, 95):.4f}')
 
-    # Full percentile sweep — exposes saturation / bimodal distributions.
     pcts = [1, 5, 10, 25, 50, 75, 90, 95, 99]
     pct_vals = [float(np.percentile(pred, p)) for p in pcts]
     print('Pred percentiles ' + '  '.join(f'p{p}={v:.4f}' for p, v in zip(pcts, pct_vals)))
@@ -787,53 +1055,9 @@ def brute_force_tp_sl_top20(
         round(min(p90 + 0.10, 0.99), 2),
     ]))
 
-    # Calculate total combinations for EV-based strategy
     total_combinations = len(horizons) * len(thresholds) * len(entry_probs)
 
-    # EV-based strategy needs quantile predictions
-    pred_q = results.get('pred_quantile')  # [N, n_horizons, n_quantiles, n_dir]
-    if pred_q is None:
-        logger.error('[Backtest] Quantile predictions not available for EV-based strategy.')
-        return
-
-    # Build per-symbol data once (precomputed NumPy arrays for the inner loop).
-    # Windows are sorted by current_close_time so the sequential next_entry_time
-    # lock in the worker reflects the true chronological order.
-    step_ms = base_tf_min * 60_000
-    sym_data: dict[str, dict] = {}
-    for sym in symbols:
-        sym_idx = [i for i, w in enumerate(windows) if w['symbol'] == sym]
-        sym_windows = [windows[i] for i in sym_idx]
-        order = sorted(range(len(sym_windows)),
-                       key=lambda k: int(sym_windows[k]['current_close_time']))
-        sym_windows = [sym_windows[k] for k in order]
-        order_arr   = np.asarray(order, dtype=np.int64)
-        sym_pred    = pred[np.asarray(sym_idx, dtype=np.int64)][order_arr]
-        sym_pred_q_sorted = pred_q[np.asarray(sym_idx, dtype=np.int64)][order_arr] if pred_q is not None else None
-
-        current_times  = np.asarray([int(w['current_close_time']) for w in sym_windows], dtype=np.int64)
-        entry_prices   = np.asarray([float(w['current_close'])    for w in sym_windows], dtype=np.float64)
-        horizon_times  = np.asarray([w['future_close_times'] for w in sym_windows], dtype=np.int64)
-        horizon_closes = np.asarray([w['future_closes']      for w in sym_windows], dtype=np.float64)
-
-        ohlcv = ohlcv_by_symbol[sym]
-        o_times = ohlcv['times']
-        # entry_idx[i] = first OHLCV index strictly after current_time (t = ct + step_ms)
-        entry_idx = np.searchsorted(o_times, current_times + step_ms, side='left').astype(np.int64)
-
-        sym_data[sym] = {
-            'symbol':         sym,
-            'current_times':  current_times,
-            'entry_prices':   entry_prices,
-            'horizon_times':  horizon_times,
-            'horizon_closes': horizon_closes,
-            'pred':           np.ascontiguousarray(sym_pred),
-            'pred_q':         np.ascontiguousarray(sym_pred_q_sorted) if sym_pred_q_sorted is not None else None,
-            'ohlcv_times':    o_times,
-            'ohlcv_highs':    ohlcv['highs'],
-            'ohlcv_lows':     ohlcv['lows'],
-            'entry_idx':      entry_idx,
-        }
+    sym_data = _build_sym_data(symbols, windows, pred, pred_q, ohlcv_by_symbol, base_tf_min)
     timer.checkpoint('prepared per-symbol arrays')
 
     symbol_rows: dict[str, list[dict]] = {sym: [] for sym in symbols}
@@ -858,10 +1082,8 @@ def brute_force_tp_sl_top20(
                     row = _simulate_combo_ev(
                         sd, sym, hi, ti, entry_prob, direction,
                         horizon_h, threshold_t,
-                        sd['pred_q'],   # per-symbol, time-sorted quantile predictions
-                        sd['pred'],     # per-symbol, time-sorted threshold predictions
-                        q_idx_tp, q_idx_sl,
-                        bt_cfg,
+                        sd['pred_q'], sd['pred'],
+                        q_idx_tp, q_idx_sl, bt_cfg,
                     )
                     if row:
                         symbol_rows[sym].append(row)
@@ -879,13 +1101,143 @@ def brute_force_tp_sl_top20(
     timer.checkpoint('aggregated and printed results')
     print(f'\n  * = fewer than {min_trades_valid} trades (statistically low)')
 
+    qs = compute_q_score(all_rows, test_start, test_end)
+    print_q_score_report(qs, label='ALL SYMBOLS · ev_threshold')
+    for sym in symbols:
+        sym_rows = symbol_rows[sym]
+        if sym_rows:
+            qs_sym = compute_q_score(sym_rows, test_start, test_end)
+            print_q_score_report(qs_sym, label=sym)
+
     return all_rows, {
+        'strategy':         'ev_threshold',
         'test_start':       test_start,
         'test_end':         test_end,
         'symbols':          list(symbols),
         'entry_probs':      entry_probs,
         'min_trades_valid': min_trades_valid,
+        'q_score':          qs,
     }
+
+
+def _run_quantile_asymmetry_strategy(
+    results: dict, windows: list, config: dict,
+    ohlcv_by_symbol: dict, base_tf_min: int, bt_cfg: dict, timer: StageTimer,
+):
+    pred_q = results.get('pred_quantile')
+    if pred_q is None:
+        logger.error('[Backtest] Quantile predictions not available — quantile_asymmetry strategy needs them.')
+        return None
+
+    pred_cfg   = config['prediction']
+    horizons   = pred_cfg['horizons_hours']
+    quantiles  = pred_cfg.get('quantiles', [])
+    direction  = pred_cfg['direction']
+    symbols    = sorted({w['symbol'] for w in windows})
+    test_start = min(int(w['current_close_time']) for w in windows)
+    test_end   = max(int(w['future_close_times'][-1]) for w in windows)
+    asymmetry_ratio = float(bt_cfg['asymmetry_ratio'])
+
+    # Brute-force only quantiles >= 0.25; the lower ones are too tight to
+    # produce a meaningful asymmetry signal (and likely always fire).
+    q_grid = [(qi, float(q)) for qi, q in enumerate(quantiles) if float(q) >= 0.25]
+    if not q_grid:
+        logger.error('[Backtest] No quantiles >= 0.25 in config.prediction.quantiles.')
+        return None
+
+    sym_data = _build_sym_data(symbols, windows, None, pred_q, ohlcv_by_symbol, base_tf_min)
+    timer.checkpoint('prepared per-symbol arrays')
+
+    symbol_rows: dict[str, list[dict]] = {sym: [] for sym in symbols}
+    total_combinations = len(horizons) * len(q_grid)
+    total_combos = 0
+
+    print('\n' + '=' * 70)
+    print('QUANTILE-ASYMMETRY STRATEGY — TOP 100 BY SQN')
+    print('=' * 70)
+    print(f'Test range: {_format_ts(test_start)} -> {_format_ts(test_end)} UTC')
+    print(f'Symbols: {", ".join(symbols)}')
+    print(f'Quantile grid: {[q for _, q in q_grid]}')
+    print(f'Asymmetry ratio: {asymmetry_ratio}  direction: {direction}  '
+          f'commission: {bt_cfg["commission"]}  slippage: {bt_cfg["slippage_bps"]}bps')
+    print(f'sequential_lock={bt_cfg["sequential_lock"]}  same_bar_priority={bt_cfg["same_bar_priority"]}')
+
+    for sym in symbols:
+        sd = sym_data[sym]
+        for hi, horizon_h in enumerate(horizons):
+            for q_idx, q_val in q_grid:
+                total_combos += 1
+                row = _simulate_combo_quantile_asymmetry(
+                    sd, sym, hi, q_idx, q_val, asymmetry_ratio, direction,
+                    horizon_h, sd['pred_q'], bt_cfg,
+                )
+                if row:
+                    symbol_rows[sym].append(row)
+
+    timer.checkpoint(f'computed {total_combos} quantile-asymmetry combos')
+
+    all_rows = [row for sym in symbols for row in symbol_rows[sym]]
+    n_with_trades = len(all_rows)
+    print(f'\nCombinations tested: {len(symbols) * total_combinations} total | '
+          f'{n_with_trades} with trades | {len(symbols) * total_combinations - n_with_trades} empty (no signals)')
+
+    min_trades_valid = int(bt_cfg['min_trades_valid'])
+    _print_top100_quantile_asymmetry(
+        all_rows, 'ALL SYMBOLS — QUANTILE-ASYMMETRY STRATEGY TOP 100 BY SQN', min_trades_valid,
+    )
+
+    timer.checkpoint('aggregated and printed results')
+    print(f'\n  * = fewer than {min_trades_valid} trades (statistically low)')
+
+    qs = compute_q_score(all_rows, test_start, test_end)
+    print_q_score_report(qs, label='ALL SYMBOLS · quantile_asymmetry')
+    for sym in symbols:
+        sym_rows = symbol_rows[sym]
+        if sym_rows:
+            qs_sym = compute_q_score(sym_rows, test_start, test_end)
+            print_q_score_report(qs_sym, label=sym)
+
+    return all_rows, {
+        'strategy':         'quantile_asymmetry',
+        'test_start':       test_start,
+        'test_end':         test_end,
+        'symbols':          list(symbols),
+        'asymmetry_ratio':  asymmetry_ratio,
+        'quantile_grid':    [q for _, q in q_grid],
+        'min_trades_valid': min_trades_valid,
+        'q_score':          qs,
+    }
+
+
+def brute_force_tp_sl_top20(
+    results: dict,
+    windows: list,
+    config: dict,
+    ohlcv_by_symbol: dict[str, dict],
+    base_tf_min: int,
+):
+    """Run the strategy selected via [backtest].strategy.
+
+    Dispatches to:
+      - ev_threshold       — entry by threshold prob, TP/SL from MFE/MAE quantiles
+      - quantile_asymmetry — entry when one side's quantile is >= ratio x the other
+    """
+    bt_cfg   = _backtest_cfg(config)
+    strategy = str(bt_cfg.get('strategy', 'ev_threshold')).lower()
+    timer    = StageTimer('Backtest')
+
+    if strategy == 'ev_threshold':
+        return _run_ev_threshold_strategy(
+            results, windows, config, ohlcv_by_symbol, base_tf_min, bt_cfg, timer,
+        )
+    if strategy == 'quantile_asymmetry':
+        return _run_quantile_asymmetry_strategy(
+            results, windows, config, ohlcv_by_symbol, base_tf_min, bt_cfg, timer,
+        )
+    raise ValueError(
+        f'Unknown [backtest].strategy = {strategy!r}. '
+        f'Expected "ev_threshold" or "quantile_asymmetry".'
+    )
 
 
 def export_strategy_top100(all_rows: list, meta: dict, save_path: str):
@@ -896,25 +1248,34 @@ def export_strategy_top100(all_rows: list, meta: dict, save_path: str):
         key=lambda r: r['sqn'], reverse=True
     )[:100]
 
+    strategy = meta.get('strategy', 'ev_threshold')
     out = {
         'generated_at': datetime.now(UTC).isoformat(),
+        'strategy':     strategy,
         'test_range': {
             'start': _format_ts(meta['test_start']),
             'end':   _format_ts(meta['test_end']),
         },
-        'symbols':         meta['symbols'],
-        'entry_prob_grid': meta['entry_probs'],
-        'combos': [],
+        'symbols':  meta['symbols'],
+        'q_score':  meta.get('q_score'),
+        'combos':   [],
     }
+    if strategy == 'ev_threshold':
+        out['entry_prob_grid'] = meta.get('entry_probs', [])
+    elif strategy == 'quantile_asymmetry':
+        out['quantile_grid']   = meta.get('quantile_grid', [])
+        out['asymmetry_ratio'] = meta.get('asymmetry_ratio')
 
     for rank, row in enumerate(sorted_rows, start=1):
-        out['combos'].append({
+        combo = {
             'rank':         rank,
             'symbol':       row['symbol'],
             'horizon':      row['horizon'],
-            'threshold':    row['threshold'],
             'direction':    row['direction'],
-            'entry_prob':   row['entry_prob'],
+            'threshold':    row.get('threshold'),
+            'entry_prob':   row.get('entry_prob'),
+            'quantile':     row.get('quantile'),
+            'asymmetry_ratio': row.get('asymmetry_ratio'),
             'tp_pct':       row['tp_pct'],
             'sl_pct':       row['sl_pct'],
             'n_trades':     row['n_trades'],
@@ -942,7 +1303,8 @@ def export_strategy_top100(all_rows: list, meta: dict, save_path: str):
                 }
                 for t in row.get('trades', [])
             ],
-        })
+        }
+        out['combos'].append(combo)
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with open(save_path, 'w', encoding='utf-8') as f:

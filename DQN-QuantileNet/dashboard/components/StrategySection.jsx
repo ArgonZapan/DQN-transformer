@@ -30,8 +30,9 @@ function EquityCurveChart({ trades }) {
   const points = useMemo(() => {
     if (!trades?.length) return [];
     let eq = 1;
+    // Backend stores t.return as a fraction (e.g. 0.0594 = 5.94%), not percent.
     return trades.map(t => {
-      eq *= (1 + (t.return || 0) / 100);
+      eq *= (1 + (t.return || 0));
       return { x: new Date(t.entry_time).toLocaleDateString(), y: +((eq - 1) * 100).toFixed(2) };
     });
   }, [trades]);
@@ -39,12 +40,13 @@ function EquityCurveChart({ trades }) {
   const final = points[points.length - 1].y;
   const color = final >= 0 ? '#22c55e' : '#ef4444';
   const fill = final >= 0 ? 'rgba(34,197,94,0.08)' : 'rgba(239,68,68,0.08)';
-  return <LineChart width={520} height={180} points={points} color={color} fill={fill} />;
+  return <LineChart width={1200} height={220} points={points} color={color} fill={fill} />;
 }
 
 function ReturnHistogram({ trades }) {
   if (!trades?.length) return null;
-  return <Histogram width={520} height={180} values={trades.map(t => t.return)} bins={dynamicBins(trades.length)} />;
+  // t.return is a fraction; convert to percent for display.
+  return <Histogram width={600} height={220} values={trades.map(t => t.return * 100)} bins={dynamicBins(trades.length)} logY />;
 }
 
 function ExitDonut({ combo }) {
@@ -122,9 +124,9 @@ function DetailPanel({ combo, onClose }) {
   );
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-end', background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(2px)' }}
+    <div style={{ position: 'fixed', inset: 0, zIndex: 100, background: '#0b0c0f' }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ width: '72vw', height: '85vh', background: '#0b0c0f', borderTop: '1px solid #1e2230', borderLeft: '1px solid #1e2230', borderTopLeftRadius: 10, padding: 20, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div style={{ width: '100vw', height: '100vh', background: '#0b0c0f', padding: 20, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 14, boxSizing: 'border-box' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 4 }}>
           <span style={{ fontFamily: FONT, fontWeight: 700, color: '#e2e4ea', fontSize: 15 }}>
             {combo.symbol} · {combo.horizon}h · {combo.threshold}% · {combo.direction.toUpperCase()}
@@ -157,14 +159,14 @@ function DetailPanel({ combo, onClose }) {
           ))}
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gridTemplateRows: '260px 220px', gap: 12, flex: 1 }}>
-          <div style={cardS}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gridTemplateRows: 'minmax(360px, 1fr) minmax(220px, auto) minmax(220px, auto)', gap: 12, flex: 1 }}>
+          <div style={{ ...cardS, gridColumn: '1 / -1' }}>
             <div style={titleS}>OHLCV + Trade Markers ({tf})</div>
-            <div style={{ flex: 1 }}>
-              <OHLCVChart symbol={combo.symbol} interval={tf} height={210} markers={tradeMarkers} showVolume={false} showIntervalPicker maxCandles={1000} />
+            <div style={{ flex: 1, minHeight: 0 }}>
+              <OHLCVChart symbol={combo.symbol} interval={tf} height={420} markers={tradeMarkers} showVolume={false} showIntervalPicker maxCandles={1000} />
             </div>
           </div>
-          <div style={cardS}>
+          <div style={{ ...cardS, gridColumn: '1 / -1' }}>
             <div style={titleS}>Equity Curve (compounded)</div>
             <div style={{ flex: 1 }}><EquityCurveChart trades={combo.trades || []} /></div>
           </div>

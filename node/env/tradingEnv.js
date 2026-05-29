@@ -161,7 +161,14 @@ class TradingEnv {
             state = buildState(this.allCandles, currentTime, this.config);
         }
 
-        if (state) state.position = this._getPositionFeatures(currentTime);
+        if (state) {
+            state.position = this._getPositionFeatures(currentTime);
+            // Required by Python QuantileFeatureLoader to look up prerolled
+            // QuantileNet features for this (symbol, close_time_ms). Without
+            // these, every lookup misses and emits warnings.
+            state.timestamp = currentTime;
+            state.symbol = this.symbol;
+        }
         return state;
     }
 

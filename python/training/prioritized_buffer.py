@@ -3,6 +3,9 @@ import copy
 import numpy as np
 import torch
 
+from quantilenet import POSITION_BASE_DIM, extended_position_dim
+from training.replay_buffer import _extract_pos_vector
+
 
 class SumTree:
     """
@@ -132,8 +135,11 @@ class PrioritizedReplayBuffer:
         self.rewards           = pin(torch.zeros(self.capacity, dtype=torch.float32))
         self.dones             = pin(torch.zeros(self.capacity, dtype=torch.float32))
         self.action_masks      = pin(torch.zeros(self.capacity, self.num_actions, dtype=torch.float32))
-        self.pos_features      = pin(torch.zeros(self.capacity, 10, dtype=torch.float32))
-        self.next_pos_features = pin(torch.zeros(self.capacity, 10, dtype=torch.float32))
+
+        self.pos_dim = extended_position_dim(config)
+        self.quantile_dim = self.pos_dim - POSITION_BASE_DIM
+        self.pos_features      = pin(torch.zeros(self.capacity, self.pos_dim, dtype=torch.float32))
+        self.next_pos_features = pin(torch.zeros(self.capacity, self.pos_dim, dtype=torch.float32))
 
         self.tree = SumTree(self.capacity)
         self.max_priority = 1.0
@@ -208,29 +214,20 @@ class PrioritizedReplayBuffer:
         else:
             self.action_masks[idx] = torch.ones(self.num_actions, dtype=torch.float32)
 
-        pf = state.get('position') if isinstance(state, dict) else None
-        if pf is not None:
-            arr = torch.zeros(10, dtype=torch.float32)
-            src = torch.tensor(pf[:10], dtype=torch.float32)
-            arr[:src.shape[0]] = src
-            self.pos_features[idx] = arr
-        else:
-            self.pos_features[idx] = torch.zeros(10, dtype=torch.float32)
+        self.pos_features[idx] = torch.from_numpy(
+            _extract_pos_vector(state, self.pos_dim, self.quantile_dim))
+        self.next_pos_features[idx] = torch.from_numpy(
+            _extract_pos_vector(next_state, self.pos_dim, self.quantile_dim))
 
-        npf = next_state.get('position') if isinstance(next_state, dict) else None
-        if npf is not None:
-            arr = torch.zeros(10, dtype=torch.float32)
-            src = torch.tensor(npf[:10], dtype=torch.float32)
-            arr[:src.shape[0]] = src
-            self.next_pos_features[idx] = arr
+        # Tree leaves (and max_priority) store the FINAL priority p = (|td|+eps)^alpha.
+        # A fresh experience with unknown TD gets the current max priority so it is
+        # guaranteed to be sampled at least once — do NOT raise max_priority to alpha
+        # again (it is already alpha-applied), which would systematically under-weight
+        # new transitions whenever max_priority > 1.
+        if td_error is not None and np.isfinite(td_error):
+            priority = min((abs(td_error) + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
         else:
-            self.next_pos_features[idx] = torch.zeros(10, dtype=torch.float32)
-
-        if td_error is not None:
-            td_val = abs(td_error) if np.isfinite(td_error) else self.max_priority
-            priority = min((td_val + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
-        else:
-            priority = min(self.max_priority ** self.alpha, self._MAX_PRIORITY)
+            priority = min(self.max_priority, self._MAX_PRIORITY)
 
         self.tree.add(priority)
         self.position = (self.position + 1) % self.capacity
@@ -279,24 +276,20 @@ class PrioritizedReplayBuffer:
                     masks[i] = arr
         self.action_masks[positions] = torch.from_numpy(masks)
 
-        pf = np.zeros((n, 10), dtype=np.float32)
-        npf = np.zeros((n, 10), dtype=np.float32)
+        pf = np.zeros((n, self.pos_dim), dtype=np.float32)
+        npf = np.zeros((n, self.pos_dim), dtype=np.float32)
         for i, (state, _, _, next_state, _, _) in enumerate(experiences):
-            p = state.get('position') if isinstance(state, dict) else None
-            if p is not None:
-                arr = np.asarray(p[:10], dtype=np.float32)
-                pf[i, :arr.shape[0]] = arr
-            next_pos = next_state.get('position') if isinstance(next_state, dict) else None
-            if next_pos is not None:
-                arr = np.asarray(next_pos[:10], dtype=np.float32)
-                npf[i, :arr.shape[0]] = arr
+            pf[i] = _extract_pos_vector(state, self.pos_dim, self.quantile_dim)
+            npf[i] = _extract_pos_vector(next_state, self.pos_dim, self.quantile_dim)
         self.pos_features[positions] = torch.from_numpy(pf)
         self.next_pos_features[positions] = torch.from_numpy(npf)
 
         self.position = int((self.position + n) % self.capacity)
         self.size = min(self.size + n, self.capacity)
 
-        priority = min(self.max_priority ** self.alpha, self._MAX_PRIORITY)
+        # max_priority already holds an alpha-applied priority — assign it directly
+        # so fresh experiences enter at the current maximum (standard PER).
+        priority = min(self.max_priority, self._MAX_PRIORITY)
         priorities = np.full(n, priority, dtype=np.float64)
         self.tree.update_batch(positions, priorities)
         self.tree.data_pointer = self.position
@@ -305,7 +298,7 @@ class PrioritizedReplayBuffer:
         """Reset tree to uniform priorities if it contains invalid values."""
         total = self.tree.total()
         if not np.isfinite(total) or total <= 0:
-            uniform_priority = min(self.max_priority ** self.alpha, self._MAX_PRIORITY)
+            uniform_priority = min(self.max_priority, self._MAX_PRIORITY)
             if not np.isfinite(uniform_priority) or uniform_priority <= 0:
                 uniform_priority = 1.0
             self.tree.tree[:] = 0.0
@@ -354,8 +347,13 @@ class PrioritizedReplayBuffer:
 
     def update_priorities(self, indices, td_errors):
         td_vals = np.abs(td_errors).astype(np.float64)
-        td_vals = np.where(np.isfinite(td_vals), td_vals, self.max_priority)
-        priorities = np.minimum((td_vals + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
+        finite = np.isfinite(td_vals)
+        priorities = np.empty_like(td_vals)
+        priorities[finite] = np.minimum(
+            (td_vals[finite] + self.per_epsilon) ** self.alpha, self._MAX_PRIORITY)
+        # Non-finite TD (e.g. AMP overflow) → reuse the current max priority directly
+        # (already alpha-applied); never feed Inf/NaN into the tree.
+        priorities[~finite] = min(self.max_priority, self._MAX_PRIORITY)
         self.tree.update_batch(indices.astype(np.int64), priorities)
         self.max_priority = max(self.max_priority, float(priorities.max()))
 
@@ -448,10 +446,19 @@ class PrioritizedReplayBuffer:
         self.rewards[:n] = state['rewards'][:n]
         self.dones[:n] = state['dones'][:n]
         self.action_masks[:n] = state['action_masks'][:n]
+        # Backward-compat: pad narrower saved pos_features (e.g. legacy 10-D) with zeros.
+        def _restore_pos(target: torch.Tensor, saved: torch.Tensor) -> None:
+            sd = saved.shape[1] if saved.ndim == 2 else 0
+            td = target.shape[1]
+            cols = min(sd, td)
+            target[:n, :cols] = saved[:n, :cols]
+            if sd < td:
+                target[:n, sd:] = 0.0
+
         if 'pos_features' in state:
-            self.pos_features[:n] = state['pos_features'][:n]
+            _restore_pos(self.pos_features, state['pos_features'])
         if 'next_pos_features' in state:
-            self.next_pos_features[:n] = state['next_pos_features'][:n]
+            _restore_pos(self.next_pos_features, state['next_pos_features'])
 
 
 class DualPrioritizedBuffer:

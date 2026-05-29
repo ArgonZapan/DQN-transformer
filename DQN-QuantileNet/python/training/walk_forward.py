@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from typing import TypedDict
 
 logger = logging.getLogger(__name__)
@@ -111,10 +112,13 @@ def build_walk_forward_folds(
         v_cnt = len(f['val'])
         t_span = _span_months(f['train'])
         v_span = _span_months(f['val'])
+        t_range = _date_range(f['train'])
+        v_range = _date_range(f['val'])
         logger.info(
-            f'  Fold {i}: train={t_cnt} ({t_span:.1f}M)  val={v_cnt} ({v_span:.1f}M)'
+            f'  Fold {i}: train={t_cnt} ({t_span:.1f}M, {t_range})  '
+            f'val={v_cnt} ({v_span:.1f}M, {v_range})'
         )
-    logger.info(f'  Test : {len(test_w)} windows ({_span_months(test_w):.1f}M)')
+    logger.info(f'  Test : {len(test_w)} windows ({_span_months(test_w):.1f}M, {_date_range(test_w)})')
 
     return folds, test_w
 
@@ -125,3 +129,13 @@ def _span_months(windows: list) -> float:
     t0 = windows[0]['current_close_time']
     t1 = windows[-1]['current_close_time']
     return (t1 - t0) / _MS_PER_MONTH
+
+
+def _date_range(windows: list) -> str:
+    if not windows:
+        return 'empty'
+    t0 = min(w['current_close_time'] for w in windows)
+    t1 = max(w['current_close_time'] for w in windows)
+    d0 = datetime.fromtimestamp(t0 / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
+    d1 = datetime.fromtimestamp(t1 / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
+    return f'{d0} → {d1}'

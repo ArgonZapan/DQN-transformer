@@ -28,10 +28,10 @@ port = 6555   # offset from DQN-OPUS (5555) to allow both to run simultaneously
 # Liczba świec na każdy timeframe w oknie wejściowym. 0 = wyłączony TF.
 [timeframes]
 candles_1m  = 0
-candles_15m = 8
+candles_15m = 32
 candles_1h  = 48
 candles_4h  = 0
-candles_1d  = 4
+candles_1d  = 14
 candles_1w  = 0
 
 # ── Predykcja ──────────────────────────────────────────────────────────────────
@@ -57,27 +57,27 @@ threshold_loss_weight = 0.5
 d_model             = 64    # wymiar ukryty we wszystkich warstwach
 n_attention_heads   = 4     # głowice uwagi
 lstm_layers         = 2     # głębokość kodera LSTM
-lstm_hidden         = 64   # rozmiar stanu ukrytego LSTM
-grn_dropout         = 0.1   # dropout wewnątrz GRN
-vsn_dropout         = 0.1   # dropout wewnątrz VSN
+lstm_hidden         = 48    # rozmiar stanu ukrytego LSTM
+grn_dropout         = 0.2   # dropout wewnątrz GRN
+vsn_dropout         = 0.2   # dropout wewnątrz VSN
 ff_dim              = 128   # wymiar feed-forward
-n_transformer_blocks = 2    # liczba bloków atencji TFT
+n_transformer_blocks = 8    # liczba bloków atencji TFT
 
 # ── Trening ────────────────────────────────────────────────────────────────────
 [training]
-lr            = 1.0e-4       # base LR — transformer-friendly (1e-5 was 10× too low)
-betas         = [0.9, 0.95]  # AdamW betas — (0.9, 0.95) standard for transformers
-weight_decay  = 0.05         # decoupled WD; applied only to Linear/Conv weights
+lr            = 1.0e-5          # base LR — transformer-friendly (1e-5 was 10× too low)
+betas         = [0.9, 0.95]     # AdamW betas — (0.9, 0.95) standard for transformers
+weight_decay  = 0.10            # decoupled WD; applied only to Linear/Conv weights
 batch_size    = 512
-epochs        = 32          # maksymalna liczba epok
-patience      = 8           # early stopping: stop po N epokach bez poprawy
-seed          = 4245        # >0 = deterministic run, <=0 = random seed each start
-device        = "cuda"       # "cuda" | "cpu" | "auto"
-num_threads   = 64
+epochs        = 32              # maksymalna liczba epok
+patience      = 8               # early stopping: stop po N epokach bez poprawy
+seed          = 0               # >0 = deterministic run, <=0 = random seed each start
+device        = "cuda"          # "cuda" | "cpu" | "auto"
+num_threads   = 10
 
-train_months = 8             # IS window size per fold (months)
-val_months   = 2             # OOS window size per fold (months)
-test_months  = 6             # held-out test block at the end (months)
+train_months = 8                # IS window size per fold (months)
+val_months   = 2                # OOS window size per fold (months)
+test_months  = 6                # held-out test block at the end (months)
 
 checkpoint_interval     = 5  # zapis checkpointu co N epok
 keep_last_n_checkpoints = 10
@@ -85,7 +85,21 @@ resume_from_checkpoint  = "" # ścieżka do .pt lub "" dla treningu od zera
 
 compile_model = false        # torch.compile (PyTorch 2+)
 
-backtest_every_n_epochs = 1  # run TP/SL backtest after every N epochs; 0 = disabled
+backtest_every_n_epochs = 2   # run TP/SL backtest every N epochs (after warmup); 0 = disabled
+backtest_warmup_epochs  = 10  # skip backtest entirely for the first N epochs
+inference_batch_size    = 4096  # batch size for backtest/live inference (not training)
+
+# DataLoader tuning — keep the GPU fed
+dataloader_workers           = 0     # parallel data-prep workers (0 = main thread)
+dataloader_prefetch_factor   = 4     # batches each worker prefetches
+dataloader_persistent_workers = true # keep workers alive across epochs (avoids fork cost)
+
+# Keep the entire IS/OOS dataset in VRAM and iterate by index — eliminates
+# host→device copies and DataLoader worker overhead. Only enable if the
+# stacked windows fit in GPU memory (rough estimate: N_windows * sum(seq_lens)
+# * 11 features * 4B ≈ ~3 KB/window for the default TF mix). When true,
+# `dataloader_*` settings above are ignored.
+data_in_vram = true
 
 # Stride between consecutive training windows, in base-TF candles.
 # 1 = co-bar (default; max samples, but adjacent windows share most of their
@@ -130,7 +144,17 @@ bce_use_pos_weight     = true    # auto-balance positive/negative for rare thres
 [augmentation]
 # Gaussian noise added to (already-normalized) input features during training only.
 # Tiny regularizer; 0.0 disables. Sensible range: 0.001–0.01.
-feature_noise_std = 0.0
+feature_noise_std = 0.005
+
+# ── Sampling ──────────────────────────────────────────────────────────────────
+# Volatility-stratified sampling: bin training windows by realised future range
+# (high-low at the longest horizon) into equal-frequency bins, then sample so
+# every bin contributes ~equally per epoch. Upweights extreme-vol regimes that
+# dominate tail (q05/q95) calibration; downweights low-vol chop. Applied only
+# to the training (IS) loader — eval/OOS loaders sweep deterministically.
+[sampling]
+volatility_stratified = true
+n_bins                = 5
 
 # ── Cechy wejściowe ────────────────────────────────────────────────────────────
 [features]
@@ -148,13 +172,21 @@ api_retry_interval_sec = 60
 
 # ── Backtest ───────────────────────────────────────────────────────────────────
 [backtest]
+# Which strategy to run:
+#   "ev_threshold"       — entry by threshold prob; TP/SL from MFE/MAE quantiles (tp_quantile/sl_quantile)
+#   "quantile_asymmetry" — entry only when, at the same quantile, one side's
+#                          predicted excursion is >= asymmetry_ratio x the other.
+#                          TP = farther quantile, SL = nearer quantile.
+strategy             = "ev_threshold"
+asymmetry_ratio      = 1.5       # used by "quantile_asymmetry" strategy
+
 commission           = 0.00075   # per side (Binance taker default)
 slippage_bps         = 1.0       # extra cost per fill in basis points (0.01% = 1 bps)
 min_trades_valid    = 20         # combos with fewer trades flagged as low-confidence
 sequential_lock     = true       # block new entries until previous trade closes
 same_bar_priority   = "sl"       # "sl" | "tp" — when both hit in same bar
-tp_quantile         = 0.90       # config['prediction'].quantiles value used for TP
-sl_quantile         = 0.10       # config['prediction'].quantiles value used for SL
+tp_quantile         = 0.90       # config['prediction'].quantiles value used for TP (ev_threshold)
+sl_quantile         = 0.10       # config['prediction'].quantiles value used for SL (ev_threshold)
 sl_min_pct          = 0.5        # minimum SL distance (%) to cap quantile output
 tp_max_pct          = 50.0       # maximum TP distance (%)
 sl_max_pct          = 50.0       # maximum SL distance (%)

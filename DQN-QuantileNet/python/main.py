@@ -17,6 +17,12 @@ def setup_logging(config: dict):
     level   = getattr(logging, log_cfg.get('level', 'INFO'), logging.INFO)
     log_dir = os.path.join(os.path.dirname(__file__), log_cfg.get('log_dir', 'logs'))
     os.makedirs(log_dir, exist_ok=True)
+
+    # Force UTF-8 on stdout so unicode glyphs (→, ─, …) used in log strings
+    # don't blow up on Windows consoles defaulting to cp1250/cp1252.
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
     logging.basicConfig(
         level=level,
         handlers=[
@@ -25,6 +31,7 @@ def setup_logging(config: dict):
                 os.path.join(log_dir, 'learner.log'),
                 maxBytes=log_cfg.get('max_file_size_mb', 10) * 1024 * 1024,
                 backupCount=log_cfg.get('max_files', 5),
+                encoding='utf-8',
             ),
         ],
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',

@@ -1,16 +1,24 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import BacktestSection from '../components/BacktestSection.jsx';
 import StrategySection from '../components/StrategySection.jsx';
 import LiveSection from '../components/LiveSection.jsx';
+import KronosSection from '../components/KronosSection.jsx';
 
 const TABS = [
   { id: 'backtest', label: 'Backtest Explorer' },
   { id: 'strategy', label: 'Strategy Simulator' },
   { id: 'live',     label: 'Live Predictions' },
+  { id: 'kronos',   label: 'Kronos Forecast' },
 ];
 
+const TAB_STORAGE_KEY = 'dashboard.activeTab.v1';
+
 export default function App() {
-  const [tab, setTab] = useState('backtest');
+  const [tab, setTab] = useState(() => {
+    try { return localStorage.getItem(TAB_STORAGE_KEY) || 'backtest'; }
+    catch { return 'backtest'; }
+  });
+  useEffect(() => { try { localStorage.setItem(TAB_STORAGE_KEY, tab); } catch { /* ignore */ } }, [tab]);
   const [bestCombo, setBestCombo] = useState(null);
 
   const tabBtn = (id) => ({
@@ -54,6 +62,7 @@ export default function App() {
         {tab === 'backtest' && <BacktestSection />}
         {tab === 'strategy' && <StrategySection onBestCombo={setBestCombo} />}
         {tab === 'live'     && <LiveSection bestCombo={bestCombo} />}
+        {tab === 'kronos'   && <KronosSection />}
       </div>
     </div>
   );

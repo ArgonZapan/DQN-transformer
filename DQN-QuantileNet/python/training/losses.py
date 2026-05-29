@@ -134,7 +134,10 @@ class LossModule(nn.Module):
         quantile_labels:  torch.Tensor | None,
         threshold_labels: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict]:
-        components: dict[str, float] = {}
+        # NOTE: components values are kept as detached GPU tensors here; the
+        # caller is expected to defer .item() until epoch end. Per-batch
+        # .item() forces cudaStreamSynchronize and stalls the pipeline.
+        components: dict[str, torch.Tensor] = {}
         device = next(iter(outputs.values())).device
         total = torch.zeros((), device=device)
 
@@ -143,12 +146,12 @@ class LossModule(nn.Module):
 
         if 'quantile' in outputs and quantile_labels is not None:
             pred_q = outputs['quantile']
-            q_loss = pinball_loss(pred_q, quantile_labels, self.quantiles.to(device))
-            components['loss/quantile_raw'] = q_loss.item()
+            q_loss = pinball_loss(pred_q, quantile_labels, self.quantiles)
+            components['loss/quantile_raw'] = q_loss.detach()
 
             if self.noncrossing_weight > 0:
                 nc = noncrossing_penalty(pred_q)
-                components['loss/noncrossing'] = nc.item()
+                components['loss/noncrossing'] = nc.detach()
                 q_loss = q_loss + self.noncrossing_weight * nc
 
             q_loss_val = q_loss
@@ -159,7 +162,7 @@ class LossModule(nn.Module):
                 outputs['threshold'], threshold_labels,
                 pos_weight=pos_w, label_smoothing=self.bce_label_smoothing,
             )
-            components['loss/threshold_raw'] = t_loss.item()
+            components['loss/threshold_raw'] = t_loss.detach()
             t_loss_val = t_loss
 
         # ── Combine ──────────────────────────────────────────────────────────
@@ -168,17 +171,17 @@ class LossModule(nn.Module):
             # Halving (the 1/2 in regression) is folded into pinball/BCE conventions.
             if q_loss_val is not None:
                 total = total + torch.exp(-self.log_var_q) * q_loss_val + self.log_var_q
-                components['loss/log_var_q'] = self.log_var_q.item()
+                components['loss/log_var_q'] = self.log_var_q.detach()
             if t_loss_val is not None:
                 total = total + torch.exp(-self.log_var_t) * t_loss_val + self.log_var_t
-                components['loss/log_var_t'] = self.log_var_t.item()
+                components['loss/log_var_t'] = self.log_var_t.detach()
         else:
             if q_loss_val is not None:
                 total = total + self.q_weight * self.pinball_scale * q_loss_val
             if t_loss_val is not None:
                 total = total + self.t_weight * t_loss_val
 
-        components['loss/total'] = total.item()
+        components['loss/total'] = total.detach()
         return total, components
 
 

@@ -11,8 +11,11 @@ __pycache__/
 # Node.js
 node_modules/
 
-# Checkpoints
-python/checkpoints/*.pt
+# Checkpoints / model weights / exports
+python/checkpoints/
+*.pt
+*.pth
+*.onnx
 
 # Historical data
 node/data/historical/*.csv
@@ -25,7 +28,7 @@ datasets/
 results/*.json
 
 # Logs
-logs/*.log
+logs/
 python/logs/
 
 # TensorBoard runs
@@ -49,6 +52,14 @@ _restart.ps1
 # IDE
 .vscode/
 .idea/
+
+# Claude Code harness
+.claude/
+.agents/
+
+# Archives
+*.rar
+*.zip
 
 # OS
 Thumbs.db

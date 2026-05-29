@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { createChart, CrosshairMode, LineStyle } from 'lightweight-charts';
+import { createChart, CrosshairMode, LineStyle, LineType } from 'lightweight-charts';
 
 const TF_SECONDS = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'];
@@ -37,6 +37,11 @@ export default function OHLCVChart({
   showIntervalPicker = true,
   onLastPrice = null,
   maxCandles = 500,
+  viewMode = 'fan',
+  continuousPredictions = null,
+  enabledQuantiles = null,
+  onVisibleRangeChange = null,
+  onTfChange = null,
 }) {
   const containerRef = useRef(null);
   const chartRef     = useRef(null);
@@ -45,6 +50,9 @@ export default function OHLCVChart({
   const candlesRef      = useRef([]);   // all fetched candles, for historical fans
   const fanSeriesRef    = useRef([]);
   const priceLineRefs   = useRef([]);
+
+  const onVisibleRangeChangeRef = useRef(onVisibleRangeChange);
+  useEffect(() => { onVisibleRangeChangeRef.current = onVisibleRangeChange; }, [onVisibleRangeChange]);
 
   const [tf, setTf] = useState(initialInterval);
   const [loading, setLoading] = useState(true);
@@ -55,6 +63,7 @@ export default function OHLCVChart({
   const [candleReady, setCandleReady] = useState(0);
 
   useEffect(() => { setTf(initialInterval); }, [initialInterval]);
+  useEffect(() => { onTfChange?.(tf); }, [tf]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -153,6 +162,16 @@ export default function OHLCVChart({
         candleBaseRef.current = { time: lc.time, close: lc.close };
         setCandleReady(n => n + 1);
         setLoading(false);
+
+        // Notify parent of visible range changes (used by continuous mode).
+        // Uses a ref so the subscription always calls the latest callback
+        // without needing to re-mount the chart when viewMode changes.
+        const fireRange = () => {
+          const r = chart.timeScale().getVisibleRange();
+          if (r) onVisibleRangeChangeRef.current?.({ from_ms: Math.floor(r.from) * 1000, to_ms: Math.ceil(r.to) * 1000 });
+        };
+        chart.timeScale().subscribeVisibleTimeRangeChange(fireRange);
+        fireRange();
       } catch (e) {
         if (!cancelled) { setError(e.message); setLoading(false); }
       }
@@ -167,24 +186,13 @@ export default function OHLCVChart({
     };
   }, [symbol, tf, height, showVolume, maxCandles]);
 
-  // Fan overlay: current prediction + historical verification fans
+  // Overlay effect: fan mode (existing) OR continuous per-candle mode (new).
   useEffect(() => {
     const chart = chartRef.current;
-    const base  = candleBaseRef.current;
-    if (!chart || !fanData || !base) return;
+    if (!chart) return;
 
     fanSeriesRef.current.forEach(s => { try { chart.removeSeries(s); } catch { /* noop */ } });
     fanSeriesRef.current = [];
-
-    const sel = fanData.selectedHorizon ?? null;  // null = all horizons
-    const allHorizons = (fanData.horizons || []).filter(h => h.long && h.short);
-    const horizons = sel ? allHorizons.filter(h => h.h === sel) : allHorizons;
-    if (!horizons.length) return;
-
-    const allowedQ = Array.isArray(fanData.enabledQuantiles)
-      ? fanData.enabledQuantiles
-      : ALL_QUANTILE_KEYS;
-    const activeQuantiles = QUANTILES.filter(([q]) => allowedQ.includes(q));
 
     const addLine = (color, width, style, t0, t1, value) => {
       if (t1 <= t0) return;
@@ -196,7 +204,65 @@ export default function OHLCVChart({
       fanSeriesRef.current.push(s);
     };
 
-    // ── Current (future) fan ─────────────────────────────────────────────────
+    // ── Continuous mode: one line per quantile across all visible candles ────
+    if (viewMode === 'continuous' && continuousPredictions) {
+      // Backend keys are close_time_s; chart candle times are open_time_s.
+      // close_time_s = open_time_s + TF_SECONDS - 1  (Binance: close = open + tf_ms - 1ms)
+      const tfSecs = TF_SECONDS[tf] || 900;
+      const priceByTime = {};
+      for (const c of candlesRef.current) priceByTime[c.time] = c.close;
+
+      const allowedQ = Array.isArray(enabledQuantiles) ? enabledQuantiles : ALL_QUANTILE_KEYS;
+      const activeQ  = QUANTILES.filter(([q]) => allowedQ.includes(q));
+
+      for (const [q, , st, alpha] of activeQ) {
+        const extreme = q === 'p10' || q === 'p90';
+        const lAlpha  = extreme ? 0.45 : 0.80;
+        const sAlpha  = extreme ? 0.45 : 0.80;
+
+        const lData = [], sData = [];
+        for (const [ts, pred] of Object.entries(continuousPredictions)) {
+          // Convert close_time_s → open_time_s so it aligns with chart time scale.
+          const closeT = parseInt(ts, 10);
+          const openT  = closeT - tfSecs + 1;
+          const price  = priceByTime[openT];
+          if (!price) continue;
+          if (pred.long?.[q]  !== undefined) lData.push({ time: openT, value: price * (1 + pred.long[q]  / 100) });
+          if (pred.short?.[q] !== undefined) sData.push({ time: openT, value: price * (1 - pred.short[q] / 100) });
+        }
+        lData.sort((a, b) => a.time - b.time);
+        sData.sort((a, b) => a.time - b.time);
+        if (!lData.length && !sData.length) continue;
+
+        const lSeries = chart.addLineSeries({
+          color: `rgba(34,197,94,${lAlpha})`, lineWidth: 1, lineStyle: st,
+          lineType: LineType.WithSteps,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        });
+        const sSeries = chart.addLineSeries({
+          color: `rgba(239,68,68,${sAlpha})`, lineWidth: 1, lineStyle: st,
+          lineType: LineType.WithSteps,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        });
+        if (lData.length) lSeries.setData(lData);
+        if (sData.length) sSeries.setData(sData);
+        fanSeriesRef.current.push(lSeries, sSeries);
+      }
+      return;
+    }
+
+    // ── Fan mode: current future fan + historical anchor verification ─────────
+    const base = candleBaseRef.current;
+    if (!fanData || !base) return;
+
+    const sel = fanData.selectedHorizon ?? null;
+    const allHorizons = (fanData.horizons || []).filter(h => h.long && h.short);
+    const horizons    = sel ? allHorizons.filter(h => h.h === sel) : allHorizons;
+    if (!horizons.length) return;
+
+    const allowedQ      = Array.isArray(fanData.enabledQuantiles) ? fanData.enabledQuantiles : ALL_QUANTILE_KEYS;
+    const activeQuantiles = QUANTILES.filter(([q]) => allowedQ.includes(q));
+
     const baseTime  = base.time;
     const basePrice = base.close;
 
@@ -206,19 +272,17 @@ export default function OHLCVChart({
     horizons.forEach(h => {
       const tEnd = baseTime + h.h * 3600;
       activeQuantiles.forEach(([q, w, st, alpha]) => {
-        const extreme = q === 'p10' || q === 'p90';
+        const extreme    = q === 'p10' || q === 'p90';
         const longColor  = extreme ? `rgba(134,239,172,${alpha})` : `rgba(34,197,94,${alpha})`;
         const shortColor = extreme ? `rgba(251,146,60,${alpha})`  : `rgba(239,68,68,${alpha})`;
-        const lw = 3;
-        addLine(longColor,  lw, st, baseTime, tEnd, basePrice * (1 + (h.long[q]  ?? 0) / 100));
-        addLine(shortColor, lw, st, baseTime, tEnd, basePrice * (1 - (h.short[q] ?? 0) / 100));
+        addLine(longColor,  3, st, baseTime, tEnd, basePrice * (1 + (h.long[q]  ?? 0) / 100));
+        addLine(shortColor, 3, st, baseTime, tEnd, basePrice * (1 - (h.short[q] ?? 0) / 100));
       });
     });
 
-    // ── Historical verification fans (real model inference per anchor) ────────
     const histFans = fanData.historicalFans;
     if (histFans?.length) {
-      histFans.forEach((fan, idx) => {
+      histFans.forEach(fan => {
         const aTime  = fan.anchorTime;
         const aPrice = fan.anchorPrice;
         const allAH  = (fan.horizons || []).filter(h => h.long && h.short);
@@ -226,28 +290,23 @@ export default function OHLCVChart({
         if (!aTime || !aPrice || !aHorizons.length) return;
 
         const maxAEnd = Math.min(aTime + Math.max(...aHorizons.map(h => h.h)) * 3600, baseTime);
-        if (maxAEnd > aTime) {
-          addLine('rgba(255,255,255,0.55)', 1, LineStyle.Solid, aTime, maxAEnd, aPrice);
-        }
+        if (maxAEnd > aTime) addLine('rgba(255,255,255,0.55)', 1, LineStyle.Solid, aTime, maxAEnd, aPrice);
 
         aHorizons.forEach(h => {
           const tEnd = Math.min(aTime + h.h * 3600, baseTime);
           if (tEnd <= aTime) return;
-          activeQuantiles.forEach(([q, w, , alpha]) => {
-            const a = (alpha * 0.5).toFixed(3);
-            const extreme = q === 'p10' || q === 'p90';
+          activeQuantiles.forEach(([q, , , alpha]) => {
+            const a          = (alpha * 0.5).toFixed(3);
+            const extreme    = q === 'p10' || q === 'p90';
             const longColor  = extreme ? `rgba(134,239,172,${a})` : `rgba(34,197,94,${a})`;
             const shortColor = extreme ? `rgba(251,146,60,${a})`  : `rgba(239,68,68,${a})`;
-            const lw = 3;
-            addLine(longColor,  lw, LineStyle.Dashed,
-              aTime, tEnd, aPrice * (1 + (h.long[q]  ?? 0) / 100));
-            addLine(shortColor, lw, LineStyle.Dashed,
-              aTime, tEnd, aPrice * (1 - (h.short[q] ?? 0) / 100));
+            addLine(longColor,  3, LineStyle.Dashed, aTime, tEnd, aPrice * (1 + (h.long[q]  ?? 0) / 100));
+            addLine(shortColor, 3, LineStyle.Dashed, aTime, tEnd, aPrice * (1 - (h.short[q] ?? 0) / 100));
           });
         });
       });
     }
-  }, [fanData, candleReady, tf]);
+  }, [fanData, viewMode, continuousPredictions, enabledQuantiles, candleReady, tf]);
 
   // Reactive price lines (EP / TP / SL).
   useEffect(() => {
