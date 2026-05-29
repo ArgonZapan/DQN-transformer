@@ -587,14 +587,11 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
     cumulative_pnl = 0.0
     position = None
     hold_minutes = 0
-    bars_in_trade = 0
 
     step_interval = config['backtesting'].get('step_interval', 1)
 
     for abs_idx in range(oos_start, len(candles_1m)):
         if (abs_idx - oos_start) % step_interval != 0:
-            if position is not None:
-                bars_in_trade += 1
             hold_minutes += 1
             continue
 
@@ -614,13 +611,17 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
         _is_weekend = 1.0 if _dt.weekday() >= 5 else 0.0
 
         # Position features: [is_long, is_short, unrealized_pnl, hold_6h, hold_48h, sin_hour, cos_hour, sin_week, cos_week, is_weekend]
-        _step_interval = config.get('training', {}).get('step_interval', 15)
         if position is not None:
             is_long  = 1 if position.side == 'LONG'  else 0
             is_short = 1 if position.side == 'SHORT' else 0
             upnl = ((price - position.open_price) / position.open_price if is_long
                     else (position.open_price - price) / position.open_price)
-            _minutes = bars_in_trade * _step_interval
+            # Wall-clock minutes held, straight from timestamps. This matches training,
+            # where minutes = bars_in_trade * step_interval equals real minutes (each env
+            # step spans step_interval 1m candles). The prior code multiplied a per-1m-candle
+            # counter by step_interval, inflating hold time ~15x so hold_6h/hold_48h
+            # saturated to 1.0 within minutes — a train/serve skew now removed.
+            _minutes = (t_ms - position.open_time_ms) / 60000.0
             pos_feat = [is_long, is_short, upnl,
                         min(_minutes / 360, 1.0), min(_minutes / 2880, 1.0),
                         _sin_hour, _cos_hour, _sin_week, _cos_week, _is_weekend]
@@ -643,7 +644,6 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
                 print(f"  [{symbol}] HOLD {hold_minutes} min")
                 hold_minutes = 0
             position = Position('LONG', price, t_ms)
-            bars_in_trade = 0
             print(f"  [{symbol}] OPEN LONG  @ {price:.4f}  {_fmt_time(t_ms)}")
 
         elif action == ACTION_SHORT and position is None:
@@ -651,7 +651,6 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
                 print(f"  [{symbol}] HOLD {hold_minutes} min")
                 hold_minutes = 0
             position = Position('SHORT', price, t_ms)
-            bars_in_trade = 0
             print(f"  [{symbol}] OPEN SHORT @ {price:.4f}  {_fmt_time(t_ms)}")
 
         elif action == ACTION_CLOSE and position is not None:
@@ -669,19 +668,15 @@ def run_symbol_backtest(symbol: str, config: dict, model: TradingDQN, device: st
                   f"PnL: {pnl_sign}{pnl:.4f}  held {held} min  "
                   f"cumPnL: {cumulative_pnl:.4f}  {_fmt_time(t_ms)}")
             position = None
-            bars_in_trade = 0
             hold_minutes = 0
 
         else:
-            if position is not None:
-                bars_in_trade += 1
             hold_minutes += 1
 
     if hold_minutes:
         print(f"  [{symbol}] HOLD {hold_minutes} min")
 
     # Force-close any open position at end of OOS
-    bars_in_trade = 0
     if position is not None and len(candles_1m) > oos_start:
         last = candles_1m[-1]
         position.close(last['close'], last['close_time'])
