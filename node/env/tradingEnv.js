@@ -190,6 +190,16 @@ class TradingEnv {
         let reward = 0;
         let tradeClosed = false;
 
+        // Capture the observation the agent actually acted on: the state BEFORE this
+        // action mutates the position (and before the index advances). The position
+        // features here reflect the pre-action position — exactly what was fed to the
+        // model when it chose `action`. Capturing it after the mutation (as before)
+        // desynchronized (state, action): an OPEN was stored with an already-in-position
+        // state and a CLOSE with an already-flat one, so the network learned Q for the
+        // wrong position context. With this in place, nextState = steps[t+n].state is
+        // also pre-action, so the position-derived next-state mask in the learner is exact.
+        const currentState = this._getState();
+
         // Rozbicie nagrody na składowe — do wyświetlania w tabeli aktora.
         // Wszystkie wartości są PRE-scale; reward_scale aplikowany na końcu do reward i rb łącznie.
         const rb = { open: 0, close: 0, close_pnl: 0, idle: 0, unreal: 0, delta: 0, hold: 0 };
@@ -282,9 +292,6 @@ class TradingEnv {
         const rewardScale = this.rewardConfig.reward_scale ?? 1.0;
         reward *= rewardScale;
         for (const k of Object.keys(rb)) rb[k] *= rewardScale;
-
-        // Capture state BEFORE incrementing index (Bug 6: addStep used wrong state)
-        const currentState = this._getState();
 
         this.currentStepIndex += this.stepInterval;
 
