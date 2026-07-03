@@ -140,13 +140,17 @@ class Episode {
      */
     getExperiencesTD() {
         this.calculateMonteCarloReturns();
-        return this.steps.map(step => ({
+        const T = this.steps.length;
+        return this.steps.map((step, t) => ({
             state:      step.state,
             action:     step.action,
             reward:     step.reward,
             nextState:  step.nextState,
             done:       step.done,
             actionMask: step.actionMask,
+            // Mask in effect at s_{t+1} (pre-action) — lets the learner mask
+            // bootstrap actions exactly (incl. min_hold CLOSE blocking).
+            nextActionMask: (t + 1 < T) ? this.steps[t + 1].actionMask : null,
             gammaToN:   this.gamma,
             returnG:    step.returnG,  // MC return — display only
         }));

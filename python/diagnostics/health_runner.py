@@ -46,13 +46,13 @@ class HealthRunner:
         n = min(100, len(self.trainer.buffer))
         step = self.trainer.step_count
 
-        # Próbkuj stany z buffera
-        # Zwraca: (states, actions, rewards, next_states, dones, action_masks,
-        #          pos_features, next_pos_features, indices[, is_weights])
+        # Sample states from the buffer
+        # Returns: (states, actions, rewards, next_states, dones, action_masks,
+        #           pos_features, next_pos_features, next_action_masks, indices[, is_weights])
         sample = self.trainer.buffer.sample(n)
         states       = sample[0]
         action_masks = sample[5]
-        pos_features = sample[6]   # [n, 10] — kontekst pozycji + czas
+        pos_features = sample[6]   # [n, 10] — position + time context
 
         network = self.trainer.main_network
         device = self.trainer.device
@@ -69,7 +69,7 @@ class HealthRunner:
         q_cpu = q.cpu()
         spread = (q_cpu.max(1).values - q_cpu.min(1).values)
 
-        # Masked Q (tylko dozwolone akcje) — używany też do wyboru dominującej akcji
+        # Masked Q (allowed actions only) — also used to pick the dominant action
         q_masked = q_cpu.masked_fill(action_masks.cpu() == 0, float('-inf'))
         spread_masked = (q_masked.max(1).values - q_masked.min(1).values)
 

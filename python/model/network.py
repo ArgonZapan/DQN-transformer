@@ -86,6 +86,8 @@ class TradingDQN(nn.Module):
     2. Concatenate sequences from all timeframes → [batch, total_seq, conv_filters]
        - Transformer receives ~130 tokens (candles) instead of 4 (one per TF)
        - Removed redundant identity projection Linear(d→d)
+       - Learnable position+timeframe embedding added to the tokens (without it
+         attention + mean-pool is permutation-invariant → no recency information)
     3. M Transformer Encoder blocks → [batch, total_seq, conv_filters]
     4. Global Average Pooling over sequence axis → [batch, conv_filters]
     5. Trunk Dense + concat with position features → Dueling heads
@@ -132,6 +134,17 @@ class TradingDQN(nn.Module):
                 for _ in range(self.n_transformer_blocks)
             ])
             trunk_dim = self.conv_filters
+
+            # Learnable position + timeframe embedding for the concatenated token
+            # sequence. Without it, self-attention followed by mean-pooling is
+            # permutation-invariant beyond the conv's local receptive field
+            # (kernel_size candles) — the network cannot tell how recent a
+            # pattern is, nor which timeframe a token came from (each TF
+            # occupies a fixed slot range, so one table covers both). Zero-init
+            # keeps legacy checkpoints functionally identical after loading
+            # (they are padded with zeros for this key).
+            total_seq = sum(timeframes_cfg[k] for k in self.timeframe_keys)
+            self.pos_embedding = nn.Parameter(torch.zeros(1, total_seq, self.conv_filters))
         else:
             self.transformer_blocks = nn.ModuleList()
             trunk_dim = concat_dim
@@ -191,7 +204,7 @@ class TradingDQN(nn.Module):
         if self.n_transformer_blocks > 0:
             # Concatenate sequences from all timeframes along the time axis
             # → [batch, total_seq, conv_filters]  (e.g. 60+32+48+14 = 154 tokens)
-            x = torch.cat(conv_outputs, dim=1)
+            x = torch.cat(conv_outputs, dim=1) + self.pos_embedding
             for block in self.transformer_blocks:
                 x = block(x)
             # GAP over sequence axis — after Transformer, not before
@@ -229,3 +242,33 @@ class TradingDQN(nn.Module):
         for module in self.modules():
             if hasattr(module, 'reset_noise'):
                 module.reset_noise()
+
+
+def upgrade_legacy_state_dict(model: "TradingDQN", state_dict: dict) -> dict | None:
+    """Best-effort upgrade of older checkpoints to the current architecture.
+
+    Handles two known evolutions, both of which preserve the legacy network's
+    outputs exactly:
+    - pos_fc widened by quantile features → zero-pad the input dim,
+    - pos_embedding added later → fill with zeros (additive no-op).
+
+    Returns a patched copy, or None when nothing upgradeable was found.
+    """
+    upgraded = None
+    current = model.state_dict()
+
+    target = current.get('pos_fc.0.weight')
+    ckpt_w = state_dict.get('pos_fc.0.weight')
+    if (target is not None and ckpt_w is not None
+            and target.shape[0] == ckpt_w.shape[0] and target.shape[1] > ckpt_w.shape[1]):
+        new_w = torch.zeros_like(target)
+        new_w[:, :ckpt_w.shape[1]] = ckpt_w
+        upgraded = dict(state_dict)
+        upgraded['pos_fc.0.weight'] = new_w
+
+    target_pe = current.get('pos_embedding')
+    if target_pe is not None and 'pos_embedding' not in state_dict:
+        upgraded = dict(upgraded if upgraded is not None else state_dict)
+        upgraded['pos_embedding'] = torch.zeros_like(target_pe)
+
+    return upgraded

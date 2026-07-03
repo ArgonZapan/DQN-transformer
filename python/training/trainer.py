@@ -11,7 +11,7 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-from model.network import TradingDQN
+from model.network import TradingDQN, upgrade_legacy_state_dict
 from training.replay_buffer import ReplayBuffer
 from training.prioritized_buffer import PrioritizedReplayBuffer, DualPrioritizedBuffer
 from training.debugger import TensorBoardDebugger
@@ -90,10 +90,6 @@ class Trainer:
         else:
             self.lr_scheduler = None
 
-        # Pre-allocated constant masks for Double DQN (previously created every step)
-        self._mask_in_pos = torch.tensor([0, 0, 1, 1], dtype=torch.float32, device=self.device)
-        self._mask_no_pos = torch.tensor([1, 1, 1, 0], dtype=torch.float32, device=self.device)
-
         # Experience queue: ZMQ thread only enqueues (fast), training thread
         # drains at the start of each train_step — eliminates GIL contention
         self._experience_queue: queue.Queue = queue.Queue(maxsize=50000)
@@ -103,6 +99,7 @@ class Trainer:
         # (extended_position_dim reads the same config keys).
         self.quantile_loader = QuantileFeatureLoader(config)
         self.position_dim = extended_position_dim(config)
+        self._quantile_lookup_prev = (0, 0)  # (lookups, hits) at last TB log
 
         per_cfg = config.get('per', {})
         self.use_per = per_cfg.get('alpha', 0) > 0
@@ -274,18 +271,9 @@ class Trainer:
             logger.info(f"[Checkpoint] Loading replay buffer from: {buf_path} (step {buffer_candidates[0][0]})")
             self._load_buffer(buf_path)
 
-    def _upgrade_pos_fc_for_quantiles(self, state_dict):
-        target = self.main_network.state_dict().get('pos_fc.0.weight')
-        ckpt_w = state_dict.get('pos_fc.0.weight')
-        if target is None or ckpt_w is None:
-            return None
-        if target.shape[0] != ckpt_w.shape[0] or target.shape[1] <= ckpt_w.shape[1]:
-            return None
-        new_w = torch.zeros_like(target)
-        new_w[:, :ckpt_w.shape[1]] = ckpt_w
-        upgraded = dict(state_dict)
-        upgraded['pos_fc.0.weight'] = new_w
-        return upgraded
+    def _upgrade_legacy_state_dict(self, state_dict):
+        """Delegates to model.network.upgrade_legacy_state_dict (shared with backtest)."""
+        return upgrade_legacy_state_dict(self.main_network, state_dict)
 
     def _load_checkpoint(self, path, load_buffer=True):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
@@ -293,19 +281,20 @@ class Trainer:
             self.main_network.load_state_dict(checkpoint['model_state_dict'])
             self.target_network.load_state_dict(checkpoint['model_state_dict'])
         except RuntimeError as e:
-            # Common case: pre-quantilenet checkpoint has pos_fc.0.weight
-            # of shape [32, 10]; current network expects [32, 10+quantile_dim].
-            # Pad the input dim with zeros so legacy base weights are kept and
-            # quantile contribution starts at zero, then retry.
-            patched = self._upgrade_pos_fc_for_quantiles(checkpoint['model_state_dict'])
+            # Known legacy layouts: pre-quantilenet pos_fc shape [32, 10]
+            # (current: [32, 10+quantile_dim]) and checkpoints saved before
+            # pos_embedding existed. Both upgrades are functional no-ops
+            # (zero pad / zero fill) — patch and retry.
+            patched = self._upgrade_legacy_state_dict(checkpoint['model_state_dict'])
             if patched is not None:
                 try:
                     self.main_network.load_state_dict(patched)
                     self.target_network.load_state_dict(patched)
-                    # Optimizer Adam state (m, v) was tied to old pos_fc shape;
-                    # discard it so the new param starts with fresh momentum.
+                    # Optimizer Adam state (m, v) was tied to the old parameter
+                    # set (shape and count); discard it so patched/new params
+                    # start with fresh momentum.
                     checkpoint.pop('optimizer_state_dict', None)
-                    logger.info("[Checkpoint] Upgraded legacy pos_fc weights for quantile features (zero-padded). Optimizer state reset.")
+                    logger.info("[Checkpoint] Upgraded legacy state dict (zero-padded new params). Optimizer state reset.")
                 except RuntimeError as e2:
                     logger.warning(f"[Checkpoint] Architecture mismatch — starting with fresh weights. ({e2})")
                     return
@@ -377,7 +366,18 @@ class Trainer:
     def _cleanup_old_checkpoints(self):
         checkpoint_dir = os.path.join('python', 'checkpoints')
         pattern = os.path.join(checkpoint_dir, 'checkpoint_step_*.pt')
-        checkpoints = sorted(glob.glob(pattern))
+
+        # Sort numerically by step. Lexicographic sort orders
+        # 'checkpoint_step_20000' AFTER 'checkpoint_step_180000', so rotation
+        # would delete the NEWEST checkpoints once step counts cross a
+        # digit-count boundary.
+        def step_of(path):
+            try:
+                return int(os.path.basename(path).rsplit('_', 1)[1].split('.')[0])
+            except (IndexError, ValueError):
+                return -1
+
+        checkpoints = sorted(glob.glob(pattern), key=step_of)
         while len(checkpoints) > self.keep_last_n:
             old = checkpoints.pop(0)
             os.remove(old)
@@ -468,7 +468,8 @@ class Trainer:
         state['quantile_features'] = self.quantile_loader.lookup(symbol, ts)
         return state
 
-    def add_experience(self, state, action, reward, next_state, done, action_mask=None, actor_id=None):
+    def add_experience(self, state, action, reward, next_state, done, action_mask=None,
+                       next_action_mask=None, actor_id=None):
         # Augment state with quantile features here (one lookup per experience)
         # rather than at training-step time (which would repeat lookups for every
         # PER sample). actor_id doubles as the symbol for ONNX actors.
@@ -478,7 +479,8 @@ class Trainer:
 
         # Do not block ZMQ thread — if queue is full, skip (safe with PER)
         try:
-            self._experience_queue.put_nowait((state, action, reward, next_state, done, action_mask))
+            self._experience_queue.put_nowait(
+                (state, action, reward, next_state, done, action_mask, next_action_mask))
         except queue.Full:
             pass
 
@@ -691,6 +693,17 @@ class Trainer:
             buffer_fill_ratio = len(self.buffer) / buffer_capacity
             self.writer.add_scalar('Buffer/fill_ratio', buffer_fill_ratio, step)
             
+            # ---- QuantileNet lookup hit rate (interval-based) ----
+            # Near-zero means the DQN trains on zero quantile features (e.g.
+            # preroll only covers the test block) — a silent failure otherwise.
+            if self.quantile_loader.enabled:
+                lookups, hits = self.quantile_loader.lookups, self.quantile_loader.hits
+                d_lookups = lookups - self._quantile_lookup_prev[0]
+                d_hits = hits - self._quantile_lookup_prev[1]
+                if d_lookups > 0:
+                    self.writer.add_scalar('Quantile/lookup_hit_rate', d_hits / d_lookups, step)
+                self._quantile_lookup_prev = (lookups, hits)
+
             # ---- PER stats ----
             if self.use_per:
                 self.writer.add_scalar('PER/beta', self.buffer.beta, step)
@@ -806,9 +819,11 @@ class Trainer:
         _t0 = time_module.perf_counter()
 
         if self.use_per:
-            states, actions, rewards, next_states, dones, action_masks, pos_features, next_pos_features, indices, is_weights = self.buffer.sample(self.batch_size)
+            (states, actions, rewards, next_states, dones, action_masks, pos_features,
+             next_pos_features, next_action_masks, indices, is_weights) = self.buffer.sample(self.batch_size)
         else:
-            states, actions, rewards, next_states, dones, action_masks, pos_features, next_pos_features, indices = self.buffer.sample(self.batch_size)
+            (states, actions, rewards, next_states, dones, action_masks, pos_features,
+             next_pos_features, next_action_masks, indices) = self.buffer.sample(self.batch_size)
             is_weights = None
 
         _t1 = time_module.perf_counter()
@@ -835,19 +850,13 @@ class Trainer:
 
         # ── Forward Double DQN (no grad, with autocast) ──────────────────────
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.use_amp):
-            # Derive the next-state action mask from the ACTUAL next-state position
-            # (is_long = pos[:,0], is_short = pos[:,1]), not by reconstructing it from
-            # the current action. The action-based reconstruction is wrong for n-step
-            # returns: next_state is s_{t+n}, whose position depends on the intermediate
-            # actions, not just a_t (e.g. a HOLD whose n-step window crosses a later
-            # open would be mis-masked as flat). next_pos_features always reflects
-            # s_{t+n}, so a position there means HOLD/CLOSE are legal, otherwise
-            # LONG/SHORT/HOLD are. When done=True the bootstrap is zeroed, so the
+            # Next-state action mask comes from the buffer. The actor sends the
+            # exact mask observed at s_{t+n} (including env rules the position
+            # alone cannot express, e.g. CLOSE blocked during min_hold_steps);
+            # entries without one fall back to a position-derived mask at
+            # insertion time. When done=True the bootstrap is zeroed, so the
             # mask for terminal transitions is irrelevant.
-            in_position = (next_pos_features[:, 0] + next_pos_features[:, 1]) > 0.5
-            next_masks = torch.where(
-                in_position.unsqueeze(1), self._mask_in_pos, self._mask_no_pos
-            )
+            next_masks = next_action_masks
 
             # Double DQN: main network selects action, target network evaluates value
             self.main_network.eval()

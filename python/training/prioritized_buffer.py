@@ -4,7 +4,9 @@ import numpy as np
 import torch
 
 from quantilenet import POSITION_BASE_DIM, extended_position_dim
-from training.replay_buffer import _extract_pos_vector
+from training.replay_buffer import (
+    _extract_pos_vector, _default_next_mask, _MASK_IN_POS, _MASK_NO_POS,
+)
 
 
 class SumTree:
@@ -72,7 +74,20 @@ class SumTree:
 
     def update_batch(self, data_indices, priorities):
         """Batch priority update — vectorized propagation up the tree."""
-        tree_indices = (data_indices + self.capacity - 1).astype(np.int64)
+        data_indices = np.asarray(data_indices, dtype=np.int64)
+        priorities = np.asarray(priorities, dtype=np.float64)
+        if len(data_indices) > 1:
+            # Deduplicate (keep last occurrence). PER sampling can return the
+            # same leaf multiple times in one batch (a leaf whose mass spans
+            # several stratified segments). The leaf assignment below is
+            # last-wins, but np.add.at would propagate EVERY duplicate's delta
+            # up the tree, drifting ancestor sums away from the true leaf sum.
+            rev_unique, rev_first = np.unique(data_indices[::-1], return_index=True)
+            if len(rev_unique) != len(data_indices):
+                keep = len(data_indices) - 1 - rev_first
+                data_indices = data_indices[keep]
+                priorities = priorities[keep]
+        tree_indices = data_indices + self.capacity - 1
         changes = priorities - self.tree[tree_indices]
         self.tree[tree_indices] = priorities
         idx = tree_indices.copy()
@@ -135,6 +150,7 @@ class PrioritizedReplayBuffer:
         self.rewards           = pin(torch.zeros(self.capacity, dtype=torch.float32))
         self.dones             = pin(torch.zeros(self.capacity, dtype=torch.float32))
         self.action_masks      = pin(torch.zeros(self.capacity, self.num_actions, dtype=torch.float32))
+        self.next_action_masks = pin(torch.zeros(self.capacity, self.num_actions, dtype=torch.float32))
 
         self.pos_dim = extended_position_dim(config)
         self.quantile_dim = self.pos_dim - POSITION_BASE_DIM
@@ -146,7 +162,8 @@ class PrioritizedReplayBuffer:
         self.position = 0
         self.size = 0
 
-    def add(self, state, action, reward, next_state, done, action_mask=None, td_error=None):
+    def add(self, state, action, reward, next_state, done, action_mask=None,
+            next_action_mask=None, td_error=None):
         idx = self.position
 
         for key in self.timeframe_keys:
@@ -216,8 +233,19 @@ class PrioritizedReplayBuffer:
 
         self.pos_features[idx] = torch.from_numpy(
             _extract_pos_vector(state, self.pos_dim, self.quantile_dim))
-        self.next_pos_features[idx] = torch.from_numpy(
-            _extract_pos_vector(next_state, self.pos_dim, self.quantile_dim))
+        npf_vec = _extract_pos_vector(next_state, self.pos_dim, self.quantile_dim)
+        self.next_pos_features[idx] = torch.from_numpy(npf_vec)
+
+        nm = None
+        if next_action_mask is not None:
+            arr = np.asarray(next_action_mask, dtype=np.float32)
+            # All-zero masks are rejected: they would turn every next-state Q
+            # into -inf and produce NaN targets via 0 * inf on done rows.
+            if len(arr) == self.num_actions and arr.sum() > 0:
+                nm = arr
+        if nm is None:
+            nm = _default_next_mask(npf_vec)
+        self.next_action_masks[idx] = torch.from_numpy(nm)
 
         # Tree leaves (and max_priority) store the FINAL priority p = (|td|+eps)^alpha.
         # A fresh experience with unknown TD gets the current max priority so it is
@@ -245,7 +273,7 @@ class PrioritizedReplayBuffer:
             seq_len = self.timeframe_sizes[key]
             s_batch = np.zeros((n, seq_len, self.num_features), dtype=np.float32)
             ns_batch = np.zeros((n, seq_len, self.num_features), dtype=np.float32)
-            for i, (state, _, _, next_state, _, _) in enumerate(experiences):
+            for i, (state, _, _, next_state, _, _, *_rest) in enumerate(experiences):
                 sd = state.get(key) or state.get(tf_name)
                 if sd:
                     arr = np.asarray(sd, dtype=np.float32)
@@ -278,11 +306,23 @@ class PrioritizedReplayBuffer:
 
         pf = np.zeros((n, self.pos_dim), dtype=np.float32)
         npf = np.zeros((n, self.pos_dim), dtype=np.float32)
-        for i, (state, _, _, next_state, _, _) in enumerate(experiences):
+        for i, (state, _, _, next_state, _, _, *_rest) in enumerate(experiences):
             pf[i] = _extract_pos_vector(state, self.pos_dim, self.quantile_dim)
             npf[i] = _extract_pos_vector(next_state, self.pos_dim, self.quantile_dim)
         self.pos_features[positions] = torch.from_numpy(pf)
         self.next_pos_features[positions] = torch.from_numpy(npf)
+
+        next_masks = np.empty((n, self.num_actions), dtype=np.float32)
+        for i, e in enumerate(experiences):
+            nm = e[6] if len(e) > 6 else None
+            if nm is not None:
+                arr = np.asarray(nm, dtype=np.float32)
+                # Reject all-zero masks (would yield all--inf next-state Q).
+                if len(arr) == self.num_actions and arr.sum() > 0:
+                    next_masks[i] = arr
+                    continue
+            next_masks[i] = _default_next_mask(npf[i])
+        self.next_action_masks[positions] = torch.from_numpy(next_masks)
 
         self.position = int((self.position + n) % self.capacity)
         self.size = min(self.size + n, self.capacity)
@@ -342,8 +382,10 @@ class PrioritizedReplayBuffer:
         action_masks = self.action_masks[indices].to(self.device, non_blocking=True)
         pos_features      = self.pos_features[indices].to(self.device, non_blocking=True)
         next_pos_features = self.next_pos_features[indices].to(self.device, non_blocking=True)
+        next_action_masks = self.next_action_masks[indices].to(self.device, non_blocking=True)
 
-        return states_batch, actions, rewards, next_states_batch, dones, action_masks, pos_features, next_pos_features, indices, is_weights
+        return (states_batch, actions, rewards, next_states_batch, dones, action_masks,
+                pos_features, next_pos_features, next_action_masks, indices, is_weights)
 
     def update_priorities(self, indices, td_errors):
         td_vals = np.abs(td_errors).astype(np.float64)
@@ -381,6 +423,7 @@ class PrioritizedReplayBuffer:
             'rewards': self.rewards[:n].cpu().clone(),
             'dones': self.dones[:n].cpu().clone(),
             'action_masks': self.action_masks[:n].cpu().clone(),
+            'next_action_masks': self.next_action_masks[:n].cpu().clone(),
             'pos_features': self.pos_features[:n].cpu().clone(),
             'next_pos_features': self.next_pos_features[:n].cpu().clone(),
         }
@@ -460,6 +503,18 @@ class PrioritizedReplayBuffer:
         if 'next_pos_features' in state:
             _restore_pos(self.next_pos_features, state['next_pos_features'])
 
+        if 'next_action_masks' in state:
+            self.next_action_masks[:n] = state['next_action_masks'][:n]
+        else:
+            # Legacy checkpoint without stored next masks — derive from the
+            # restored next-state position (same fallback as at insertion).
+            in_pos = (self.next_pos_features[:n, 0] + self.next_pos_features[:n, 1]) > 0.5
+            self.next_action_masks[:n] = torch.where(
+                in_pos.unsqueeze(1),
+                torch.from_numpy(_MASK_IN_POS),
+                torch.from_numpy(_MASK_NO_POS),
+            )
+
 
 class DualPrioritizedBuffer:
     """
@@ -530,6 +585,11 @@ class DualPrioritizedBuffer:
 
     def update_beta(self, fraction):
         self.main.update_beta(fraction)
+        # Directional buffers contribute IS-weighted samples to the same batch,
+        # so their bias correction must anneal on the same schedule as main.
+        if self.long_buf is not None:
+            self.long_buf.update_beta(fraction)
+            self.short_buf.update_beta(fraction)
 
     def __len__(self):
         return len(self.main)
@@ -541,15 +601,15 @@ class DualPrioritizedBuffer:
         return self.main.get_reward_stats(recent_n=recent_n)
 
     # ── Add ───────────────────────────────────────────────────────────────────
-    def add(self, state, action, reward, next_state, done, action_mask=None):
-        self.main.add(state, action, reward, next_state, done, action_mask)
+    def add(self, state, action, reward, next_state, done, action_mask=None, next_action_mask=None):
+        self.main.add(state, action, reward, next_state, done, action_mask, next_action_mask)
         if reward > 0:
-            self.positive.add(state, action, reward, next_state, done, action_mask)
+            self.positive.add(state, action, reward, next_state, done, action_mask, next_action_mask)
         if self.long_buf is not None:
             if action == 0:
-                self.long_buf.add(state, action, reward, next_state, done, action_mask)
+                self.long_buf.add(state, action, reward, next_state, done, action_mask, next_action_mask)
             elif action == 1:
-                self.short_buf.add(state, action, reward, next_state, done, action_mask)
+                self.short_buf.add(state, action, reward, next_state, done, action_mask, next_action_mask)
 
     def batch_add(self, experiences):
         self.main.batch_add(experiences)
@@ -586,11 +646,11 @@ class DualPrioritizedBuffer:
 
         # ── Sample from main (PER) ─────────────────────────────────────────
         (states_m, actions_m, rewards_m, next_states_m, dones_m,
-         masks_m, pf_m, npf_m, idx_m, iw_m) = self.main.sample(n_main)
+         masks_m, pf_m, npf_m, nmk_m, idx_m, iw_m) = self.main.sample(n_main)
 
         if n_pos == 0 and n_long == 0 and n_short == 0:
             return (states_m, actions_m, rewards_m, next_states_m, dones_m,
-                    masks_m, pf_m, npf_m, idx_m, iw_m)
+                    masks_m, pf_m, npf_m, nmk_m, idx_m, iw_m)
 
         device = self.main.device
         parts_s, parts_ns = {k: [states_m[k]] for k in states_m}, {k: [next_states_m[k]] for k in states_m}
@@ -600,36 +660,40 @@ class DualPrioritizedBuffer:
         parts_mk  = [masks_m]
         parts_pf  = [pf_m]
         parts_npf = [npf_m]
+        parts_nmk = [nmk_m]
         parts_iw  = [iw_m]
         parts_idx = [idx_m]
 
         # ── Positive buffer (uniform, no PER) ──────────────────────────────
         if n_pos > 0:
             (states_p, actions_p, rewards_p, next_states_p, dones_p,
-             masks_p, pf_p, npf_p, idx_p) = self.positive.sample(n_pos)
+             masks_p, pf_p, npf_p, nmk_p, idx_p) = self.positive.sample(n_pos)
             for k in parts_s: parts_s[k].append(states_p[k]); parts_ns[k].append(next_states_p[k])
             parts_a.append(actions_p); parts_r.append(rewards_p); parts_d.append(dones_p)
             parts_mk.append(masks_p); parts_pf.append(pf_p); parts_npf.append(npf_p)
+            parts_nmk.append(nmk_p)
             parts_iw.append(torch.ones(n_pos, device=device, dtype=torch.float32))
             parts_idx.append(idx_p + self.capacity)
 
         # ── Long buffer (PER) ─────────────────────────────────────────────
         if n_long > 0:
             (states_l, actions_l, rewards_l, next_states_l, dones_l,
-             masks_l, pf_l, npf_l, idx_l, iw_l) = self.long_buf.sample(n_long)
+             masks_l, pf_l, npf_l, nmk_l, idx_l, iw_l) = self.long_buf.sample(n_long)
             for k in parts_s: parts_s[k].append(states_l[k]); parts_ns[k].append(next_states_l[k])
             parts_a.append(actions_l); parts_r.append(rewards_l); parts_d.append(dones_l)
             parts_mk.append(masks_l); parts_pf.append(pf_l); parts_npf.append(npf_l)
+            parts_nmk.append(nmk_l)
             parts_iw.append(iw_l)
             parts_idx.append(idx_l + 2 * self.capacity)
 
         # ── Short buffer (PER) ────────────────────────────────────────────
         if n_short > 0:
             (states_sh, actions_sh, rewards_sh, next_states_sh, dones_sh,
-             masks_sh, pf_sh, npf_sh, idx_sh, iw_sh) = self.short_buf.sample(n_short)
+             masks_sh, pf_sh, npf_sh, nmk_sh, idx_sh, iw_sh) = self.short_buf.sample(n_short)
             for k in parts_s: parts_s[k].append(states_sh[k]); parts_ns[k].append(next_states_sh[k])
             parts_a.append(actions_sh); parts_r.append(rewards_sh); parts_d.append(dones_sh)
             parts_mk.append(masks_sh); parts_pf.append(pf_sh); parts_npf.append(npf_sh)
+            parts_nmk.append(nmk_sh)
             parts_iw.append(iw_sh)
             parts_idx.append(idx_sh + 3 * self.capacity)
 
@@ -642,12 +706,13 @@ class DualPrioritizedBuffer:
         masks        = torch.cat(parts_mk,  dim=0)
         pf           = torch.cat(parts_pf,  dim=0)
         npf          = torch.cat(parts_npf, dim=0)
+        next_masks   = torch.cat(parts_nmk, dim=0)
         is_weights   = torch.cat(parts_iw,  dim=0)
         is_weights   = is_weights / is_weights.max()
         indices      = np.concatenate(parts_idx)
 
         return (states, actions, rewards, next_states, dones,
-                masks, pf, npf, indices, is_weights)
+                masks, pf, npf, next_masks, indices, is_weights)
 
     # ── Priority updates ──────────────────────────────────────────────────────
     def update_priorities(self, indices, td_errors):

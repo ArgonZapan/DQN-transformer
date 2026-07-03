@@ -89,6 +89,13 @@ class QuantileFeatureLoader:
         self._ts_to_row: dict[str, dict] = {}
         self._miss_count: dict[str, int] = {}
 
+        # Cumulative lookup counters (GIL-atomic increments; read by the
+        # trainer to expose a hit-rate metric). A silently low hit rate means
+        # the DQN is training on zero quantile features — e.g. preroll only
+        # covers the test block — which the per-symbol warn limit would hide.
+        self.lookups = 0
+        self.hits = 0
+
         if not self.enabled:
             logger.info("[QuantileLoader] disabled — emitting zeros for 30 quantile features")
             return
@@ -161,6 +168,7 @@ class QuantileFeatureLoader:
         """
         if not self.enabled:
             return self._zero.copy()
+        self.lookups += 1
         if symbol is None or ts_ms is None:
             return self._zero.copy()
         feats_by_ts = self._ts_to_row.get(symbol)
@@ -185,4 +193,5 @@ class QuantileFeatureLoader:
                 )
                 self._miss_count[symbol] = n + 1
             return self._zero.copy()
+        self.hits += 1
         return self._features[symbol][row].copy()

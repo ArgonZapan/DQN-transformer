@@ -84,9 +84,11 @@ class ZMQServer:
         next_state = data.get('nextState')
         done = data['done']
         action_mask = data.get('actionMask')
+        next_action_mask = data.get('nextActionMask')
 
         if action is not None:
-            self.trainer.add_experience(state, action, reward, next_state, done, action_mask, actor_id='single')
+            self.trainer.add_experience(state, action, reward, next_state, done, action_mask,
+                                        next_action_mask=next_action_mask, actor_id='single')
 
         if next_state is not None and not done:
             next_action = self.trainer.predict_action(next_state, action_mask)
@@ -117,12 +119,13 @@ class ZMQServer:
             next_state = item.get('nextState')
             done = item.get('done', False)
             action_mask = item.get('actionMask')
+            next_action_mask = item.get('nextActionMask')
             metrics = item.get('metrics', {})
 
             if action is not None:
                 self.trainer.add_experience(
                     item['state'], action, reward, next_state, done, action_mask,
-                    actor_id=actor_id
+                    next_action_mask=next_action_mask, actor_id=actor_id
                 )
 
             if metrics:

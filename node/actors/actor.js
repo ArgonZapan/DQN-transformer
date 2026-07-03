@@ -454,6 +454,7 @@ class Actor {
                 nextState:  step.nextState ? this._mirrorStateFeatures(step.nextState) : null,
                 done:       step.done,
                 actionMask: this._mirrorActionMask(step.actionMask),
+                nextActionMask: (t + 1 < T) ? this._mirrorActionMask(steps[t + 1].actionMask) : null,
                 returnG:    mcReturns[t],
                 gammaToN:   gamma,
             }));

@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
-from model.network import TradingDQN
+from model.network import TradingDQN, upgrade_legacy_state_dict
 from config import load_config
 from quantilenet import QuantileFeatureLoader
 from utils.metrics import (
@@ -411,7 +411,16 @@ def load_model(checkpoint_path: str, config: dict, device: str) -> TradingDQN:
     """Load TradingDQN from checkpoint without instantiating Trainer."""
     model = TradingDQN(config).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
+    try:
+        model.load_state_dict(ckpt['model_state_dict'])
+    except RuntimeError:
+        # Legacy checkpoint (pre-quantilenet pos_fc / pre-pos_embedding) —
+        # apply the same zero-fill upgrades as the trainer and retry.
+        patched = upgrade_legacy_state_dict(model, ckpt['model_state_dict'])
+        if patched is None:
+            raise
+        model.load_state_dict(patched)
+        print("[Backtest] Upgraded legacy checkpoint state dict (zero-filled new params).")
     model.eval()
     print(f"[Backtest] Loaded: step={ckpt.get('step', '?')}, epsilon={ckpt.get('epsilon', '?'):.4f}")
     return model
