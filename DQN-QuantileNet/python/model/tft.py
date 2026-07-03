@@ -36,6 +36,26 @@ class TFBlock(nn.Module):
         return self.grn(x)
 
 
+class PerVariableProjection(nn.Module):
+    """Per-variable scalar → d_model embedding: each feature has its own w_f, b_f.
+
+    Replaces a single shared Linear(1, d_model), under which every feature's
+    embedding was colinear (the same direction scaled by the feature value) and
+    only the downstream VSN GRNs could tell variables apart. The TFT paper
+    prescribes one linear projection per variable — this restores that.
+    """
+
+    def __init__(self, n_vars: int, d_model: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(n_vars, d_model))
+        self.bias   = nn.Parameter(torch.zeros(n_vars, d_model))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, n_vars] → [batch, seq_len, n_vars, d_model]
+        return x.unsqueeze(-1) * self.weight + self.bias
+
+
 class TimeframeEncoder(nn.Module):
     """Per-timeframe encoder: feature projection → VSN → LSTM."""
 
@@ -45,7 +65,7 @@ class TimeframeEncoder(nn.Module):
         self.seq_len = seq_len
 
         # Project each feature to d_model, then VSN selects across features
-        self.feat_proj = nn.Linear(1, d_model)          # per-feature scalar → d_model
+        self.feat_proj = PerVariableProjection(n_features, d_model)
         self.vsn       = VSN(n_features, d_model, dropout=vsn_dropout)
         self.lstm      = nn.LSTM(d_model, lstm_hidden, num_layers=lstm_layers,
                                  batch_first=True, dropout=grn_dropout if lstm_layers > 1 else 0.0)
@@ -57,7 +77,7 @@ class TimeframeEncoder(nn.Module):
         b, s, f = x.shape
 
         # Expand each feature to d_model: [batch, seq_len, n_features, d_model]
-        x_exp = self.feat_proj(x.unsqueeze(-1))   # [b, s, f, d_model]
+        x_exp = self.feat_proj(x)                 # [b, s, f, d_model]
         vsn_out = self.vsn(x_exp)                 # [b, s, d_model]
 
         lstm_out, _ = self.lstm(vsn_out)          # [b, s, lstm_hidden]
@@ -166,3 +186,33 @@ class QuantileNet(nn.Module):
             out['threshold'] = self.threshold_head(pooled)
 
         return out
+
+
+def upgrade_legacy_state_dict(model: nn.Module, state_dict: dict) -> dict:
+    """Convert checkpoints saved with the shared Linear(1, d_model) feat_proj
+    to PerVariableProjection.
+
+    The conversion is an exact functional equivalent: every variable's row is
+    initialized with the shared direction (old weight [d_model, 1] broadcast to
+    [n_vars, d_model], old bias [d_model] likewise). Works for both raw model
+    state dicts and EMA/AveragedModel dicts ('module.'-prefixed keys) — the
+    match is on the key suffix. Returns the input dict unchanged when no
+    legacy feat_proj keys are present.
+    """
+    upgraded = None
+    for name, param in model.state_dict().items():
+        if not name.endswith('feat_proj.weight') or name not in state_dict:
+            continue
+        old_w = state_dict[name]
+        if old_w.shape == param.shape:
+            continue
+        if old_w.ndim == 2 and old_w.shape[1] == 1:
+            if upgraded is None:
+                upgraded = dict(state_dict)
+            n_vars, d_model = param.shape
+            upgraded[name] = old_w[:, 0].expand(n_vars, d_model).clone()
+            bias_name = name[: -len('weight')] + 'bias'
+            old_b = state_dict.get(bias_name)
+            if old_b is not None and old_b.ndim == 1:
+                upgraded[bias_name] = old_b.expand(n_vars, d_model).clone()
+    return upgraded if upgraded is not None else state_dict

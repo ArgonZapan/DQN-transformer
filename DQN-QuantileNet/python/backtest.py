@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from python.config                import load_config, get_device
 from python.data.loader           import build_windows, _load_csv, _base_tf, TF_MINUTES
-from python.model.tft             import QuantileNet
+from python.model.tft             import QuantileNet, upgrade_legacy_state_dict
 from python.training.dataset      import QuantileDataset, collate_fn
 from python.training.walk_forward import build_walk_forward_folds
 
@@ -130,7 +130,9 @@ def get_quantile_tp_sl(quantiles_up: np.ndarray, quantiles_down: np.ndarray,
 def load_model(config: dict, device: torch.device, checkpoint: str) -> QuantileNet:
     model = QuantileNet(config).to(device)
     ckpt  = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(ckpt['model'])
+    # Transparently upgrade checkpoints saved with the shared Linear(1, d_model)
+    # feat_proj (exact functional equivalent — see model/tft.py).
+    model.load_state_dict(upgrade_legacy_state_dict(model, ckpt['model']))
     model.eval()
     logger.info(f'Loaded checkpoint: {checkpoint}  (epoch {ckpt.get("epoch", "?")},'
                 f' val_loss={ckpt.get("val_loss", float("nan")):.5f})')

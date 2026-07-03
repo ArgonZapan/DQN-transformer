@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
-from ..model.tft              import QuantileNet
+from ..model.tft              import QuantileNet, upgrade_legacy_state_dict
 from ..training.dataset       import QuantileDataset, GPUWindowDataset, collate_fn
 from ..training.losses        import LossModule, compute_pos_freq
 from ..training.walk_forward  import build_walk_forward_folds
@@ -493,12 +493,19 @@ class Trainer:
 
     def _load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt['model'])
-        self.optimizer.load_state_dict(ckpt['optimizer'])
+        # Transparently upgrade checkpoints saved with the shared
+        # Linear(1, d_model) feat_proj (exact functional equivalent).
+        model_sd = upgrade_legacy_state_dict(self.model, ckpt['model'])
+        self.model.load_state_dict(model_sd)
+        if model_sd is not ckpt['model']:
+            # Adam state (m, v) was tied to the old feat_proj shape — reset it.
+            logger.info('[Trainer] Upgraded legacy feat_proj weights; optimizer state reset.')
+        else:
+            self.optimizer.load_state_dict(ckpt['optimizer'])
         if 'loss' in ckpt:
             self.loss_module.load_state_dict(ckpt['loss'])
         if 'ema' in ckpt and self.ema_enabled:
-            self.ema.load_state_dict(ckpt['ema'])
+            self.ema.load_state_dict(upgrade_legacy_state_dict(self.ema, ckpt['ema']))
         logger.info(f'[Trainer] Resumed from: {path}')
 
     def _run_epoch_backtest(self, epoch: int):
